@@ -1,0 +1,1595 @@
+{
+  "project": "FL3_V2",
+  "version": "1.3",
+  "created": "2026-01-28",
+  "total_effort_hours": "106-157",
+  "phases": [
+    {
+      "phase_id": "0",
+      "phase_name": "Infrastructure Setup",
+      "effort_hours": "20-30",
+      "components": [
+        {
+          "component_id": "0.1",
+          "component": "GCP Project Creation",
+          "description": "Create new FL3_V2 GCP project with all required APIs, service accounts, secrets, and artifact registry configured",
+          "deliverable": "Fully configured GCP project with DB connectivity",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "0.1.1",
+              "description": "Create new GCP project (fl3-v2-prod)",
+              "command": "gcloud projects create fl3-v2-prod --name=\"FL3 V2 Production\"",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.2",
+              "description": "Enable required APIs (Cloud Run, SQL, Secrets, Scheduler, Logging, Monitoring, Artifact Registry, Build)",
+              "command": "gcloud services enable run.googleapis.com sqladmin.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com logging.googleapis.com monitoring.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.3",
+              "description": "Create service accounts with appropriate roles (fl3-v2-cloudrun, fl3-v2-scheduler, fl3-v2-deployer)",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.4",
+              "description": "Configure Cloud SQL connection to existing fr3-pg instance",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.5",
+              "description": "Copy secrets from V1 project to V2 Secret Manager (DATABASE_URL, POLYGON_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY)",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.6",
+              "description": "Set up Artifact Registry for container images",
+              "command": "gcloud artifacts repositories create fl3-v2-images --repository-format=docker --location=us-west1",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.7",
+              "description": "Configure Cloud Logging and Monitoring dashboards",
+              "passes": null
+            },
+            {
+              "step_id": "0.1.8",
+              "description": "Set up billing alerts",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP0a",
+            "criteria": "V2 GCP project operational with DB connectivity",
+            "action_if_failed": "Debug GCP setup before continuing"
+          },
+          "passes": null
+        },
+        {
+          "component_id": "0.2",
+          "component": "V1 Compatibility Validation",
+          "description": "Validate that V1 services will remain unaffected by V2 changes and document all dependencies",
+          "deliverable": "Dependency matrix and validation report",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "0.2.1",
+              "description": "Inventory all V1 Cloud Run services and their status (active vs disabled)",
+              "passes": null
+            },
+            {
+              "step_id": "0.2.2",
+              "description": "Inventory all V1 Cloud Scheduler jobs and their dependencies",
+              "passes": null
+            },
+            {
+              "step_id": "0.2.3",
+              "description": "Map V1 code dependencies to database tables (create dependency matrix)",
+              "passes": null
+            },
+            {
+              "step_id": "0.2.4",
+              "description": "Identify tables safe to drop vs must keep (finalize Drop/Keep list)",
+              "passes": null
+            },
+            {
+              "step_id": "0.2.5",
+              "description": "Test V1 ORATS ingest in isolation to confirm it will remain unaffected",
+              "passes": null
+            },
+            {
+              "step_id": "0.2.6",
+              "description": "Document V1 rollback procedure in case of unexpected issues",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP0b",
+            "criteria": "V1 dependencies fully mapped, active services confirmed",
+            "action_if_failed": "Do not proceed to DB cleanup"
+          },
+          "passes": null
+        },
+        {
+          "component_id": "0.3",
+          "component": "Database Backup & Cleanup",
+          "description": "Backup legacy tables and drop them to recover ~42 GB of storage",
+          "deliverable": "Database reduced to ~12 GB with backups in Cloud Storage",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "0.3.1",
+              "description": "Create pg_dump backup of tables to be dropped (option_trades_*, uoa_hit_components, option_greeks_latest, option_oi_daily, option_contracts)",
+              "passes": null
+            },
+            {
+              "step_id": "0.3.2",
+              "description": "Upload backups to Cloud Storage bucket",
+              "passes": null
+            },
+            {
+              "step_id": "0.3.3",
+              "description": "Verify backup integrity (test restore to temp DB or spot check)",
+              "passes": null
+            },
+            {
+              "step_id": "0.3.4",
+              "description": "Execute DROP statements for legacy tables",
+              "sql": "DROP TABLE IF EXISTS option_trades_2025_09, option_trades_2025_10, option_trades_2025_11, option_trades_2025_12, option_trades_default, uoa_hit_components, option_greeks_latest, option_oi_daily, option_contracts;",
+              "passes": null
+            },
+            {
+              "step_id": "0.3.5",
+              "description": "Run VACUUM FULL to reclaim disk space and verify DB size reduced to ~12 GB",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP0c",
+            "criteria": "DB cleanup successful, V1 unaffected, shared tables intact",
+            "action_if_failed": "Restore from backup, reassess dependencies"
+          },
+          "passes": null
+        },
+        {
+          "component_id": "0.4",
+          "component": "Core Validation Tests",
+          "description": "Validate firehose feasibility, baseline accuracy, and time multipliers before building full system",
+          "deliverable": "Validation scripts and reports confirming approach is viable",
+          "effort_hours": "9-14",
+          "steps": [
+            {
+              "step_id": "0.4.1",
+              "description": "Polygon Firehose feasibility test - connect to T.* and measure throughput for 30+ minutes",
+              "deliverable": "test_firehose_feasibility.py + throughput report",
+              "passes": null
+            },
+            {
+              "step_id": "0.4.2",
+              "description": "Baseline calculation validation - compare ORATS-derived baselines to actual volume patterns",
+              "deliverable": "baseline_validation.py + correlation report",
+              "passes": null
+            },
+            {
+              "step_id": "0.4.3",
+              "description": "Time multiplier calibration - analyze historical data to tune time-of-day multipliers",
+              "deliverable": "config/time_multipliers.json",
+              "passes": null
+            },
+            {
+              "step_id": "0.4.4",
+              "description": "TA pipeline assessment - document current V1 TA state and required fixes for V2",
+              "deliverable": "TA assessment document",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP1",
+            "criteria": "Baseline correlation > 0.4, firehose stable for 30+ minutes",
+            "action_if_failed": "Reconsider baseline approach"
+          },
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "1",
+      "phase_name": "Database Schema",
+      "effort_hours": "5-10",
+      "components": [
+        {
+          "component_id": "1.1",
+          "component": "Intraday Baselines Table",
+          "description": "Create table to store 30-minute bucket aggregates for time-of-day baseline calibration",
+          "deliverable": "sql/intraday_baselines_30m.sql",
+          "effort_hours": "1-2",
+          "steps": [
+            {
+              "step_id": "1.1.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol, trade_date, bucket_start, prints, notional, contracts_unique",
+              "passes": null
+            },
+            {
+              "step_id": "1.1.2",
+              "description": "Add primary key constraint on (symbol, trade_date, bucket_start)",
+              "passes": null
+            },
+            {
+              "step_id": "1.1.3",
+              "description": "Add indexes for common query patterns",
+              "passes": null
+            },
+            {
+              "step_id": "1.1.4",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "1.2",
+          "component": "GEX Metrics Table",
+          "description": "Create table to store GEX/DEX/Vanna/Charm snapshots on UOA trigger",
+          "deliverable": "sql/gex_metrics_snapshot.sql",
+          "effort_hours": "1-2",
+          "steps": [
+            {
+              "step_id": "1.2.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol, snapshot_ts, spot_price, net_gex, net_dex, call_wall_strike, put_wall_strike, gamma_flip_level, net_vex, net_charm",
+              "passes": null
+            },
+            {
+              "step_id": "1.2.2",
+              "description": "Add index on (symbol, snapshot_ts)",
+              "passes": null
+            },
+            {
+              "step_id": "1.2.3",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "1.3",
+          "component": "UOA Triggers Table",
+          "description": "Create table to store triggered UOA events with full context",
+          "deliverable": "sql/uoa_triggers_v2.sql",
+          "effort_hours": "1-2",
+          "steps": [
+            {
+              "step_id": "1.3.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol, trigger_ts, trigger_type, volume_ratio, notional, baseline_notional, contracts, meta_json",
+              "passes": null
+            },
+            {
+              "step_id": "1.3.2",
+              "description": "Add indexes for time-based and symbol-based queries",
+              "passes": null
+            },
+            {
+              "step_id": "1.3.3",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "1.4",
+          "component": "Phase Signals Table",
+          "description": "Create table to store P&D phase transition signals",
+          "deliverable": "sql/pd_phase_signals.sql",
+          "effort_hours": "1-2",
+          "steps": [
+            {
+              "step_id": "1.4.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol, signal_ts, phase, score, contributing_factors, meta_json",
+              "passes": null
+            },
+            {
+              "step_id": "1.4.2",
+              "description": "Add indexes for time-based and symbol-based queries",
+              "passes": null
+            },
+            {
+              "step_id": "1.4.3",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "1.5",
+          "component": "Tracked Tickers V2 Table",
+          "description": "Create table for permanent symbol tracking (never remove once triggered)",
+          "deliverable": "sql/tracked_tickers_v2.sql",
+          "effort_hours": "0.5-1",
+          "steps": [
+            {
+              "step_id": "1.5.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol (PK), first_trigger_ts, trigger_count, last_trigger_ts, ta_enabled, created_at",
+              "passes": null
+            },
+            {
+              "step_id": "1.5.2",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "1.6",
+          "component": "TA Snapshots V2 Table",
+          "description": "Create table for 5-minute interval TA data storage (~78K rows/day)",
+          "deliverable": "sql/ta_snapshots_v2.sql",
+          "effort_hours": "0.5-1",
+          "steps": [
+            {
+              "step_id": "1.6.1",
+              "description": "Write CREATE TABLE DDL with columns: symbol, snapshot_ts, price, volume, rsi_14, atr_14, vwap, sma_20, ema_9",
+              "passes": null
+            },
+            {
+              "step_id": "1.6.2",
+              "description": "Add unique constraint on (symbol, snapshot_ts)",
+              "passes": null
+            },
+            {
+              "step_id": "1.6.3",
+              "description": "Add index on (symbol, snapshot_ts) for efficient lookups",
+              "passes": null
+            },
+            {
+              "step_id": "1.6.4",
+              "description": "Consider partitioning strategy for high volume (optional)",
+              "passes": null
+            },
+            {
+              "step_id": "1.6.5",
+              "description": "Execute DDL on production database",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "2",
+      "phase_name": "Core Components",
+      "effort_hours": "16-23",
+      "components": [
+        {
+          "component_id": "2.1",
+          "component": "OCC Symbol Parser",
+          "description": "Parse OCC option symbols to extract underlying, expiry, strike, and right (call/put)",
+          "deliverable": "utils/occ_parser.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "2.1.1",
+              "description": "Implement parse_occ_symbol() function to extract underlying, expiry, strike, right",
+              "passes": null
+            },
+            {
+              "step_id": "2.1.2",
+              "description": "Handle edge cases: variable-length underlyings (A, AA, AAPL, BRKB), adjusted options",
+              "passes": null
+            },
+            {
+              "step_id": "2.1.3",
+              "description": "Write unit tests with diverse symbol examples",
+              "passes": null
+            },
+            {
+              "step_id": "2.1.4",
+              "description": "Benchmark parsing speed (target: >100K symbols/sec)",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "2.2",
+          "component": "Baseline Manager",
+          "description": "Manage hybrid baseline strategy: ORATS-derived for cold start, bucket history for warm",
+          "deliverable": "analysis/baseline_manager.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "2.2.1",
+              "description": "Implement get_baseline(symbol, bucket_time) with hybrid logic",
+              "passes": null
+            },
+            {
+              "step_id": "2.2.2",
+              "description": "Implement ORATS fallback calculation: (total_volume / 390) * time_multiplier",
+              "passes": null
+            },
+            {
+              "step_id": "2.2.3",
+              "description": "Implement bucket history lookup: 20-day rolling average",
+              "passes": null
+            },
+            {
+              "step_id": "2.2.4",
+              "description": "Add caching layer for frequently accessed baselines",
+              "passes": null
+            },
+            {
+              "step_id": "2.2.5",
+              "description": "Load time_multipliers.json config",
+              "passes": null
+            },
+            {
+              "step_id": "2.2.6",
+              "description": "Write unit tests for cold start, warm, and hybrid scenarios",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "2.3",
+          "component": "Greeks Calculator",
+          "description": "Implement Black-Scholes Greeks calculations: Delta, Gamma, Vanna, Charm",
+          "deliverable": "analysis/greeks_calculator.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "2.3.1",
+              "description": "Implement Black-Scholes d1, d2 calculations",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.2",
+              "description": "Implement Delta calculation for calls and puts",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.3",
+              "description": "Implement Gamma calculation",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.4",
+              "description": "Implement Vanna calculation (second-order: dDelta/dIV)",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.5",
+              "description": "Implement Charm calculation (second-order: dDelta/dTime)",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.6",
+              "description": "Validate calculations against known sources (e.g., OptionStrat, TOS)",
+              "passes": null
+            },
+            {
+              "step_id": "2.3.7",
+              "description": "Write unit tests with known input/output pairs",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "2.4",
+          "component": "GEX/DEX Aggregator",
+          "description": "Aggregate Greeks across option chain to compute Net GEX, Net DEX, Call/Put Walls, Gamma Flip",
+          "deliverable": "analysis/gex_aggregator.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "2.4.1",
+              "description": "Implement GEX per contract: Γ × OI × 100 × S² × 0.01",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.2",
+              "description": "Implement Net GEX aggregation: Σ[GEX_Call(K)] - Σ[GEX_Put(K)]",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.3",
+              "description": "Implement Net DEX aggregation: Σ[Δ_call × CallOI × 100] - Σ[|Δ_put| × PutOI × 100]",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.4",
+              "description": "Implement Call Wall detection: strike with max call OI",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.5",
+              "description": "Implement Put Wall detection: strike with max put OI",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.6",
+              "description": "Implement Gamma Flip Level: price where Net GEX crosses zero",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.7",
+              "description": "Implement Net VEX (Vanna exposure) aggregation",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.8",
+              "description": "Implement Net Charm aggregation",
+              "passes": null
+            },
+            {
+              "step_id": "2.4.9",
+              "description": "Write integration tests with sample option chain data",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "2.5",
+          "component": "Polygon Snapshot Fetcher",
+          "description": "Fetch option chain snapshots from Polygon REST API on UOA trigger",
+          "deliverable": "adapters/polygon_snapshot.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "2.5.1",
+              "description": "Implement async snapshot fetch for underlying symbol",
+              "passes": null
+            },
+            {
+              "step_id": "2.5.2",
+              "description": "Parse snapshot response: extract all contracts, OI, IV, Greeks if available",
+              "passes": null
+            },
+            {
+              "step_id": "2.5.3",
+              "description": "Implement rate limiting (respect Polygon limits)",
+              "passes": null
+            },
+            {
+              "step_id": "2.5.4",
+              "description": "Implement retry logic with exponential backoff",
+              "passes": null
+            },
+            {
+              "step_id": "2.5.5",
+              "description": "Add caching to avoid duplicate fetches within short window",
+              "passes": null
+            },
+            {
+              "step_id": "2.5.6",
+              "description": "Write integration tests with Polygon sandbox/test data",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "3",
+      "phase_name": "Firehose Pipeline",
+      "effort_hours": "22-32",
+      "components": [
+        {
+          "component_id": "3.1",
+          "component": "Firehose Websocket Client",
+          "description": "Connect to Polygon websocket firehose (T.*) and receive all options trades",
+          "deliverable": "firehose/client.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "3.1.1",
+              "description": "Implement websocket connection to Polygon options trades stream",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.2",
+              "description": "Implement T.* wildcard subscription for all options",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.3",
+              "description": "Implement message parsing (extract symbol, price, size, timestamp)",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.4",
+              "description": "Implement automatic reconnection with exponential backoff",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.5",
+              "description": "Implement heartbeat/ping-pong handling",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.6",
+              "description": "Add metrics: messages/sec, reconnect count, lag detection",
+              "passes": null
+            },
+            {
+              "step_id": "3.1.7",
+              "description": "Test stability over 30+ minutes at peak load",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "3.2",
+          "component": "Rolling Window Aggregator",
+          "description": "Aggregate trades in-memory with 60-second rolling windows per underlying",
+          "deliverable": "firehose/aggregator.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "3.2.1",
+              "description": "Implement in-memory data structure for per-symbol rolling windows",
+              "passes": null
+            },
+            {
+              "step_id": "3.2.2",
+              "description": "Implement trade aggregation: count, notional, unique contracts",
+              "passes": null
+            },
+            {
+              "step_id": "3.2.3",
+              "description": "Implement window expiration/cleanup (evict stale data)",
+              "passes": null
+            },
+            {
+              "step_id": "3.2.4",
+              "description": "Optimize for high throughput (target: 10K trades/sec)",
+              "passes": null
+            },
+            {
+              "step_id": "3.2.5",
+              "description": "Add memory monitoring to prevent unbounded growth",
+              "passes": null
+            },
+            {
+              "step_id": "3.2.6",
+              "description": "Write unit tests for aggregation correctness",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "3.3",
+          "component": "UOA Detector V2",
+          "description": "Detect unusual options activity by comparing rolling aggregates to baselines",
+          "deliverable": "uoa/detector_v2.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "3.3.1",
+              "description": "Implement detection logic: volume_ratio = current / baseline",
+              "passes": null
+            },
+            {
+              "step_id": "3.3.2",
+              "description": "Implement configurable thresholds (default: 3x baseline)",
+              "passes": null
+            },
+            {
+              "step_id": "3.3.3",
+              "description": "Implement cooldown period to avoid duplicate triggers",
+              "passes": null
+            },
+            {
+              "step_id": "3.3.4",
+              "description": "Integrate with BaselineManager for baseline lookups",
+              "passes": null
+            },
+            {
+              "step_id": "3.3.5",
+              "description": "Add trigger event emission for downstream handlers",
+              "passes": null
+            },
+            {
+              "step_id": "3.3.6",
+              "description": "Write unit tests with mock baselines",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP3",
+            "criteria": "Triggers < 1000/day",
+            "action_if_failed": "Tighten thresholds"
+          },
+          "passes": null
+        },
+        {
+          "component_id": "3.4",
+          "component": "Trigger Handler",
+          "description": "Handle UOA triggers: fetch snapshot, calculate GEX, store event, add to tracking",
+          "deliverable": "uoa/trigger_handler.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "3.4.1",
+              "description": "Implement async trigger processing pipeline",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.2",
+              "description": "Call Polygon snapshot fetcher on trigger",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.3",
+              "description": "Calculate GEX/DEX/Vanna/Charm from snapshot",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.4",
+              "description": "Store trigger event to uoa_triggers_v2 table",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.5",
+              "description": "Store GEX metrics to gex_metrics_snapshot table",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.6",
+              "description": "Add/update symbol in tracked_tickers_v2 (permanent tracking)",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.7",
+              "description": "Emit event for phase detection pipeline",
+              "passes": null
+            },
+            {
+              "step_id": "3.4.8",
+              "description": "Add error handling and logging",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "3.5",
+          "component": "Bucket Aggregator",
+          "description": "Store 30-minute bucket summaries for baseline refinement",
+          "deliverable": "firehose/bucket_aggregator.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "3.5.1",
+              "description": "Implement 30-minute bucket accumulation per symbol",
+              "passes": null
+            },
+            {
+              "step_id": "3.5.2",
+              "description": "Track prints, notional, unique contracts per bucket",
+              "passes": null
+            },
+            {
+              "step_id": "3.5.3",
+              "description": "Implement bucket flush at 30-minute boundaries",
+              "passes": null
+            },
+            {
+              "step_id": "3.5.4",
+              "description": "Batch insert to intraday_baselines_30m table",
+              "passes": null
+            },
+            {
+              "step_id": "3.5.5",
+              "description": "Only store buckets for symbols with activity (sparse storage)",
+              "passes": null
+            },
+            {
+              "step_id": "3.5.6",
+              "description": "Add metrics: symbols stored, rows inserted",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "3.6",
+          "component": "Firehose Orchestrator",
+          "description": "Main orchestrator that ties together all firehose components",
+          "deliverable": "scripts/firehose_main.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "3.6.1",
+              "description": "Implement startup sequence: verify time, check market status, log startup info",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.2",
+              "description": "Initialize all components (client, aggregator, detector, handler, bucket)",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.3",
+              "description": "Wire up event flow between components",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.4",
+              "description": "Implement graceful shutdown handling",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.5",
+              "description": "Add --test-mode flag for non-market hours testing",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.6",
+              "description": "Add periodic health logging (trades/sec, triggers, memory)",
+              "passes": null
+            },
+            {
+              "step_id": "3.6.7",
+              "description": "Write integration test for full pipeline",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "4",
+      "phase_name": "TA Pipeline Re-enablement",
+      "effort_hours": "8-12",
+      "components": [
+        {
+          "component_id": "4.1",
+          "component": "Tracked Tickers V2 Manager",
+          "description": "Manage permanent symbol tracking list - never remove symbols once triggered",
+          "deliverable": "tracking/ticker_manager_v2.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "4.1.1",
+              "description": "Implement add_symbol() - insert or update trigger count",
+              "passes": null
+            },
+            {
+              "step_id": "4.1.2",
+              "description": "Implement get_active_symbols() - return all ta_enabled symbols",
+              "passes": null
+            },
+            {
+              "step_id": "4.1.3",
+              "description": "Implement get_symbols_for_refresh() - batch for TA pipeline",
+              "passes": null
+            },
+            {
+              "step_id": "4.1.4",
+              "description": "Add metrics: total tracked, active count",
+              "passes": null
+            },
+            {
+              "step_id": "4.1.5",
+              "description": "Write unit tests",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "4.2",
+          "component": "Alpaca Batched Bars Fetcher",
+          "description": "Fetch price bars from Alpaca in batches of 50-100 symbols to stay within rate limits",
+          "deliverable": "adapters/alpaca_bars_batch.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "4.2.1",
+              "description": "Implement batch bars request (50-100 symbols per call)",
+              "passes": null
+            },
+            {
+              "step_id": "4.2.2",
+              "description": "Implement rate limiting (stay under 200 req/min)",
+              "passes": null
+            },
+            {
+              "step_id": "4.2.3",
+              "description": "Parse response and return OHLCV data per symbol",
+              "passes": null
+            },
+            {
+              "step_id": "4.2.4",
+              "description": "Handle partial failures (some symbols may not have data)",
+              "passes": null
+            },
+            {
+              "step_id": "4.2.5",
+              "description": "Write integration tests",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "4.3",
+          "component": "TA Calculator",
+          "description": "Calculate technical indicators: RSI, ATR, VWAP, SMA, EMA from price bars",
+          "deliverable": "analysis/ta_calculator.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "4.3.1",
+              "description": "Implement RSI-14 calculation",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.2",
+              "description": "Implement ATR-14 calculation",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.3",
+              "description": "Implement VWAP calculation",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.4",
+              "description": "Implement SMA-20 calculation",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.5",
+              "description": "Implement EMA-9 calculation",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.6",
+              "description": "Handle insufficient data gracefully (return null)",
+              "passes": null
+            },
+            {
+              "step_id": "4.3.7",
+              "description": "Write unit tests with known input/output",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "4.4",
+          "component": "TA Pipeline Orchestrator",
+          "description": "Orchestrate 5-minute TA refresh cycle for all tracked symbols",
+          "deliverable": "scripts/ta_pipeline_v2.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "4.4.1",
+              "description": "Implement main refresh loop (every 5 minutes during market hours)",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.2",
+              "description": "Get active symbols from TrackedTickersV2Manager",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.3",
+              "description": "Batch fetch bars via AlpacaBatchedBarsFetcher",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.4",
+              "description": "Calculate TA indicators for each symbol",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.5",
+              "description": "Batch insert to ta_snapshots_v2 table",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.6",
+              "description": "Add metrics: symbols refreshed, duration, errors",
+              "passes": null
+            },
+            {
+              "step_id": "4.4.7",
+              "description": "Verify completes within 60 seconds for 1000 symbols",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP4",
+            "criteria": "TA pipeline stable at 1000 symbols, completes < 60s",
+            "action_if_failed": "Optimize batching/caching"
+          },
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "5",
+      "phase_name": "Phase Detection Logic",
+      "effort_hours": "13-18",
+      "components": [
+        {
+          "component_id": "5.1",
+          "component": "Phase 1 (Setup) Detector",
+          "description": "Detect Setup phase: UOA trigger + IV elevation + OI building",
+          "deliverable": "phase_detectors/setup.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "5.1.1",
+              "description": "Define Setup phase criteria and thresholds",
+              "passes": null
+            },
+            {
+              "step_id": "5.1.2",
+              "description": "Implement UOA trigger check (volume > 3x baseline)",
+              "passes": null
+            },
+            {
+              "step_id": "5.1.3",
+              "description": "Implement IV elevation check (iv_rank > 50 from ORATS)",
+              "passes": null
+            },
+            {
+              "step_id": "5.1.4",
+              "description": "Implement OI building check (call OI increasing from snapshot)",
+              "passes": null
+            },
+            {
+              "step_id": "5.1.5",
+              "description": "Combine signals into Setup phase score",
+              "passes": null
+            },
+            {
+              "step_id": "5.1.6",
+              "description": "Write unit tests with mock data",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "5.2",
+          "component": "Phase 2 (Acceleration) Detector",
+          "description": "Detect Acceleration phase: price breakout + volume surge + positive GEX + RSI overbought",
+          "deliverable": "phase_detectors/acceleration.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "5.2.1",
+              "description": "Define Acceleration phase criteria and thresholds",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.2",
+              "description": "Implement price breakout check (price > 3x ATR from TA)",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.3",
+              "description": "Implement volume surge check (sustained high volume)",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.4",
+              "description": "Implement GEX positive check (net_gex > 0 from snapshot)",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.5",
+              "description": "Implement RSI overbought check (RSI > 70 from TA)",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.6",
+              "description": "Implement VWAP deviation check",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.7",
+              "description": "Combine signals into Acceleration phase score",
+              "passes": null
+            },
+            {
+              "step_id": "5.2.8",
+              "description": "Write unit tests with mock data",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "5.3",
+          "component": "Phase 3 (Reversal) Detector",
+          "description": "Detect Reversal phase: Vanna flip + negative GEX + RSI divergence + volume climax + IV crush",
+          "deliverable": "phase_detectors/reversal.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "5.3.1",
+              "description": "Define Reversal phase criteria and thresholds",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.2",
+              "description": "Implement Vanna flip check (net_vex sign change)",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.3",
+              "description": "Implement GEX negative check (net_gex < 0)",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.4",
+              "description": "Implement RSI divergence check (price up, RSI down)",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.5",
+              "description": "Implement volume climax check (spike then drop)",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.6",
+              "description": "Implement IV crush check (iv_rank dropping from ORATS)",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.7",
+              "description": "Combine signals into Reversal phase score",
+              "passes": null
+            },
+            {
+              "step_id": "5.3.8",
+              "description": "Write unit tests with mock data",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "5.4",
+          "component": "Phase Scoring Engine",
+          "description": "Combine phase detectors into unified scoring system with transition tracking",
+          "deliverable": "analysis/phase_scorer.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "5.4.1",
+              "description": "Implement unified score calculation across phases",
+              "passes": null
+            },
+            {
+              "step_id": "5.4.2",
+              "description": "Implement phase transition detection (Setup → Acceleration → Reversal)",
+              "passes": null
+            },
+            {
+              "step_id": "5.4.3",
+              "description": "Store phase signals to pd_phase_signals table",
+              "passes": null
+            },
+            {
+              "step_id": "5.4.4",
+              "description": "Implement alert generation on high-confidence transitions",
+              "passes": null
+            },
+            {
+              "step_id": "5.4.5",
+              "description": "Add configurable thresholds for each phase",
+              "passes": null
+            },
+            {
+              "step_id": "5.4.6",
+              "description": "Write integration tests for full scoring flow",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "6",
+      "phase_name": "Backtesting & Validation",
+      "effort_hours": "12-17",
+      "components": [
+        {
+          "component_id": "6.1",
+          "component": "Outcome Labeler",
+          "description": "Label historical triggers with forward returns for backtest validation",
+          "deliverable": "scripts/label_outcomes.py",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "6.1.1",
+              "description": "Query uoa_triggers_v2 for triggers to label",
+              "passes": null
+            },
+            {
+              "step_id": "6.1.2",
+              "description": "Join with orats_daily_returns for 1d, 3d, 5d, 10d forward returns",
+              "passes": null
+            },
+            {
+              "step_id": "6.1.3",
+              "description": "Compute success labels (e.g., >5% return within 5 days)",
+              "passes": null
+            },
+            {
+              "step_id": "6.1.4",
+              "description": "Store labels back to triggers table or separate outcomes table",
+              "passes": null
+            },
+            {
+              "step_id": "6.1.5",
+              "description": "Generate summary statistics",
+              "passes": null
+            }
+          ],
+          "checkpoint": {
+            "id": "CP5",
+            "criteria": "Triggers have signal vs random (win rate > baseline)",
+            "action_if_failed": "Revisit detection logic"
+          },
+          "passes": null
+        },
+        {
+          "component_id": "6.2",
+          "component": "Baseline Performance Report",
+          "description": "Measure accuracy of ORATS-derived baselines vs actual volume",
+          "deliverable": "analysis/baseline_performance.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "6.2.1",
+              "description": "Compare predicted baseline to actual bucket volume",
+              "passes": null
+            },
+            {
+              "step_id": "6.2.2",
+              "description": "Calculate correlation coefficient",
+              "passes": null
+            },
+            {
+              "step_id": "6.2.3",
+              "description": "Calculate mean absolute error",
+              "passes": null
+            },
+            {
+              "step_id": "6.2.4",
+              "description": "Break down by time-of-day bucket",
+              "passes": null
+            },
+            {
+              "step_id": "6.2.5",
+              "description": "Generate report with charts",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "6.3",
+          "component": "Phase Detection Accuracy Report",
+          "description": "Measure accuracy of phase detection vs actual price outcomes",
+          "deliverable": "analysis/phase_accuracy.py",
+          "effort_hours": "3-4",
+          "steps": [
+            {
+              "step_id": "6.3.1",
+              "description": "Query phase signals with forward returns",
+              "passes": null
+            },
+            {
+              "step_id": "6.3.2",
+              "description": "Calculate precision/recall for each phase",
+              "passes": null
+            },
+            {
+              "step_id": "6.3.3",
+              "description": "Measure timing accuracy (did reversal predict the top?)",
+              "passes": null
+            },
+            {
+              "step_id": "6.3.4",
+              "description": "Generate confusion matrix",
+              "passes": null
+            },
+            {
+              "step_id": "6.3.5",
+              "description": "Generate report with recommendations",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "6.4",
+          "component": "Threshold Tuner",
+          "description": "Tune detection thresholds based on backtest results",
+          "deliverable": "scripts/tune_thresholds.py",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "6.4.1",
+              "description": "Implement grid search over threshold parameters",
+              "passes": null
+            },
+            {
+              "step_id": "6.4.2",
+              "description": "Evaluate each parameter set against labeled outcomes",
+              "passes": null
+            },
+            {
+              "step_id": "6.4.3",
+              "description": "Optimize for precision vs recall tradeoff",
+              "passes": null
+            },
+            {
+              "step_id": "6.4.4",
+              "description": "Generate recommended threshold configuration",
+              "passes": null
+            },
+            {
+              "step_id": "6.4.5",
+              "description": "Update config files with tuned thresholds",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    },
+    {
+      "phase_id": "7",
+      "phase_name": "Deployment & Monitoring",
+      "effort_hours": "10-15",
+      "components": [
+        {
+          "component_id": "7.1",
+          "component": "Firehose Service",
+          "description": "Deploy firehose pipeline as Cloud Run service",
+          "deliverable": "Dockerfile + deploy scripts",
+          "effort_hours": "4-6",
+          "steps": [
+            {
+              "step_id": "7.1.1",
+              "description": "Create Dockerfile for firehose service",
+              "passes": null
+            },
+            {
+              "step_id": "7.1.2",
+              "description": "Configure Cloud Run service (memory, CPU, always-on)",
+              "passes": null
+            },
+            {
+              "step_id": "7.1.3",
+              "description": "Set up secrets and environment variables",
+              "passes": null
+            },
+            {
+              "step_id": "7.1.4",
+              "description": "Create deploy script",
+              "passes": null
+            },
+            {
+              "step_id": "7.1.5",
+              "description": "Test deployment in staging",
+              "passes": null
+            },
+            {
+              "step_id": "7.1.6",
+              "description": "Deploy to production",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "7.2",
+          "component": "TA Pipeline Service",
+          "description": "Deploy TA pipeline as scheduled Cloud Run job",
+          "deliverable": "Dockerfile + Cloud Scheduler config",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "7.2.1",
+              "description": "Create Dockerfile for TA pipeline",
+              "passes": null
+            },
+            {
+              "step_id": "7.2.2",
+              "description": "Configure Cloud Run job",
+              "passes": null
+            },
+            {
+              "step_id": "7.2.3",
+              "description": "Create Cloud Scheduler job (every 5 min during market hours)",
+              "passes": null
+            },
+            {
+              "step_id": "7.2.4",
+              "description": "Test scheduled execution",
+              "passes": null
+            },
+            {
+              "step_id": "7.2.5",
+              "description": "Deploy to production",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "7.3",
+          "component": "Monitoring Dashboard",
+          "description": "Set up Cloud Monitoring dashboard with alerts",
+          "deliverable": "Cloud Monitoring configuration",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "7.3.1",
+              "description": "Create dashboard with key metrics (trades/sec, triggers/day, errors)",
+              "passes": null
+            },
+            {
+              "step_id": "7.3.2",
+              "description": "Set up alerting policy for firehose disconnection",
+              "passes": null
+            },
+            {
+              "step_id": "7.3.3",
+              "description": "Set up alerting policy for error rate spike",
+              "passes": null
+            },
+            {
+              "step_id": "7.3.4",
+              "description": "Set up alerting policy for excessive triggers (>1000/day)",
+              "passes": null
+            },
+            {
+              "step_id": "7.3.5",
+              "description": "Configure notification channels (email, Slack)",
+              "passes": null
+            }
+          ],
+          "passes": null
+        },
+        {
+          "component_id": "7.4",
+          "component": "Daily Baseline Refresh Job",
+          "description": "Scheduled job to refresh baseline calculations and cleanup old data",
+          "deliverable": "scripts/refresh_baselines.py + Cloud Scheduler",
+          "effort_hours": "2-3",
+          "steps": [
+            {
+              "step_id": "7.4.1",
+              "description": "Implement baseline refresh logic (recalculate 20-day rolling averages)",
+              "passes": null
+            },
+            {
+              "step_id": "7.4.2",
+              "description": "Implement old data cleanup (delete buckets older than 30 days)",
+              "passes": null
+            },
+            {
+              "step_id": "7.4.3",
+              "description": "Create Cloud Scheduler job (daily after market close)",
+              "passes": null
+            },
+            {
+              "step_id": "7.4.4",
+              "description": "Test scheduled execution",
+              "passes": null
+            },
+            {
+              "step_id": "7.4.5",
+              "description": "Deploy to production",
+              "passes": null
+            }
+          ],
+          "passes": null
+        }
+      ]
+    }
+  ],
+  "checkpoints_summary": [
+    {
+      "id": "CP0a",
+      "after_step": "0.1",
+      "criteria": "V2 GCP project operational",
+      "action_if_failed": "Debug GCP setup before continuing"
+    },
+    {
+      "id": "CP0b",
+      "after_step": "0.2",
+      "criteria": "V1 dependencies fully mapped",
+      "action_if_failed": "Do not proceed to DB cleanup"
+    },
+    {
+      "id": "CP0c",
+      "after_step": "0.3",
+      "criteria": "DB cleanup successful, V1 unaffected",
+      "action_if_failed": "Restore from backup, reassess"
+    },
+    {
+      "id": "CP1",
+      "after_step": "0.4.2",
+      "criteria": "Baseline correlation > 0.4",
+      "action_if_failed": "Reconsider baseline approach"
+    },
+    {
+      "id": "CP2",
+      "after_step": "0.4.3",
+      "criteria": "Time multipliers improve accuracy",
+      "action_if_failed": "Accept higher noise, proceed"
+    },
+    {
+      "id": "CP3",
+      "after_step": "3.3",
+      "criteria": "Triggers < 1000/day",
+      "action_if_failed": "Tighten thresholds"
+    },
+    {
+      "id": "CP4",
+      "after_step": "4.4",
+      "criteria": "TA pipeline stable at 1000 symbols",
+      "action_if_failed": "Optimize batching/caching"
+    },
+    {
+      "id": "CP5",
+      "after_step": "6.1",
+      "criteria": "Triggers have signal vs random",
+      "action_if_failed": "Revisit detection logic"
+    }
+  ],
+  "storage_estimates": {
+    "intraday_baselines_30m": {
+      "rows_per_day": 13000,
+      "rows_per_month": 400000,
+      "purpose": "Time-of-day calibration"
+    },
+    "uoa_triggers_v2": {
+      "rows_per_day": "50-500",
+      "rows_per_month": 15000,
+      "purpose": "Triggered events"
+    },
+    "gex_metrics_snapshot": {
+      "rows_per_day": "50-500",
+      "rows_per_month": 15000,
+      "purpose": "GEX/DEX on trigger"
+    },
+    "pd_phase_signals": {
+      "rows_per_day": "10-100",
+      "rows_per_month": 3000,
+      "purpose": "Phase transitions"
+    },
+    "ta_snapshots_v2": {
+      "rows_per_day": 78000,
+      "rows_per_month": 2340000,
+      "size_per_year_gb": 2.8,
+      "purpose": "TA for tracked symbols (5-min intervals)"
+    }
+  }
+}
