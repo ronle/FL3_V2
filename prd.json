@@ -20,44 +20,44 @@
               "step_id": "0.1.1",
               "description": "Create new GCP project (fl3-v2-prod)",
               "command": "gcloud projects create fl3-v2-prod --name=\"FL3 V2 Production\"",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.2",
               "description": "Enable required APIs (Cloud Run, SQL, Secrets, Scheduler, Logging, Monitoring, Artifact Registry, Build)",
               "command": "gcloud services enable run.googleapis.com sqladmin.googleapis.com secretmanager.googleapis.com cloudscheduler.googleapis.com logging.googleapis.com monitoring.googleapis.com artifactregistry.googleapis.com cloudbuild.googleapis.com",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.3",
               "description": "Create service accounts with appropriate roles (fl3-v2-cloudrun, fl3-v2-scheduler, fl3-v2-deployer)",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.4",
               "description": "Configure Cloud SQL connection to existing fr3-pg instance",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.5",
               "description": "Copy secrets from V1 project to V2 Secret Manager (DATABASE_URL, POLYGON_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY)",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.6",
               "description": "Set up Artifact Registry for container images",
               "command": "gcloud artifacts repositories create fl3-v2-images --repository-format=docker --location=us-west1",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.7",
               "description": "Configure Cloud Logging and Monitoring dashboards",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.1.8",
               "description": "Set up billing alerts",
-              "passes": null
+              "passes": true
             }
           ],
           "checkpoint": {
@@ -65,7 +65,7 @@
             "criteria": "V2 GCP project operational with DB connectivity",
             "action_if_failed": "Debug GCP setup before continuing"
           },
-          "passes": null
+          "passes": true
         },
         {
           "component_id": "0.2",
@@ -77,32 +77,32 @@
             {
               "step_id": "0.2.1",
               "description": "Inventory all V1 Cloud Run services and their status (active vs disabled)",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.2.2",
               "description": "Inventory all V1 Cloud Scheduler jobs and their dependencies",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.2.3",
               "description": "Map V1 code dependencies to database tables (create dependency matrix)",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.2.4",
               "description": "Identify tables safe to drop vs must keep (finalize Drop/Keep list)",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.2.5",
               "description": "Test V1 ORATS ingest in isolation to confirm it will remain unaffected",
-              "passes": null
+              "passes": true
             },
             {
               "step_id": "0.2.6",
               "description": "Document V1 rollback procedure in case of unexpected issues",
-              "passes": null
+              "passes": true
             }
           ],
           "checkpoint": {
@@ -110,7 +110,7 @@
             "criteria": "V1 dependencies fully mapped, active services confirmed",
             "action_if_failed": "Do not proceed to DB cleanup"
           },
-          "passes": null
+          "passes": true
         },
         {
           "component_id": "0.3",
