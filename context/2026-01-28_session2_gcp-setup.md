@@ -1,5 +1,5 @@
-# Session 2: GCP Setup & Backup Started
-Date: 2026-01-28 15:13-17:20 PST
+# Session 2: GCP Setup + Phase 0-2 Complete
+Date: 2026-01-28 15:13 PST - ongoing
 
 ## Completed
 
@@ -124,27 +124,38 @@ $env:PGPASSWORD = $pass
 psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
 ```
 
-## Tables to DROP (~42 GB)
-```sql
-DROP TABLE IF EXISTS 
-  option_trades_2025_09,
-  option_trades_2025_10,
-  option_trades_2025_11,
-  option_trades_2025_12,
-  option_trades_default,
-  option_trades_bad_ts,
-  option_trades,
-  uoa_hit_components,
-  uoa_hits,
-  uoa_baselines,
-  option_greeks_latest,
-  option_oi_daily,
-  option_contracts
-CASCADE;
+## Git Commits This Session
+- e18a7c5: [feat] Complete Phase 0-2: Infrastructure, Schema, Core Components
+- 5253680: [docs] Session 2 context - GCP setup complete, backup in progress
+- 4f16cf0: [docs] Add V1 dependency matrix
 
-VACUUM FULL;
+## Project Structure After Phase 2
 ```
-
-## Git Status
-- Commit f4b28d5: Context summaries
-- Commit 4f16cf0: V1 dependency matrix
+FL3_V2/
+├── adapters/
+│   ├── __init__.py
+│   └── polygon_snapshot.py
+├── analysis/
+│   ├── __init__.py
+│   ├── baseline_manager.py
+│   ├── gex_aggregator.py
+│   └── greeks_calculator.py
+├── config/
+│   └── time_multipliers.json
+├── context/
+│   └── 2026-01-28_session2_gcp-setup.md
+├── docs/
+│   ├── ta_pipeline_assessment.md
+│   └── v1_dependency_matrix.md
+├── sql/
+│   └── create_tables_v2.sql
+├── tests/
+│   ├── test_baseline_validation.py
+│   └── test_firehose_feasibility.py
+├── utils/
+│   ├── __init__.py
+│   └── occ_parser.py
+├── CLAUDE.md
+├── prd.json
+└── requirements.txt
+```
