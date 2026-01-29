@@ -1,5 +1,5 @@
-# Session 2: GCP Setup + Phase 0-4 Complete
-Date: 2026-01-28 15:13 PST - 2026-01-29 00:25 PST
+# Session 2: GCP Setup + Phase 0-5 Complete
+Date: 2026-01-28 15:13 PST - 2026-01-29 00:40 PST
 
 ## Completed
 
@@ -144,10 +144,24 @@ Module `__init__.py` created for: `tracking/`
 
 **CP4 Checkpoint**: Test with 5 symbols = 228ms. Projected 1000 symbols: ~45s (within 60s target)
 
+### Phase 5: Phase Detection Logic ✅
+
+| Component | File | Notes |
+|-----------|------|-------|
+| 5.1 Setup Detector | `phase_detectors/setup.py` | UOA + IV + OI signals |
+| 5.2 Acceleration Detector | `phase_detectors/acceleration.py` | Breakout + RSI + GEX + VWAP |
+| 5.3 Reversal Detector | `phase_detectors/reversal.py` | Vanna flip + RSI div + IV crush |
+| 5.4 Phase Scorer | `phase_detectors/phase_scorer.py` | Unified scoring + transitions |
+
+**P&D Cycle Test**: Full cycle simulated successfully
+- NONE -> SETUP (0.91)
+- SETUP -> ACCELERATION (0.92)
+- ACCELERATION -> REVERSAL (0.90)
+
 ## Next Steps
 
-1. **Phase 5: Phase Detection** — Setup/Acceleration/Reversal detectors
-2. **Phase 6: Backtesting** — Outcome labeler, threshold tuning
+1. **Phase 6: Backtesting** — Outcome labeler, threshold tuning
+2. **Phase 7: Deployment** — Dockerfiles, Cloud Run, monitoring
 3. Schedule 30-min firehose test during market hours
 
 ## DB Connection (for CLI)
@@ -162,7 +176,7 @@ psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
 - 5253680: [docs] Session 2 context - GCP setup complete, backup in progress
 - 4f16cf0: [docs] Add V1 dependency matrix
 
-## Project Structure After Phase 4
+## Project Structure After Phase 5
 ```
 FL3_V2/
 ├── adapters/
@@ -187,6 +201,12 @@ FL3_V2/
 │   ├── aggregator.py
 │   ├── bucket_aggregator.py
 │   └── client.py
+├── phase_detectors/
+│   ├── __init__.py
+│   ├── acceleration.py
+│   ├── phase_scorer.py
+│   ├── reversal.py
+│   └── setup.py
 ├── scripts/
 │   ├── firehose_main.py
 │   └── ta_pipeline_v2.py

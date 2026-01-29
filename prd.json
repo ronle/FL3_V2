@@ -574,38 +574,14 @@
           "deliverable": "phase_detectors/setup.py",
           "effort_hours": "3-4",
           "steps": [
-            {
-              "step_id": "5.1.1",
-              "description": "Define Setup phase criteria and thresholds",
-              "passes": null
-            },
-            {
-              "step_id": "5.1.2",
-              "description": "Implement UOA trigger check (volume > 3x baseline)",
-              "passes": null
-            },
-            {
-              "step_id": "5.1.3",
-              "description": "Implement IV elevation check (iv_rank > 50 from ORATS)",
-              "passes": null
-            },
-            {
-              "step_id": "5.1.4",
-              "description": "Implement OI building check (call OI increasing from snapshot)",
-              "passes": null
-            },
-            {
-              "step_id": "5.1.5",
-              "description": "Combine signals into Setup phase score",
-              "passes": null
-            },
-            {
-              "step_id": "5.1.6",
-              "description": "Write unit tests with mock data",
-              "passes": null
-            }
+            {"step_id": "5.1.1", "description": "Define Setup phase criteria and thresholds", "passes": true},
+            {"step_id": "5.1.2", "description": "Implement UOA trigger check (volume > 3x baseline)", "passes": true},
+            {"step_id": "5.1.3", "description": "Implement IV elevation check (iv_rank > 50 from ORATS)", "passes": true},
+            {"step_id": "5.1.4", "description": "Implement OI building check (call OI increasing from snapshot)", "passes": true},
+            {"step_id": "5.1.5", "description": "Combine signals into Setup phase score", "passes": true},
+            {"step_id": "5.1.6", "description": "Write unit tests with mock data", "passes": true}
           ],
-          "passes": null
+          "passes": true
         },
         {
           "component_id": "5.2",
@@ -614,48 +590,16 @@
           "deliverable": "phase_detectors/acceleration.py",
           "effort_hours": "3-4",
           "steps": [
-            {
-              "step_id": "5.2.1",
-              "description": "Define Acceleration phase criteria and thresholds",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.2",
-              "description": "Implement price breakout check (price > 3x ATR from TA)",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.3",
-              "description": "Implement volume surge check (sustained high volume)",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.4",
-              "description": "Implement GEX positive check (net_gex > 0 from snapshot)",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.5",
-              "description": "Implement RSI overbought check (RSI > 70 from TA)",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.6",
-              "description": "Implement VWAP deviation check",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.7",
-              "description": "Combine signals into Acceleration phase score",
-              "passes": null
-            },
-            {
-              "step_id": "5.2.8",
-              "description": "Write unit tests with mock data",
-              "passes": null
-            }
+            {"step_id": "5.2.1", "description": "Define Acceleration phase criteria and thresholds", "passes": true},
+            {"step_id": "5.2.2", "description": "Implement price breakout check (price > 3x ATR from TA)", "passes": true},
+            {"step_id": "5.2.3", "description": "Implement volume surge check (sustained high volume)", "passes": true},
+            {"step_id": "5.2.4", "description": "Implement GEX positive check (net_gex > 0 from snapshot)", "passes": true},
+            {"step_id": "5.2.5", "description": "Implement RSI overbought check (RSI > 70 from TA)", "passes": true},
+            {"step_id": "5.2.6", "description": "Implement VWAP deviation check", "passes": true},
+            {"step_id": "5.2.7", "description": "Combine signals into Acceleration phase score", "passes": true},
+            {"step_id": "5.2.8", "description": "Write unit tests with mock data", "passes": true}
           ],
-          "passes": null
+          "passes": true
         },
         {
           "component_id": "5.3",
@@ -664,88 +608,32 @@
           "deliverable": "phase_detectors/reversal.py",
           "effort_hours": "4-6",
           "steps": [
-            {
-              "step_id": "5.3.1",
-              "description": "Define Reversal phase criteria and thresholds",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.2",
-              "description": "Implement Vanna flip check (net_vex sign change)",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.3",
-              "description": "Implement GEX negative check (net_gex < 0)",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.4",
-              "description": "Implement RSI divergence check (price up, RSI down)",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.5",
-              "description": "Implement volume climax check (spike then drop)",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.6",
-              "description": "Implement IV crush check (iv_rank dropping from ORATS)",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.7",
-              "description": "Combine signals into Reversal phase score",
-              "passes": null
-            },
-            {
-              "step_id": "5.3.8",
-              "description": "Write unit tests with mock data",
-              "passes": null
-            }
+            {"step_id": "5.3.1", "description": "Define Reversal phase criteria and thresholds", "passes": true},
+            {"step_id": "5.3.2", "description": "Implement Vanna flip check (net_vex sign change)", "passes": true},
+            {"step_id": "5.3.3", "description": "Implement GEX negative check (net_gex < 0)", "passes": true},
+            {"step_id": "5.3.4", "description": "Implement RSI divergence check (price up, RSI down)", "passes": true},
+            {"step_id": "5.3.5", "description": "Implement volume climax check (spike then drop)", "passes": true},
+            {"step_id": "5.3.6", "description": "Implement IV crush check (iv_rank dropping from ORATS)", "passes": true},
+            {"step_id": "5.3.7", "description": "Combine signals into Reversal phase score", "passes": true},
+            {"step_id": "5.3.8", "description": "Write unit tests with mock data", "passes": true}
           ],
-          "passes": null
+          "passes": true
         },
         {
           "component_id": "5.4",
           "component": "Phase Scoring Engine",
           "description": "Combine phase detectors into unified scoring system with transition tracking",
-          "deliverable": "analysis/phase_scorer.py",
+          "deliverable": "phase_detectors/phase_scorer.py",
           "effort_hours": "3-4",
           "steps": [
-            {
-              "step_id": "5.4.1",
-              "description": "Implement unified score calculation across phases",
-              "passes": null
-            },
-            {
-              "step_id": "5.4.2",
-              "description": "Implement phase transition detection (Setup → Acceleration → Reversal)",
-              "passes": null
-            },
-            {
-              "step_id": "5.4.3",
-              "description": "Store phase signals to pd_phase_signals table",
-              "passes": null
-            },
-            {
-              "step_id": "5.4.4",
-              "description": "Implement alert generation on high-confidence transitions",
-              "passes": null
-            },
-            {
-              "step_id": "5.4.5",
-              "description": "Add configurable thresholds for each phase",
-              "passes": null
-            },
-            {
-              "step_id": "5.4.6",
-              "description": "Write integration tests for full scoring flow",
-              "passes": null
-            }
+            {"step_id": "5.4.1", "description": "Implement unified score calculation across phases", "passes": true},
+            {"step_id": "5.4.2", "description": "Implement phase transition detection (Setup -> Acceleration -> Reversal)", "passes": true},
+            {"step_id": "5.4.3", "description": "Store phase signals to pd_phase_signals table", "passes": true},
+            {"step_id": "5.4.4", "description": "Implement alert generation on high-confidence transitions", "passes": true},
+            {"step_id": "5.4.5", "description": "Add configurable thresholds for each phase", "passes": true},
+            {"step_id": "5.4.6", "description": "Write integration tests for full scoring flow", "passes": true, "notes": "Full P&D cycle test: NONE->SETUP->ACCEL->REVERSAL with 3 transitions"}
           ],
-          "passes": null
+          "passes": true
         }
       ]
     },
