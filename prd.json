@@ -634,6 +634,20 @@
             {"step_id": "5.4.6", "description": "Write integration tests for full scoring flow", "passes": true, "notes": "Full P&D cycle test: NONE->SETUP->ACCEL->REVERSAL with 3 transitions"}
           ],
           "passes": true
+        },
+        {
+          "component_id": "5.5",
+          "component": "Earnings Proximity Filter",
+          "description": "Filter/flag UOA candidates that are within earnings window to reduce false positives from legitimate earnings volatility",
+          "deliverable": "earnings_filter.py integrated into UOA scoring",
+          "effort_hours": "2-3",
+          "steps": [
+            {"step_id": "5.5.1", "description": "Create is_earnings_adjacent() function checking earnings_calendar table for +/- 3 days"},
+            {"step_id": "5.5.2", "description": "Integrate earnings check into UOA candidate scoring with 0.3x confidence multiplier"},
+            {"step_id": "5.5.3", "description": "Add earnings_flag boolean to uoa_triggers_v2 schema"},
+            {"step_id": "5.5.4", "description": "Log earnings-filtered candidates separately for analysis"},
+            {"step_id": "5.5.5", "description": "Validate filter effectiveness: compare filtered vs unfiltered candidate outcomes"}
+          ]
         }
       ]
     },
@@ -1009,6 +1023,31 @@
             }
           ],
           "passes": true
+        },
+        {
+          "component_id": "7.5",
+          "component": "Earnings Calendar Job (Dormant)",
+          "description": "Copy V1 earnings calendar job to V2 project in PAUSED state. Will be activated when V2 takes over data responsibilities.",
+          "deliverable": "fr3-earnings-calendar job deployed to V2 (paused)",
+          "effort_hours": "1-2",
+          "steps": [
+            {
+              "step_id": "7.5.1",
+              "description": "Copy FINNHUB_API_KEY secret from V1 to V2 (required for earnings data)"
+            },
+            {
+              "step_id": "7.5.2",
+              "description": "Deploy fr3-earnings-calendar Cloud Run job to V2 project using same image"
+            },
+            {
+              "step_id": "7.5.3",
+              "description": "Create scheduler job fr-earnings-calendar-daily in V2 (PAUSED state)"
+            },
+            {
+              "step_id": "7.5.4",
+              "description": "Document cutover procedure: pause V1 job, enable V2 job"
+            }
+          ]
         }
       ]
     }
