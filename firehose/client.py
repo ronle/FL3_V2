@@ -190,7 +190,16 @@ class FirehoseClient:
 
         while self._running:
             try:
-                if not self._ws or self._ws.closed:
+                # Check if connection is open (websockets 12+ uses .state)
+                ws_closed = True
+                if self._ws:
+                    try:
+                        ws_closed = self._ws.state.name != "OPEN"
+                    except AttributeError:
+                        # Fallback for older websockets versions
+                        ws_closed = getattr(self._ws, 'closed', True)
+
+                if not self._ws or ws_closed:
                     connected = await self.connect()
                     if not connected:
                         delay = RECONNECT_DELAYS[min(reconnect_attempt, len(RECONNECT_DELAYS) - 1)]
