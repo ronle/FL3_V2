@@ -665,6 +665,20 @@
             {"step_id": "5.6.6", "description": "Add position sizing modifier: NEUTRAL signals get 0.5x size, directional signals get 1.0x", "passes": true, "notes": "size_modifier field in DirectionSignal: 1.0 for directional, 0.5 for neutral"}
           ],
           "passes": true
+        },
+        {
+          "component_id": "5.7",
+          "component": "Liquidity & Price Filter",
+          "description": "Filter out penny stocks and illiquid tickers that are untradeable or have excessive slippage risk. Uses ORATS stock_price and avg_daily_volume fields.",
+          "deliverable": "liquidity_filter.py integrated into UOA candidate screening",
+          "effort_hours": "1-2",
+          "steps": [
+            {"step_id": "5.7.1", "description": "Create passes_liquidity_filter() function checking stock_price >= $5.00 and avg_daily_volume >= 10,000"},
+            {"step_id": "5.7.2", "description": "Add filter as FIRST step in UOA candidate pipeline (before scoring)"},
+            {"step_id": "5.7.3", "description": "Log filtered-out tickers with reason (PENNY_STOCK or LOW_VOLUME)"},
+            {"step_id": "5.7.4", "description": "Add liquidity metrics to candidate output: price, avg_volume, avg_spread if available"},
+            {"step_id": "5.7.5", "description": "Make thresholds configurable via config/filters.json"}
+          ]
         }
       ]
     },

@@ -1,31 +1,97 @@
-# CLI Task: Implement Earnings Filter (5.5) + Direction Classifier (5.6)
+# CLI Task: Implement Filters (5.5, 5.6, 5.7) - URGENT
 
 **Priority:** HIGH - Needed for today's trading day
 **Time:** Late night 2026-01-28
 
 ## Why This Matters
 
-Today's scan showed two problems:
+Today's scan showed THREE problems:
 1. **8 of 20 candidates were earnings plays** (IBM, SBUX, etc.) - false positives
 2. **PLRX flagged as candidate but it's a DUMP** - 1000 puts, 13.89 P/C ratio, price declining
+3. **PLRX is a $1.27 penny stock with 1,072 avg volume** - untradeable garbage
 
-We need BOTH filters before market open.
+We need ALL THREE filters before market open.
 
 ---
 
-## Part 1: Component 5.5 - Earnings Proximity Filter
+## Part 1: Component 5.7 - Liquidity & Price Filter (DO THIS FIRST)
+
+This should be the FIRST filter in the pipeline - no point scoring illiquid junk.
+
+### 5.7.1: Create liquidity filter
+**File:** `analysis/liquidity_filter.py` (new)
+
+```python
+from typing import Tuple
+
+# Default thresholds - load from config/filters.json if exists
+MIN_PRICE = 5.00          # Avoid penny stocks
+MIN_AVG_VOLUME = 10000    # Ensure liquidity
+
+def passes_liquidity_filter(
+    stock_price: float, 
+    avg_daily_volume: int
+) -> Tuple[bool, str]:
+    """
+    Check if ticker passes liquidity requirements.
+    Returns: (passes, reason)
+    - reason is empty string if passes, otherwise 'PENNY_STOCK' or 'LOW_VOLUME'
+    """
+    if stock_price < MIN_PRICE:
+        return (False, 'PENNY_STOCK')
+    if avg_daily_volume < MIN_AVG_VOLUME:
+        return (False, 'LOW_VOLUME')
+    return (True, '')
+
+
+def load_filter_config():
+    """Load thresholds from config/filters.json if exists"""
+    import json
+    import os
+    config_path = os.path.join(os.path.dirname(__file__), '..', 'config', 'filters.json')
+    if os.path.exists(config_path):
+        with open(config_path) as f:
+            return json.load(f)
+    return {'min_price': MIN_PRICE, 'min_avg_volume': MIN_AVG_VOLUME}
+```
+
+### 5.7.2: Create config file
+**File:** `config/filters.json`
+
+```json
+{
+  "liquidity": {
+    "min_price": 5.00,
+    "min_avg_volume": 10000,
+    "max_price": 500.00
+  },
+  "earnings": {
+    "proximity_days": 3,
+    "confidence_multiplier": 0.3
+  },
+  "direction": {
+    "bullish_pc_threshold": 0.5,
+    "bearish_pc_threshold": 2.0,
+    "flat_trend_threshold": 0.01
+  }
+}
+```
+
+---
+
+## Part 2: Component 5.5 - Earnings Proximity Filter
 
 ### 5.5.1: Create earnings filter
 **File:** `analysis/earnings_filter.py` (new)
 
 ```python
 from typing import Tuple, Optional
-import os
 
 def is_earnings_adjacent(symbol: str, days: int = 3, db_conn=None) -> Tuple[bool, Optional[int]]:
     """
     Check if symbol has earnings within +/- days window.
-    Returns: (is_adjacent, days_to_earnings) where days_to_earnings is negative for past, positive for future
+    Returns: (is_adjacent, days_to_earnings)
+    - days_to_earnings: negative for past, positive for future, None if no earnings
     """
     query = """
         SELECT event_date - CURRENT_DATE as days_until
@@ -36,28 +102,23 @@ def is_earnings_adjacent(symbol: str, days: int = 3, db_conn=None) -> Tuple[bool
         ORDER BY ABS(event_date - CURRENT_DATE)
         LIMIT 1
     """
-    # Execute query, return (True, days) if found, (False, None) if not
+    # Execute and return (True, days) if found, (False, None) if not
 ```
-
-### 5.5.2-5.5.5: Integrate into scoring
-- 0.3x confidence multiplier for earnings-adjacent
-- Add `earnings_flag` and `earnings_days` columns
-- Log separately
 
 ---
 
-## Part 2: Component 5.6 - Signal Direction Classifier
+## Part 3: Component 5.6 - Signal Direction Classifier
 
 ### 5.6.1: Create price trend function
 **File:** `analysis/direction_classifier.py` (new)
 
 ```python
+from typing import Tuple
+
 def get_price_trend(symbol: str, days: int = 5, db_conn=None) -> Tuple[float, str]:
     """
     Calculate price trend over N days.
     Returns: (pct_change, trend_label)
-    - pct_change: e.g., -0.03 for -3%
-    - trend_label: 'UP', 'DOWN', or 'FLAT' (within +/- 1%)
     """
     query = """
         WITH prices AS (
@@ -74,20 +135,12 @@ def get_price_trend(symbol: str, days: int = 5, db_conn=None) -> Tuple[float, st
     """
     # Calculate: (latest - oldest) / oldest
     # Return ('UP' if > 1%, 'DOWN' if < -1%, else 'FLAT')
-```
 
-### 5.6.2: Create direction classifier
 
-```python
 def classify_direction(put_call_ratio: float, price_trend: str) -> Tuple[str, str]:
     """
     Classify signal direction based on options flow + price trend.
     Returns: (direction, entry_side)
-    
-    Logic:
-    - Call-heavy (P/C < 0.5) + UP/FLAT trend = BULLISH -> LONG
-    - Put-heavy (P/C > 2.0) + DOWN trend = BEARISH -> SHORT
-    - Everything else = NEUTRAL -> SKIP or reduced size
     """
     if put_call_ratio < 0.5 and price_trend in ('UP', 'FLAT'):
         return ('BULLISH', 'LONG')
@@ -97,50 +150,60 @@ def classify_direction(put_call_ratio: float, price_trend: str) -> Tuple[str, st
         return ('NEUTRAL', 'SKIP')
 ```
 
-### 5.6.3: Schema update
-
-```sql
--- Add to uoa_triggers_v2
-ALTER TABLE uoa_triggers_v2 
-ADD COLUMN IF NOT EXISTS signal_direction TEXT CHECK (signal_direction IN ('BULLISH', 'BEARISH', 'NEUTRAL')),
-ADD COLUMN IF NOT EXISTS entry_side TEXT CHECK (entry_side IN ('LONG', 'SHORT', 'SKIP')),
-ADD COLUMN IF NOT EXISTS price_trend_5d NUMERIC(8,4),
-ADD COLUMN IF NOT EXISTS earnings_flag BOOLEAN DEFAULT FALSE,
-ADD COLUMN IF NOT EXISTS earnings_days INTEGER;
-```
-
 ---
 
-## Part 3: Integration into identify_uoa_candidates.py
+## Part 4: Integration Pipeline
+
+**Modify:** `scripts/identify_uoa_candidates.py`
 
 ```python
+from analysis.liquidity_filter import passes_liquidity_filter
 from analysis.earnings_filter import is_earnings_adjacent
 from analysis.direction_classifier import get_price_trend, classify_direction
 
-def score_candidate(candidate):
-    score = candidate.base_score
+def process_candidates(raw_candidates):
+    results = {
+        'filtered_liquidity': [],
+        'filtered_earnings': [],
+        'bullish': [],
+        'bearish': [],
+        'neutral': []
+    }
     
-    # 1. Earnings filter
-    is_earnings, days_to = is_earnings_adjacent(candidate.symbol)
-    if is_earnings:
-        candidate.earnings_flag = True
-        candidate.earnings_days = days_to
-        score *= 0.3
+    for c in raw_candidates:
+        # STEP 1: Liquidity filter (first!)
+        passes, reason = passes_liquidity_filter(c.stock_price, c.avg_daily_volume)
+        if not passes:
+            results['filtered_liquidity'].append((c.symbol, reason, c.stock_price, c.avg_daily_volume))
+            continue
+        
+        # STEP 2: Score and apply earnings filter
+        score = calculate_base_score(c)
+        is_earnings, days_to = is_earnings_adjacent(c.symbol)
+        if is_earnings:
+            c.earnings_flag = True
+            c.earnings_days = days_to
+            score *= 0.3
+            results['filtered_earnings'].append(c)
+            continue  # Or keep in separate bucket
+        
+        # STEP 3: Direction classification
+        pct_change, trend = get_price_trend(c.symbol)
+        direction, entry_side = classify_direction(c.put_call_ratio, trend)
+        
+        c.signal_direction = direction
+        c.entry_side = entry_side
+        c.final_score = score
+        
+        # STEP 4: Bucket by direction
+        if direction == 'BULLISH':
+            results['bullish'].append(c)
+        elif direction == 'BEARISH':
+            results['bearish'].append(c)
+        else:
+            results['neutral'].append(c)
     
-    # 2. Direction classification
-    pct_change, trend = get_price_trend(candidate.symbol)
-    direction, entry_side = classify_direction(candidate.put_call_ratio, trend)
-    
-    candidate.signal_direction = direction
-    candidate.entry_side = entry_side
-    candidate.price_trend_5d = pct_change
-    
-    # 3. Neutral signals get reduced confidence
-    if direction == 'NEUTRAL':
-        score *= 0.5
-    
-    candidate.final_score = score
-    return candidate
+    return results
 ```
 
 ---
@@ -152,7 +215,14 @@ def score_candidate(candidate):
                     FL3 V2 UOA CANDIDATES - 2026-01-29
 ================================================================================
 
-=== EARNINGS-ADJACENT (0.3x Confidence) ===
+=== FILTERED: LIQUIDITY (Not Tradeable) ===
+Symbol | Price  | Avg Vol | Reason
+-------|--------|---------|------------
+PLRX   | $1.27  | 1,072   | PENNY_STOCK
+TBPH   | $19.03 | 4,048   | LOW_VOLUME
+VTEB   | $50.59 | 5,417   | LOW_VOLUME
+
+=== FILTERED: EARNINGS (0.3x Confidence) ===
 Symbol | Raw Score | Adj Score | Direction | Earnings
 -------|-----------|-----------|-----------|----------
 IBM    | 110       | 33        | BULLISH   | TODAY (0d)
@@ -160,24 +230,32 @@ SBUX   | 102       | 31        | BULLISH   | TODAY (0d)
 WDC    | 103       | 31        | NEUTRAL   | TOMORROW (+1d)
 
 === BULLISH CANDIDATES (LONG) ===
-Symbol | Score | P/C Ratio | 5d Trend | IV Rank
--------|-------|-----------|----------|--------
-AAOI   | 109   | 0.32      | +2.1%    | 98
-UUUU   | 109   | 0.41      | +5.3%    | 98
-NET    | 92    | 0.38      | +1.2%    | 79
+Symbol | Score | P/C Ratio | 5d Trend | Price  | Avg Vol
+-------|-------|-----------|----------|--------|--------
+AAOI   | 109   | 0.32      | +2.1%    | $44.63 | 32,928
+UUUU   | 109   | 0.41      | +5.3%    | $27.48 | 127,475
+NET    | 92    | 0.38      | +1.2%    | $184.75| 29,398
 
 === BEARISH CANDIDATES (SHORT) ===
-Symbol | Score | P/C Ratio | 5d Trend | IV Rank
--------|-------|-----------|----------|--------
-PLRX   | 102   | 13.89     | -3.1%    | 84
+Symbol | Score | P/C Ratio | 5d Trend | Price  | Avg Vol
+-------|-------|-----------|----------|--------|--------
+(none after PLRX filtered)
 
-=== NEUTRAL (SKIP or 0.5x Size) ===
+=== NEUTRAL (SKIP) ===
 Symbol | Score | P/C Ratio | 5d Trend | Reason
 -------|-------|-----------|----------|--------
 VIAV   | 46    | 1.20      | -0.5%    | Mixed signals
 
 ================================================================================
-SUMMARY: 100 candidates -> 23 earnings-filtered, 42 BULLISH, 12 BEARISH, 23 NEUTRAL
+PIPELINE SUMMARY
+================================================================================
+Raw candidates:      100
+Liquidity filtered:  12 (PENNY_STOCK: 5, LOW_VOLUME: 7)
+Earnings filtered:   8
+Remaining:           80
+  - BULLISH (LONG):  42
+  - BEARISH (SHORT): 15
+  - NEUTRAL (SKIP):  23
 ================================================================================
 ```
 
@@ -191,18 +269,8 @@ python scripts/identify_uoa_candidates.py
 ```
 
 ### Verify:
-- [ ] PLRX shows as BEARISH/SHORT (P/C 13.89, declining)
-- [ ] IBM/SBUX show earnings flag with reduced score
-- [ ] AAOI/UUUU show as BULLISH/LONG (call-heavy, stable/rising)
-- [ ] Output clearly separates by direction
-
----
-
-## DB Connection Reference
-```python
-import os
-import psycopg2
-
-DATABASE_URL = os.environ.get('DATABASE_URL')
-# or use: postgresql://FR3_User:xxx@127.0.0.1:5433/fl3
-```
+- [ ] PLRX filtered out (penny stock $1.27)
+- [ ] TBPH, VTEB filtered out (low volume)
+- [ ] IBM/SBUX flagged as earnings
+- [ ] AAOI/UUUU show as BULLISH/LONG
+- [ ] Pipeline summary shows filter counts
