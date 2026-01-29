@@ -648,6 +648,21 @@
             {"step_id": "5.5.4", "description": "Log earnings-filtered candidates separately for analysis"},
             {"step_id": "5.5.5", "description": "Validate filter effectiveness: compare filtered vs unfiltered candidate outcomes"}
           ]
+        },
+        {
+          "component_id": "5.6",
+          "component": "Signal Direction Classifier",
+          "description": "Classify UOA signals as BULLISH (pump) or BEARISH (dump) based on options flow direction and price trend. Enables playing both long and short sides.",
+          "deliverable": "direction_classifier.py integrated into UOA scoring",
+          "effort_hours": "3-4",
+          "steps": [
+            {"step_id": "5.6.1", "description": "Create get_price_trend() function - calculate 5-day price change percentage from spot_prices"},
+            {"step_id": "5.6.2", "description": "Create classify_direction() function combining put/call ratio + price trend"},
+            {"step_id": "5.6.3", "description": "Add signal_direction ENUM ('BULLISH', 'BEARISH', 'NEUTRAL') to uoa_triggers_v2 schema"},
+            {"step_id": "5.6.4", "description": "Classification logic: Call-heavy (P/C < 0.5) + flat/up trend = BULLISH; Put-heavy (P/C > 2.0) + declining trend = BEARISH; Mixed = NEUTRAL"},
+            {"step_id": "5.6.5", "description": "Integrate into UOA candidate output with clear direction labels and entry side (LONG vs SHORT)"},
+            {"step_id": "5.6.6", "description": "Add position sizing modifier: NEUTRAL signals get 0.5x size, directional signals get 1.0x"}
+          ]
         }
       ]
     },
