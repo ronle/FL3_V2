@@ -22,6 +22,7 @@ from analysis.earnings_filter import batch_check_earnings, apply_earnings_penalt
 from analysis.direction_classifier import (
     batch_classify_candidates, SignalDirection, get_direction_label, get_entry_label
 )
+from analysis.liquidity_filter import filter_candidates, get_thresholds, get_filter_summary
 
 # UOA detection thresholds
 VOLUME_RATIO_THRESHOLD = 2.0  # Volume > 2x average (using volume_zscore)
@@ -151,7 +152,41 @@ async def main():
             print(f"  - Min volume >= {MIN_VOLUME}")
             return
 
-        print(f"Found {len(candidates)} UOA candidates")
+        print(f"Found {len(candidates)} raw UOA candidates")
+
+        # STEP 1: Apply liquidity filter FIRST (before any scoring)
+        thresholds = get_thresholds()
+        print(f"\nLiquidity Filter Thresholds:")
+        print(f"  - Min stock price: ${thresholds.min_stock_price:.2f}")
+        print(f"  - Min avg option volume: {thresholds.min_avg_option_volume:.0f}")
+        print(f"  - Min total open interest: {thresholds.min_total_open_interest:,}")
+
+        liquid_candidates, illiquid_candidates, filter_stats = filter_candidates(candidates, thresholds)
+
+        print(f"\nLiquidity Filter Results:")
+        print(f"  - Passed: {len(liquid_candidates)}")
+        print(f"  - Filtered: {len(illiquid_candidates)} ({get_filter_summary(filter_stats)})")
+
+        # Show filtered candidates
+        if illiquid_candidates:
+            print(f"\n  Filtered out:")
+            for item in illiquid_candidates[:10]:
+                c = item['candidate']
+                print(f"    {c['symbol']:<8} ${float(c['stock_price']):>7.2f}  "
+                      f"AvgVol: {float(c.get('avg_daily_volume') or 0):>8,.0f}  "
+                      f"OI: {int(c.get('total_open_interest') or 0):>10,}  "
+                      f"-> {item['reason'].value}")
+            if len(illiquid_candidates) > 10:
+                print(f"    ... and {len(illiquid_candidates) - 10} more")
+
+        # Continue with liquid candidates only
+        candidates = liquid_candidates
+
+        if not candidates:
+            print("\nNo candidates passed liquidity filter.")
+            return
+
+        print(f"\nProceeding with {len(candidates)} liquid candidates")
 
         # Check earnings proximity for all candidates
         symbols = [c['symbol'] for c in candidates]

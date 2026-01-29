@@ -1,0 +1,13 @@
+{
+  "liquidity": {
+    "min_stock_price": 5.00,
+    "min_avg_option_volume": 500,
+    "min_total_open_interest": 1000,
+    "enabled": true
+  },
+  "notes": {
+    "min_stock_price": "Filter out penny stocks below this price",
+    "min_avg_option_volume": "Minimum average daily options volume from ORATS avg_daily_volume",
+    "min_total_open_interest": "Minimum total open interest to ensure tradeable options exist"
+  }
+}

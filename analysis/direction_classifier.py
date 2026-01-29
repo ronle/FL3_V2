@@ -66,20 +66,21 @@ async def get_price_trend(
         Tuple of (pct_change, current_price, prior_price)
         Returns (None, None, None) if insufficient data
     """
+    # spot_prices table uses: ticker, underlying (as price), trade_date
     query = """
-        SELECT price, recorded_at
+        SELECT underlying as price, trade_date
         FROM spot_prices
-        WHERE symbol = $1
-        ORDER BY recorded_at DESC
+        WHERE ticker = $1
+        ORDER BY trade_date DESC
         LIMIT 1
     """
 
     query_prior = """
-        SELECT price, recorded_at
+        SELECT underlying as price, trade_date
         FROM spot_prices
-        WHERE symbol = $1
-          AND recorded_at::date <= CURRENT_DATE - $2
-        ORDER BY recorded_at DESC
+        WHERE ticker = $1
+          AND trade_date <= CURRENT_DATE - make_interval(days => $2)
+        ORDER BY trade_date DESC
         LIMIT 1
     """
 
