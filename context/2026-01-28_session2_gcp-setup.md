@@ -1,69 +1,79 @@
-# Session 2: GCP Setup & V1 Validation
-**Date:** 2026-01-28 15:13 - 16:01 PST
-**Market:** RTH
-
-## Summary
-Completed Phase 0 Components 0.1 and 0.2. Started Component 0.3 (DB Backup).
+# Session 2: GCP Setup & Backup Started
+Date: 2026-01-28 15:13-17:20 PST
 
 ## Completed
 
 ### Component 0.1: GCP Project Creation ✅
-- Created `fl3-v2-prod` project
-- Enabled 8 core APIs (Cloud Run, SQL, Secrets, Scheduler, etc.)
-- Created 3 service accounts with proper IAM roles:
-  - fl3-v2-cloudrun (SQL client, secrets accessor, log writer)
-  - fl3-v2-scheduler (run invoker)
-  - fl3-v2-deployer (run admin, artifact writer, build editor)
-- Granted cross-project Cloud SQL access to V1 database
-- Copied 7 secrets: DATABASE_URL, POLYGON_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY, ORATS_FTP_USER, ORATS_FTP_PASSWORD, FMP_API_KEY
-- Created Artifact Registry: fl3-v2-images (Docker, us-west1)
-- Set $100/month budget with 50/90/100% alerts
+- Project `fl3-v2-prod` created
+- 8 APIs enabled (Run, SQL, Secrets, Scheduler, Logging, Monitoring, Artifact Registry, Build)
+- 3 service accounts: fl3-v2-cloudrun, fl3-v2-scheduler, fl3-v2-deployer
+- Cross-project Cloud SQL access configured (V2 can access V1's fr3-pg)
+- 7 secrets copied: DATABASE_URL, POLYGON_API_KEY, ALPACA_API_KEY, ALPACA_SECRET_KEY, ORATS_FTP_USER, ORATS_FTP_PASSWORD, FMP_API_KEY
+- Artifact Registry: fl3-v2-images (us-west1)
+- Billing alert: $100/month (50%, 90%, 100% thresholds)
 
 ### Component 0.2: V1 Compatibility Validation ✅
-- Inventoried 9 Cloud Run services (all active)
-- Inventoried 43 Cloud Scheduler jobs (16 enabled, 27 paused)
-- Identified critical ENABLED jobs:
-  - orats-daily-ingest-trigger (22:00 daily)
-  - orats-track-top50-trigger (05:15 weekdays)
-  - fr-spot-cron (*/5 min RTH)
-  - fr-earnings-calendar-daily (04:00 weekdays)
-  - Various wave-* trading jobs
-- Verified ORATS ingest ran successfully today (06:06 UTC, exit 0)
-- Created dependency matrix: docs/v1_compatibility_validation.md
-- Documented rollback procedure
+- 9 Cloud Run services inventoried
+- 41 scheduler jobs mapped (25 ENABLED, 16 PAUSED)
+- All UOA/options-stream jobs PAUSED → safe to drop tables
+- ORATS ingest confirmed active (5,817 symbols/day through 2026-01-27)
+- No foreign key dependencies on drop tables
+- Dependency matrix: docs/v1_dependency_matrix.md
 
-### Component 0.3: Database Backup (IN PROGRESS)
-- Created backup bucket: gs://fl3-v2-db-backups
-- Granted Cloud SQL service account write access
-- Started async export of option_trades tables (33 GB, RUNNING)
-- Pending exports: option_greeks_latest, option_oi_daily, option_contracts, uoa_hit_components
+### Component 0.3: Database Backup — IN PROGRESS
+Backup bucket: gs://fl3-v2-backups
+Local backup dir: C:\Users\levir\Documents\FL3_V2\backups
 
-## Key Decisions
-1. Database name is `fl3` (not `flowrider`)
-2. Cloud SQL exports run one at a time (must be sequential)
-3. Large exports (33 GB) take 30+ minutes
+#### Backups completed (check sizes):
+- option_contracts.sql.gz
+- uoa_baselines.sql.gz  
+- uoa_hits.sql.gz
+- option_oi_daily.sql.gz
+- option_greeks_latest.sql.gz
+- uoa_hit_components.sql.gz (if completed)
+- option_trades_2025_09.sql (uncompressed?)
+- option_trades_2025_10.sql (uncompressed?)
+- option_trades_2025_11.sql (uncompressed?)
+- option_trades_2025_12.sql (uncompressed?)
+- option_trades_default.sql (uncompressed?)
 
-## Files Changed
-- prd.json (steps 0.1.1-0.1.8, 0.2.1-0.2.6 marked pass)
-- docs/v1_compatibility_validation.md (new)
+## Next Steps for CLI
 
-## Git Commits
-- f73cdbb: [docs] Complete Component 0.2: V1 Compatibility Validation
+1. **Verify backups** — check file sizes in backups/ folder
+2. **Compress any uncompressed .sql files** with gzip
+3. **Upload to GCS**: `gcloud storage cp *.gz gs://fl3-v2-backups/pre-v2-cleanup/`
+4. **Verify backup integrity** — spot check one restore
+5. **Execute DROP statements** — see docs/v1_dependency_matrix.md
+6. **VACUUM FULL** — reclaim disk space
 
-## Next Steps
-1. Monitor option_trades export completion
-2. Run remaining exports sequentially:
-   - gcloud sql export sql fr3-pg gs://fl3-v2-db-backups/uoa_hit_components_backup.sql.gz --database=fl3 --table=uoa_hit_components --project=spartan-buckeye-474319-q8
-   - gcloud sql export sql fr3-pg gs://fl3-v2-db-backups/option_greeks_latest_backup.sql.gz --database=fl3 --table=option_greeks_latest --project=spartan-buckeye-474319-q8
-   - gcloud sql export sql fr3-pg gs://fl3-v2-db-backups/option_oi_daily_backup.sql.gz --database=fl3 --table=option_oi_daily --project=spartan-buckeye-474319-q8
-   - gcloud sql export sql fr3-pg gs://fl3-v2-db-backups/option_contracts_backup.sql.gz --database=fl3 --table=option_contracts --project=spartan-buckeye-474319-q8
-3. Verify backup integrity
-4. Execute DROP statements
-5. Run VACUUM FULL
+## DB Connection (for CLI)
+```powershell
+$pass = gcloud secrets versions access latest --secret=fr3-sql-db-pass --project=spartan-buckeye-474319-q8
+$env:PGPASSWORD = $pass
+psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
+```
 
-## References
-- V1 Project: spartan-buckeye-474319-q8
-- V2 Project: fl3-v2-prod
-- Cloud SQL Instance: fr3-pg (us-west1)
-- Database: fl3
-- Backup Bucket: gs://fl3-v2-db-backups
+## Tables to DROP (~42 GB)
+```sql
+DROP TABLE IF EXISTS 
+  option_trades_2025_09,
+  option_trades_2025_10,
+  option_trades_2025_11,
+  option_trades_2025_12,
+  option_trades_default,
+  option_trades_bad_ts,
+  option_trades,
+  uoa_hit_components,
+  uoa_hits,
+  uoa_baselines,
+  option_greeks_latest,
+  option_oi_daily,
+  option_contracts
+CASCADE;
+
+VACUUM FULL;
+```
+
+## Git Status
+- Commit f4b28d5: Context summaries
+- Commit 4f16cf0: V1 dependency matrix
