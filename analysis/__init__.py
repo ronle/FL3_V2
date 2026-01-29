@@ -15,6 +15,13 @@ from .gex_aggregator import (
     ContractData,
     interpret_gex,
 )
+from .ta_calculator import (
+    TACalculator,
+    TASnapshot,
+    calculate_rsi,
+    calculate_atr,
+    calculate_vwap,
+)
 
 __all__ = [
     'calculate_greeks',
@@ -29,4 +36,9 @@ __all__ = [
     'GEXMetrics',
     'ContractData',
     'interpret_gex',
+    'TACalculator',
+    'TASnapshot',
+    'calculate_rsi',
+    'calculate_atr',
+    'calculate_vwap',
 ]

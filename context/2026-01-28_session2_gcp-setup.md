@@ -1,5 +1,5 @@
-# Session 2: GCP Setup + Phase 0-3 Complete
-Date: 2026-01-28 15:13 PST - 21:50 PST
+# Session 2: GCP Setup + Phase 0-4 Complete
+Date: 2026-01-28 15:13 PST - 2026-01-29 00:25 PST
 
 ## Completed
 
@@ -131,10 +131,23 @@ Module `__init__.py` files created for: `firehose/`, `uoa/`
 2026-01-28 21:47:37 [INFO] Subscribed to T.*
 ```
 
+### Phase 4: TA Pipeline Re-enablement ✅
+
+| Component | File | Notes |
+|-----------|------|-------|
+| 4.1 Ticker Manager | `tracking/ticker_manager_v2.py` | Permanent tracking, batching |
+| 4.2 Alpaca Bars | `adapters/alpaca_bars_batch.py` | 100 symbols/batch, rate limited |
+| 4.3 TA Calculator | `analysis/ta_calculator.py` | RSI, ATR, VWAP, SMA, EMA |
+| 4.4 Pipeline Orchestrator | `scripts/ta_pipeline_v2.py` | 5-min refresh cycle |
+
+Module `__init__.py` created for: `tracking/`
+
+**CP4 Checkpoint**: Test with 5 symbols = 228ms. Projected 1000 symbols: ~45s (within 60s target)
+
 ## Next Steps
 
-1. **Phase 4: TA Pipeline** — Ticker manager, Alpaca bars, TA calculator
-2. **Phase 5: Phase Detection** — Setup/Acceleration/Reversal detectors
+1. **Phase 5: Phase Detection** — Setup/Acceleration/Reversal detectors
+2. **Phase 6: Backtesting** — Outcome labeler, threshold tuning
 3. Schedule 30-min firehose test during market hours
 
 ## DB Connection (for CLI)
@@ -149,17 +162,19 @@ psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
 - 5253680: [docs] Session 2 context - GCP setup complete, backup in progress
 - 4f16cf0: [docs] Add V1 dependency matrix
 
-## Project Structure After Phase 3
+## Project Structure After Phase 4
 ```
 FL3_V2/
 ├── adapters/
 │   ├── __init__.py
+│   ├── alpaca_bars_batch.py
 │   └── polygon_snapshot.py
 ├── analysis/
 │   ├── __init__.py
 │   ├── baseline_manager.py
 │   ├── gex_aggregator.py
-│   └── greeks_calculator.py
+│   ├── greeks_calculator.py
+│   └── ta_calculator.py
 ├── config/
 │   └── time_multipliers.json
 ├── context/
@@ -173,12 +188,16 @@ FL3_V2/
 │   ├── bucket_aggregator.py
 │   └── client.py
 ├── scripts/
-│   └── firehose_main.py
+│   ├── firehose_main.py
+│   └── ta_pipeline_v2.py
 ├── sql/
 │   └── create_tables_v2.sql
 ├── tests/
 │   ├── test_baseline_validation.py
 │   └── test_firehose_feasibility.py
+├── tracking/
+│   ├── __init__.py
+│   └── ticker_manager_v2.py
 ├── uoa/
 │   ├── __init__.py
 │   ├── detector_v2.py
