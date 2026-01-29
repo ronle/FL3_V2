@@ -4,7 +4,7 @@
 
 **At the start of EVERY session, before any other work:**
 
-1. Run `date` or `Get-Date` to confirm current date and time
+1. Run `date` or `Get-Date` to confirm current date and time. Remember, local time is set in PST.
 2. State the current date, time (ET), and day of week
 3. Determine market status:
    - **Market Open**: Mon-Fri 9:30am-4:00pm ET (excluding holidays)
