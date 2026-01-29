@@ -270,6 +270,29 @@ class TAPipelineOrchestrator:
         }
 
 
+async def create_db_pool():
+    """Create database connection pool from DATABASE_URL."""
+    import asyncpg
+
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        logger.warning("DATABASE_URL not set - running without database")
+        return None
+
+    try:
+        pool = await asyncpg.create_pool(
+            database_url,
+            min_size=1,
+            max_size=5,
+            command_timeout=60,
+        )
+        logger.info("Database pool created")
+        return pool
+    except Exception as e:
+        logger.error(f"Failed to create database pool: {e}")
+        return None
+
+
 async def main():
     parser = argparse.ArgumentParser(description="FL3_V2 TA Pipeline")
     parser.add_argument("--once", action="store_true", help="Run single refresh and exit")
@@ -294,41 +317,50 @@ async def main():
     logger.info(f"Mode: {'Test' if args.test else 'Production'}")
     logger.info("=" * 60)
 
-    # Create orchestrator
-    orchestrator = TAPipelineOrchestrator(
-        db_pool=None,  # Would be set in production
-        alpaca_api_key=alpaca_api_key,
-        alpaca_secret_key=alpaca_secret_key,
-    )
+    # Create database pool
+    db_pool = await create_db_pool()
 
-    if args.test:
-        # Run test with mock symbols
-        logger.info("Running test with mock data...")
+    try:
+        # Create orchestrator
+        orchestrator = TAPipelineOrchestrator(
+            db_pool=db_pool,
+            alpaca_api_key=alpaca_api_key,
+            alpaca_secret_key=alpaca_secret_key,
+        )
 
-        # Add mock symbols
-        now = datetime.now()
-        await orchestrator.ticker_manager.add_symbol("AAPL", now)
-        await orchestrator.ticker_manager.add_symbol("TSLA", now)
-        await orchestrator.ticker_manager.add_symbol("NVDA", now)
-        await orchestrator.ticker_manager.add_symbol("MSFT", now)
-        await orchestrator.ticker_manager.add_symbol("AMZN", now)
+        if args.test:
+            # Run test with mock symbols
+            logger.info("Running test with mock data...")
 
-        # Run single refresh
-        try:
+            # Add mock symbols
+            now = datetime.now()
+            await orchestrator.ticker_manager.add_symbol("AAPL", now)
+            await orchestrator.ticker_manager.add_symbol("TSLA", now)
+            await orchestrator.ticker_manager.add_symbol("NVDA", now)
+            await orchestrator.ticker_manager.add_symbol("MSFT", now)
+            await orchestrator.ticker_manager.add_symbol("AMZN", now)
+
+            # Run single refresh
+            try:
+                result = await orchestrator.run_once()
+                logger.info(f"Test result: {result}")
+                logger.info(f"Metrics: {orchestrator.get_metrics()}")
+            finally:
+                await orchestrator._shutdown()
+
+        elif args.once:
+            # Single production run
             result = await orchestrator.run_once()
-            logger.info(f"Test result: {result}")
-            logger.info(f"Metrics: {orchestrator.get_metrics()}")
-        finally:
-            await orchestrator._shutdown()
+            logger.info(f"Refresh result: {result}")
 
-    elif args.once:
-        # Single production run
-        result = await orchestrator.run_once()
-        logger.info(f"Refresh result: {result}")
+        else:
+            # Continuous production run
+            await orchestrator.run()
 
-    else:
-        # Continuous production run
-        await orchestrator.run()
+    finally:
+        if db_pool:
+            await db_pool.close()
+            logger.info("Database pool closed")
 
 
 if __name__ == "__main__":

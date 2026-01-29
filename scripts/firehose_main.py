@@ -8,6 +8,7 @@ Main orchestrator that ties together all firehose components:
 - UOA detector
 - Trigger handler
 - Bucket aggregator
+- HTTP health endpoint (for Cloud Run)
 
 Usage:
     python -m scripts.firehose_main
@@ -22,6 +23,7 @@ import signal
 import sys
 from datetime import datetime, time as dt_time
 from typing import Optional
+from aiohttp import web
 
 import pytz
 
@@ -73,6 +75,39 @@ def get_market_status() -> tuple[str, str]:
         return "CLOSED", "Market closed"
 
 
+class HealthServer:
+    """Simple HTTP server for Cloud Run health checks."""
+
+    def __init__(self, orchestrator: 'FirehoseOrchestrator'):
+        self.orchestrator = orchestrator
+        self.app = web.Application()
+        self.app.router.add_get('/', self.health_check)
+        self.app.router.add_get('/health', self.health_check)
+        self.runner = None
+
+    async def health_check(self, request):
+        """Health check endpoint."""
+        status = "healthy" if self.orchestrator._running else "starting"
+        return web.json_response({
+            "status": status,
+            "trades_processed": self.orchestrator._trades_processed,
+            "timestamp": datetime.now(ET).isoformat(),
+        })
+
+    async def start(self, port: int = 8080):
+        """Start the health server."""
+        self.runner = web.AppRunner(self.app)
+        await self.runner.setup()
+        site = web.TCPSite(self.runner, '0.0.0.0', port)
+        await site.start()
+        logger.info(f"Health server started on port {port}")
+
+    async def stop(self):
+        """Stop the health server."""
+        if self.runner:
+            await self.runner.cleanup()
+
+
 class FirehoseOrchestrator:
     """
     Main orchestrator for the firehose pipeline.
@@ -83,6 +118,7 @@ class FirehoseOrchestrator:
     - UOA detection
     - Trigger handling
     - Bucket storage
+    - HTTP health endpoint
     """
 
     def __init__(
@@ -113,6 +149,7 @@ class FirehoseOrchestrator:
             cooldown_seconds=300,
         )
         self.trigger_handler = TriggerHandler(db_pool=db_pool)
+        self.health_server = HealthServer(self)
 
         # State
         self._running = False
@@ -122,13 +159,23 @@ class FirehoseOrchestrator:
 
     async def run(self) -> None:
         """Run the firehose pipeline."""
+        # Start health server first (for Cloud Run)
+        port = int(os.environ.get("PORT", 8080))
+        await self.health_server.start(port)
+
         # Check market status
         status, msg = get_market_status()
         logger.info(f"Market Status: {status} - {msg}")
 
         if status not in ("OPEN", "PRE_MARKET", "AFTER_HOURS") and not self.test_mode:
             logger.warning("Market is closed. Use --test-mode to run anyway.")
-            return
+            # Keep health server running but don't start firehose
+            while True:
+                await asyncio.sleep(60)
+                status, msg = get_market_status()
+                if status in ("OPEN", "PRE_MARKET"):
+                    logger.info("Market opening, starting firehose...")
+                    break
 
         if self.test_mode:
             logger.warning("Running in TEST MODE - market may be closed")
@@ -276,9 +323,35 @@ class FirehoseOrchestrator:
         # Disconnect client
         await self.client.disconnect()
 
+        # Stop health server
+        await self.health_server.stop()
+
         # Log final metrics
         self._log_health()
         logger.info("Shutdown complete")
+
+
+async def create_db_pool():
+    """Create database connection pool from DATABASE_URL."""
+    import asyncpg
+
+    database_url = os.environ.get('DATABASE_URL')
+    if not database_url:
+        logger.warning("DATABASE_URL not set - running without database")
+        return None
+
+    try:
+        pool = await asyncpg.create_pool(
+            database_url,
+            min_size=2,
+            max_size=10,
+            command_timeout=60,
+        )
+        logger.info("Database pool created")
+        return pool
+    except Exception as e:
+        logger.error(f"Failed to create database pool: {e}")
+        return None
 
 
 async def main():
@@ -304,23 +377,33 @@ async def main():
     logger.info(f"Test Mode: {args.test_mode}")
     logger.info("=" * 60)
 
-    # Run orchestrator
-    orchestrator = FirehoseOrchestrator(
-        api_key=api_key,
-        test_mode=args.test_mode,
-    )
+    # Create database pool
+    db_pool = await create_db_pool()
 
-    if args.duration:
-        # Run for specified duration
-        async def run_with_timeout():
-            task = asyncio.create_task(orchestrator.run())
-            await asyncio.sleep(args.duration)
-            orchestrator._running = False
-            await task
+    try:
+        # Run orchestrator
+        orchestrator = FirehoseOrchestrator(
+            api_key=api_key,
+            db_pool=db_pool,
+            test_mode=args.test_mode,
+        )
 
-        await run_with_timeout()
-    else:
-        await orchestrator.run()
+        if args.duration:
+            # Run for specified duration
+            async def run_with_timeout():
+                task = asyncio.create_task(orchestrator.run())
+                await asyncio.sleep(args.duration)
+                orchestrator._running = False
+                await task
+
+            await run_with_timeout()
+        else:
+            await orchestrator.run()
+
+    finally:
+        if db_pool:
+            await db_pool.close()
+            logger.info("Database pool closed")
 
 
 if __name__ == "__main__":
