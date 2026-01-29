@@ -1,5 +1,5 @@
-# Session 2: GCP Setup + Phase 0-5 Complete
-Date: 2026-01-28 15:13 PST - 2026-01-29 00:40 PST
+# Session 2: GCP Setup + Phase 0-6.4 Complete
+Date: 2026-01-28 15:13 PST - 2026-01-29 00:36 PST
 
 ## Completed
 
@@ -158,9 +158,22 @@ Module `__init__.py` created for: `tracking/`
 - SETUP -> ACCELERATION (0.92)
 - ACCELERATION -> REVERSAL (0.90)
 
+### Phase 6: Backtesting (Components 6.1-6.4) ✅
+
+| Component | File | Test Results |
+|-----------|------|--------------|
+| 6.1 Outcome Labeler | `scripts/label_outcomes.py` | 80% success rate (5%/5d mock) |
+| 6.2 Baseline Performance | `analysis/baseline_performance.py` | 0.942 correlation mock report |
+| 6.3 Phase Accuracy | `analysis/phase_accuracy.py` | F1: Setup=0.78, Accel=0.74, Rev=0.73 |
+| 6.4 Threshold Tuner | `scripts/tune_thresholds.py` | Best F1=0.721 with UOA ratio 4.0 |
+
+**CP5 Checkpoint**: Mock data shows signal beats random baseline (~10%)
+
+**Note**: Component 6.5 (Paper Trading Validation) requires 2 weeks of live market testing.
+
 ## Next Steps
 
-1. **Phase 6: Backtesting** — Outcome labeler, threshold tuning
+1. **Component 6.5: Paper Trading** — 2 weeks live validation (separate from V1)
 2. **Phase 7: Deployment** — Dockerfiles, Cloud Run, monitoring
 3. Schedule 30-min firehose test during market hours
 
@@ -176,7 +189,7 @@ psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
 - 5253680: [docs] Session 2 context - GCP setup complete, backup in progress
 - 4f16cf0: [docs] Add V1 dependency matrix
 
-## Project Structure After Phase 5
+## Project Structure After Phase 6
 ```
 FL3_V2/
 ├── adapters/
@@ -186,8 +199,10 @@ FL3_V2/
 ├── analysis/
 │   ├── __init__.py
 │   ├── baseline_manager.py
+│   ├── baseline_performance.py    # NEW: Phase 6.2
 │   ├── gex_aggregator.py
 │   ├── greeks_calculator.py
+│   ├── phase_accuracy.py          # NEW: Phase 6.3
 │   └── ta_calculator.py
 ├── config/
 │   └── time_multipliers.json
@@ -209,7 +224,9 @@ FL3_V2/
 │   └── setup.py
 ├── scripts/
 │   ├── firehose_main.py
-│   └── ta_pipeline_v2.py
+│   ├── label_outcomes.py          # NEW: Phase 6.1
+│   ├── ta_pipeline_v2.py
+│   └── tune_thresholds.py         # NEW: Phase 6.4
 ├── sql/
 │   └── create_tables_v2.sql
 ├── tests/
