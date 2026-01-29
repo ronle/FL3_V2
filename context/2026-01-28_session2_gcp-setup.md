@@ -1,5 +1,5 @@
-# Session 2: GCP Setup + Phase 0-2 Complete
-Date: 2026-01-28 15:13 PST - ongoing
+# Session 2: GCP Setup + Phase 0-3 Complete
+Date: 2026-01-28 15:13 PST - 21:50 PST
 
 ## Completed
 
@@ -111,10 +111,30 @@ Plus `v2_table_stats` view for monitoring.
 
 Module `__init__.py` files created for: `utils/`, `analysis/`, `adapters/`
 
+### Phase 3: Firehose Pipeline ✅
+
+| Component | File | Performance/Notes |
+|-----------|------|-------------------|
+| 3.1 Firehose Client | `firehose/client.py` | Websocket + auto-reconnect + metrics |
+| 3.2 Rolling Aggregator | `firehose/aggregator.py` | 824K trades/sec (82x target) |
+| 3.3 UOA Detector V2 | `uoa/detector_v2.py` | Threshold + cooldown + callbacks |
+| 3.4 Trigger Handler | `uoa/trigger_handler.py` | Async pipeline, 5 concurrent max |
+| 3.5 Bucket Aggregator | `firehose/bucket_aggregator.py` | 30-min buckets for baseline |
+| 3.6 Orchestrator | `scripts/firehose_main.py` | Full pipeline, --test-mode |
+
+Module `__init__.py` files created for: `firehose/`, `uoa/`
+
+**Orchestrator Test** (after-hours):
+```
+2026-01-28 21:47:37 [INFO] Connected to Polygon websocket
+2026-01-28 21:47:37 [INFO] Authentication successful
+2026-01-28 21:47:37 [INFO] Subscribed to T.*
+```
+
 ## Next Steps
 
-1. **Phase 3: Firehose Pipeline** — Websocket client, aggregator, UOA detector, trigger handler
-2. **Phase 4: TA Pipeline** — Ticker manager, Alpaca bars, TA calculator
+1. **Phase 4: TA Pipeline** — Ticker manager, Alpaca bars, TA calculator
+2. **Phase 5: Phase Detection** — Setup/Acceleration/Reversal detectors
 3. Schedule 30-min firehose test during market hours
 
 ## DB Connection (for CLI)
@@ -129,7 +149,7 @@ psql -h 127.0.0.1 -p 5433 -U FR3_User -d fl3
 - 5253680: [docs] Session 2 context - GCP setup complete, backup in progress
 - 4f16cf0: [docs] Add V1 dependency matrix
 
-## Project Structure After Phase 2
+## Project Structure After Phase 3
 ```
 FL3_V2/
 ├── adapters/
@@ -147,11 +167,22 @@ FL3_V2/
 ├── docs/
 │   ├── ta_pipeline_assessment.md
 │   └── v1_dependency_matrix.md
+├── firehose/
+│   ├── __init__.py
+│   ├── aggregator.py
+│   ├── bucket_aggregator.py
+│   └── client.py
+├── scripts/
+│   └── firehose_main.py
 ├── sql/
 │   └── create_tables_v2.sql
 ├── tests/
 │   ├── test_baseline_validation.py
 │   └── test_firehose_feasibility.py
+├── uoa/
+│   ├── __init__.py
+│   ├── detector_v2.py
+│   └── trigger_handler.py
 ├── utils/
 │   ├── __init__.py
 │   └── occ_parser.py
