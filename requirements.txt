@@ -1,0 +1,25 @@
+# FL3_V2 Dependencies
+
+# Async/Websocket
+websockets>=12.0
+aiohttp>=3.9.0
+
+# Database
+asyncpg>=0.29.0
+psycopg2-binary>=2.9.9
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Technical Analysis
+ta>=0.10.2
+
+# API Clients
+alpaca-py>=0.21.0
+
+# Time/Timezone
+pytz>=2024.1
+
+# Utilities
+python-dotenv>=1.0.0

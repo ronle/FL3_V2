@@ -25,3 +25,6 @@ secrets/
 dist/
 build/
 *.egg-info/
+
+# Backups (stored in GCS, not git)
+backups/

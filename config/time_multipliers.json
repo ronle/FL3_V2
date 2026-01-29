@@ -1,0 +1,39 @@
+{
+  "description": "Time-of-day volume multipliers for baseline calibration",
+  "version": "1.0",
+  "created": "2026-01-28",
+  "methodology": "Industry-standard U-shaped intraday volume pattern. Open/close have highest activity, midday lull is lowest.",
+  "multipliers": {
+    "09:30": 3.0,
+    "10:00": 1.8,
+    "10:30": 1.4,
+    "11:00": 1.1,
+    "11:30": 0.8,
+    "12:00": 0.6,
+    "12:30": 0.5,
+    "13:00": 0.6,
+    "13:30": 0.8,
+    "14:00": 1.0,
+    "14:30": 1.1,
+    "15:00": 1.3,
+    "15:30": 2.0,
+    "16:00": 0.0
+  },
+  "bucket_minutes": 30,
+  "notes": {
+    "09:30-10:00": "Market open - highest activity, gap fills, overnight order execution",
+    "10:00-11:00": "Morning continuation - elevated but declining",
+    "11:00-14:00": "Midday lull - lunch hours, lowest activity",
+    "14:00-15:30": "Afternoon pickup - position adjustments",
+    "15:30-16:00": "Close approach - second highest, hedging, rebalancing"
+  },
+  "usage": {
+    "formula": "expected_bucket_volume = (daily_volume / trading_minutes) * bucket_minutes * multiplier",
+    "trading_minutes": 390,
+    "example": "AAPL daily volume 100000, 09:30 bucket = (100000/390)*30*3.0 = 23077 contracts expected"
+  },
+  "calibration_plan": {
+    "status": "initial_estimate",
+    "refinement": "After 30 days of intraday data collection, recalibrate using actual bucket distributions"
+  }
+}
