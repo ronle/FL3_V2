@@ -17,9 +17,16 @@ ta>=0.10.2
 
 # API Clients
 alpaca-py>=0.21.0
+requests>=2.31.0
+yfinance>=0.2.36
 
 # Time/Timezone
 pytz>=2024.1
 
 # Utilities
 python-dotenv>=1.0.0
+
+# Google Sheets Dashboard
+gspread>=5.12.0
+google-auth>=2.27.0
+google-cloud-secret-manager>=2.18.0
