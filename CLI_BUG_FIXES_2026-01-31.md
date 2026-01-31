@@ -216,7 +216,7 @@ Signal passes ALL:
 - [x] 4th position attempt rejected when 3 open
 - [x] `trade_placed` field updates in DB after fills
 - [x] All tests pass in `--dry-run` mode
-- [ ] Code committed and ready for Monday
+- [x] Code committed and ready for Monday
 
 ---
 
