@@ -130,10 +130,53 @@ class PaperTradingEngine:
 
     async def load_ta_cache(self):
         """
-        Load prior-day TA data from JSON file.
+        Load prior-day TA data from database (preferred) or JSON file (fallback).
 
-        This should be pre-computed daily before market open.
+        Data source priority:
+        1. Database (ta_daily_close table) - shared across containers
+        2. Local JSON file - only works if premarket job ran in same container
+
+        The premarket-ta-cache job writes to both database and JSON.
         """
+        # Try database first (works across containers)
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url:
+            try:
+                import psycopg2
+                conn = psycopg2.connect(database_url.strip())
+                cur = conn.cursor()
+
+                # Get most recent TA data for each symbol
+                cur.execute("""
+                    SELECT symbol, rsi_14, macd_histogram, sma_20, sma_50, close_price,
+                           CASE WHEN close_price > sma_20 THEN 1 ELSE -1 END as trend
+                    FROM ta_daily_close
+                    WHERE trade_date = (SELECT MAX(trade_date) FROM ta_daily_close)
+                """)
+
+                for row in cur.fetchall():
+                    symbol, rsi_14, macd_hist, sma_20, sma_50, last_close, trend = row
+                    self._ta_cache[symbol] = {
+                        "rsi_14": float(rsi_14) if rsi_14 else None,
+                        "macd_hist": float(macd_hist) if macd_hist else None,
+                        "sma_20": float(sma_20) if sma_20 else None,
+                        "sma_50": float(sma_50) if sma_50 else None,
+                        "last_close": float(last_close) if last_close else None,
+                        "trend": trend,
+                    }
+
+                cur.close()
+                conn.close()
+
+                if self._ta_cache:
+                    logger.info(f"Loaded TA cache from database: {len(self._ta_cache)} symbols")
+                    self.signal_generator.load_ta_cache(self._ta_cache)
+                    return
+
+            except Exception as e:
+                logger.warning(f"Failed to load TA from database: {e}")
+
+        # Fallback to JSON file (only works in same container as premarket job)
         ta_file = Path(__file__).parent.parent / "polygon_data" / "daily_ta_cache.json"
 
         if ta_file.exists():
@@ -141,11 +184,11 @@ class PaperTradingEngine:
                 with open(ta_file) as f:
                     data = json.load(f)
                     self._ta_cache = data.get("ta_data", {})
-                    logger.info(f"Loaded TA cache: {len(self._ta_cache)} symbols")
+                    logger.info(f"Loaded TA cache from file: {len(self._ta_cache)} symbols")
             except Exception as e:
-                logger.error(f"Failed to load TA cache: {e}")
+                logger.error(f"Failed to load TA cache from file: {e}")
         else:
-            logger.warning(f"TA cache not found: {ta_file}")
+            logger.warning(f"TA cache not found (DB or file). Will fetch from Polygon on demand.")
 
         self.signal_generator.load_ta_cache(self._ta_cache)
 
