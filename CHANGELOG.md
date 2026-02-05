@@ -63,31 +63,22 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
 
 ## Technical Debt (as of 2026-02-05)
 
-### High Priority
-1. **~~Aggregator always returns price=0~~** - FIXED in PR #1
-   - Root cause: Options trades don't contain stock prices, only option premiums
-   - Fix: Aggregator now returns `price: None`, signal_filter fetches from Alpaca
-   - Files: `trade_aggregator.py`, `main.py`, `signal_filter.py`
+### High Priority - RESOLVED
+1. **~~Aggregator always returns price=0~~** ✓ [PR #1](https://github.com/ronle/FL3_V2/pull/1)
+   - Options trades don't contain stock prices, only option premiums
+   - Fix: Aggregator returns `price: None`, signal_filter fetches from Alpaca
 
-2. **~~TA JSON cache not shared between containers~~** - FIXED in PR #2
-   - Root cause: JSON file written to container filesystem, not shared
-   - Fix: `main.py` now reads from `ta_daily_close` database table (shared)
-   - Premarket job already writes to database, paper-trading now reads from it
-   - Files: `paper_trading/main.py`
+2. **~~TA JSON cache not shared between containers~~** ✓ [PR #2](https://github.com/ronle/FL3_V2/pull/2)
+   - Fix: `load_ta_cache()` now reads from `ta_daily_close` database table
 
-### Medium Priority
-3. **~~TA fetch timeout may skip filters~~** - FIXED in PR #3
-   - Root cause: Signals with missing TA data could bypass RSI/SMA filters
-   - Fix: `create_signal_async()` returns None if TA data unavailable
-   - main.py skips signals where TA fetch failed
-   - Files: `paper_trading/signal_filter.py`, `paper_trading/main.py`
+### Medium Priority - RESOLVED
+3. **~~TA fetch timeout may skip filters~~** ✓ [PR #3](https://github.com/ronle/FL3_V2/pull/3)
+   - Fix: `create_signal_async()` returns None if RSI/SMA missing
 
-4. **No TA cache persistence across restarts**
-   - Every restart starts with empty TA cache
-   - First signals incur Polygon API latency
-   - Fix: Persist TA cache to database or Cloud Storage
+4. **~~No TA cache persistence across restarts~~** ✓ Fixed by [PR #2](https://github.com/ronle/FL3_V2/pull/2)
+   - Database persists across container restarts
 
-### Low Priority
+### Low Priority - OPEN
 5. **Rate limiter in Polygon bars adapter**
    - 5 requests/minute = 12s between requests
    - Contributes to TA fetch delays
