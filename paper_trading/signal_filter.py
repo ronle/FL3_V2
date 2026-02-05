@@ -12,8 +12,10 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time as dt_time
 from typing import Optional, List, Dict, Tuple
+
+import pytz
 
 from .config import TradingConfig, DEFAULT_CONFIG
 from .dashboard import get_dashboard, log_active_signal_to_db
@@ -94,6 +96,41 @@ def get_sector_for_symbol(symbol: str, db_url: str = None) -> str:
         _load_sector_cache(db_url)
 
     return _SECTOR_CACHE.get(symbol, "Unknown")
+
+
+def track_symbol_for_ta(db_url: str, symbol: str, trigger_ts: datetime) -> bool:
+    """
+    Add symbol to tracked_tickers_v2 for intraday TA updates.
+
+    Called when a signal passes all filters. Ensures the symbol will
+    receive 5-minute TA refreshes from ta_pipeline_v2.
+
+    Uses upsert: if symbol exists, increments trigger_count.
+    """
+    if not db_url:
+        return False
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url.strip())
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO tracked_tickers_v2
+            (symbol, first_trigger_ts, trigger_count, last_trigger_ts, ta_enabled)
+            VALUES (%s, %s, 1, %s, TRUE)
+            ON CONFLICT (symbol) DO UPDATE SET
+                trigger_count = tracked_tickers_v2.trigger_count + 1,
+                last_trigger_ts = %s,
+                updated_at = NOW()
+        """, (symbol, trigger_ts, trigger_ts, trigger_ts))
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.debug(f"Tracked symbol for TA: {symbol}")
+        return True
+    except Exception as e:
+        logger.warning(f"Failed to track symbol {symbol}: {e}")
+        return False
 
 
 @dataclass
@@ -595,6 +632,13 @@ class SignalFilter:
                 score=signal.score,
             )
 
+            # Track symbol for intraday TA updates (adds to tracked_tickers_v2)
+            track_symbol_for_ta(
+                db_url=self.database_url,
+                symbol=signal.symbol,
+                trigger_ts=signal.detection_time,
+            )
+
             # Push to Google Sheets dashboard
             dashboard = get_dashboard()
             if dashboard.enabled:
@@ -646,20 +690,140 @@ class SignalGenerator:
     This is a simplified version that creates Signal objects from
     the aggregated trade data coming from the firehose.
 
-    Features dynamic TA fetching for symbols not in cache.
+    Features:
+    - Dynamic TA fetching for symbols not in cache
+    - Intraday TA refresh from ta_snapshots_v2 (after 9:35 AM)
     """
 
-    def __init__(self, ta_cache: Optional[Dict] = None):
+    # Time after which we use intraday TA instead of daily
+    INTRADAY_TA_START = dt_time(9, 35)  # 5 min after open
+
+    def __init__(self, ta_cache: Optional[Dict] = None, database_url: str = None):
         """
         Initialize signal generator.
 
         Args:
             ta_cache: Pre-loaded prior-day TA data {symbol: {rsi, macd, sma}}
+            database_url: Database URL for fetching intraday TA from ta_snapshots_v2
         """
-        self.ta_cache = ta_cache or {}
+        self.ta_cache = ta_cache or {}  # Daily TA cache (prior day close)
+        self.database_url = database_url or os.environ.get("DATABASE_URL")
         self._polygon_fetcher = None
         self._fetch_lock = asyncio.Lock()
         self._fetched_symbols: set = set()  # Track symbols we've already tried to fetch
+
+        # Intraday TA cache (refreshed from ta_snapshots_v2)
+        self._intraday_ta_cache: Dict[str, Dict] = {}
+        self._intraday_cache_ts: Optional[datetime] = None
+        self._intraday_cache_max_age_sec = 300  # Refresh every 5 minutes
+
+        # Timezone for market hours check
+        self._et = pytz.timezone("America/New_York")
+
+    def _should_use_intraday_ta(self) -> bool:
+        """Check if we should use intraday TA (after 9:35 AM ET)."""
+        now_et = datetime.now(self._et)
+        return now_et.time() >= self.INTRADAY_TA_START
+
+    def _is_intraday_cache_stale(self) -> bool:
+        """Check if intraday TA cache needs refresh."""
+        if not self._intraday_cache_ts:
+            return True
+        age = (datetime.now(self._et) - self._intraday_cache_ts).total_seconds()
+        return age > self._intraday_cache_max_age_sec
+
+    async def _refresh_intraday_ta_cache(self) -> None:
+        """
+        Refresh intraday TA cache from ta_snapshots_v2 table.
+
+        Fetches the latest snapshot for all symbols (within last 10 minutes).
+        This is called periodically to get fresh 5-minute TA data.
+        """
+        if not self.database_url:
+            logger.debug("No database URL, skipping intraday TA refresh")
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url.strip())
+            cur = conn.cursor()
+
+            # Get latest TA snapshots (within last 10 minutes to handle gaps)
+            cur.execute("""
+                WITH latest AS (
+                    SELECT symbol, MAX(snapshot_ts) as max_ts
+                    FROM ta_snapshots_v2
+                    WHERE snapshot_ts > NOW() - INTERVAL '10 minutes'
+                    GROUP BY symbol
+                )
+                SELECT t.symbol, t.rsi_14, t.sma_20, t.price, t.snapshot_ts
+                FROM ta_snapshots_v2 t
+                JOIN latest l ON t.symbol = l.symbol AND t.snapshot_ts = l.max_ts
+            """)
+
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            if rows:
+                new_cache = {}
+                for symbol, rsi_14, sma_20, price, snapshot_ts in rows:
+                    new_cache[symbol] = {
+                        "rsi_14": float(rsi_14) if rsi_14 else None,
+                        "sma_20": float(sma_20) if sma_20 else None,
+                        "last_close": float(price) if price else None,
+                        "snapshot_ts": snapshot_ts,
+                    }
+                self._intraday_ta_cache = new_cache
+                self._intraday_cache_ts = datetime.now(self._et)
+                logger.info(f"Refreshed intraday TA cache: {len(new_cache)} symbols")
+            else:
+                logger.warning("No recent intraday TA data found in ta_snapshots_v2")
+
+        except Exception as e:
+            logger.warning(f"Failed to refresh intraday TA cache: {e}")
+
+    def _get_ta_for_symbol(self, symbol: str) -> Dict:
+        """
+        Get TA data for a symbol, using intraday data when appropriate.
+
+        Priority:
+        1. Before 9:35 AM: Use daily cache (prior day close)
+        2. After 9:35 AM: Use intraday cache if available, fall back to daily
+        3. For sma_50: Always use daily cache (50-day average doesn't change intraday)
+
+        Returns:
+            Dict with rsi_14, sma_20, sma_50, last_close, trend
+        """
+        daily_ta = self.ta_cache.get(symbol, {})
+
+        # Before intraday start time, use daily cache
+        if not self._should_use_intraday_ta():
+            return daily_ta
+
+        # After intraday start, try to use fresh intraday data
+        intraday_ta = self._intraday_ta_cache.get(symbol, {})
+
+        if not intraday_ta:
+            # No intraday data, fall back to daily
+            return daily_ta
+
+        # Merge: use intraday for RSI/SMA20, daily for SMA50/MACD
+        merged = {
+            "rsi_14": intraday_ta.get("rsi_14") or daily_ta.get("rsi_14"),
+            "sma_20": intraday_ta.get("sma_20") or daily_ta.get("sma_20"),
+            "sma_50": daily_ta.get("sma_50"),  # Always from daily (50-day avg)
+            "macd_hist": daily_ta.get("macd_hist"),  # Keep from daily
+            "last_close": intraday_ta.get("last_close") or daily_ta.get("last_close"),
+        }
+
+        # Recalculate trend based on current price vs intraday SMA20
+        if merged.get("last_close") and merged.get("sma_20"):
+            merged["trend"] = 1 if merged["last_close"] > merged["sma_20"] else -1
+        else:
+            merged["trend"] = daily_ta.get("trend")
+
+        return merged
 
     async def _get_polygon_fetcher(self):
         """Lazy-load Polygon fetcher."""
@@ -855,7 +1019,11 @@ class SignalGenerator:
         """
         Create a Signal object from aggregated data (async version with dynamic TA fetch).
 
-        If symbol is not in TA cache, fetches from Polygon in real-time.
+        TA data source priority:
+        1. Before 9:35 AM: Daily cache (prior day close from ta_daily_close)
+        2. After 9:35 AM: Intraday cache (5-min refresh from ta_snapshots_v2)
+        3. Fallback: On-demand fetch from Polygon API
+
         Fetches current price from Alpaca if aggregator price is 0.
 
         IMPORTANT: Uses strict timeouts to avoid blocking WebSocket ping/pong.
@@ -863,8 +1031,18 @@ class SignalGenerator:
         Returns:
             Signal object if TA data available, None if critical data missing.
         """
-        # Check if we need to fetch TA - use strict 3s timeout to avoid blocking
-        if symbol not in self.ta_cache:
+        # Refresh intraday TA cache if we're in intraday mode and cache is stale
+        if self._should_use_intraday_ta() and self._is_intraday_cache_stale():
+            try:
+                await asyncio.wait_for(self._refresh_intraday_ta_cache(), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning("Intraday TA cache refresh timeout")
+            except Exception as e:
+                logger.warning(f"Intraday TA cache refresh failed: {e}")
+
+        # Check if we need to fetch TA from Polygon (fallback for unknown symbols)
+        # Only do this if symbol is not in daily cache AND not in intraday cache
+        if symbol not in self.ta_cache and symbol not in self._intraday_ta_cache:
             try:
                 await asyncio.wait_for(self.fetch_ta_for_symbol(symbol), timeout=3.0)
             except asyncio.TimeoutError:
@@ -872,9 +1050,11 @@ class SignalGenerator:
             except Exception as e:
                 logger.warning(f"TA fetch failed for {symbol}: {e}, rejecting signal")
 
+        # Get TA using the smart lookup (intraday vs daily based on time)
+        ta = self._get_ta_for_symbol(symbol)
+
         # CRITICAL: Reject signal if we don't have required TA data
         # Without RSI and SMA data, we can't properly filter the signal
-        ta = self.ta_cache.get(symbol, {})
         if not ta or ta.get("rsi_14") is None or ta.get("sma_20") is None:
             logger.info(f"Signal REJECTED: {symbol} - missing TA data (RSI/SMA not available)")
             return None
@@ -895,7 +1075,6 @@ class SignalGenerator:
 
             if effective_price <= 0:
                 # Final fallback to TA cache's last_close
-                ta = self.ta_cache.get(symbol, {})
                 effective_price = ta.get("last_close", 0)
 
         return self.create_signal(
@@ -944,8 +1123,8 @@ class SignalGenerator:
         Returns:
             Signal object with TA indicators populated
         """
-        # Get prior-day TA from cache
-        ta = self.ta_cache.get(symbol, {})
+        # Get TA using smart lookup (intraday vs daily based on time)
+        ta = self._get_ta_for_symbol(symbol)
 
         # Use TA cache's trend (based on price vs SMA20) if available
         # This is more reliable than the aggregator's intraday trend

@@ -2,6 +2,40 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-05] - Intraday TA Refresh (v37)
+
+### Summary
+Live trading now uses fresh 5-minute TA data from `ta_snapshots_v2` instead of stale prior-day data throughout the trading session.
+
+### Data Sources (Updated Architecture)
+| Data | Source | Type |
+|------|--------|------|
+| Options trades | Polygon WebSocket (T.*) | Real-time (Options Advanced plan) |
+| TA data (RSI, SMA20) - open | `ta_daily_close` DB table | Prior day close |
+| TA data (RSI, SMA20) - intraday | `ta_snapshots_v2` DB table | 5-minute refresh |
+| TA data (SMA50) | `ta_daily_close` DB table | Prior day (50-day avg doesn't change intraday) |
+| Stock prices | Alpaca REST API (snapshot) | Real-time (2s timeout) |
+
+### Changed
+1. **Intraday TA from ta_snapshots_v2** (v37)
+   - Before 9:35 AM: Uses daily cache from `ta_daily_close` (prior day close)
+   - After 9:35 AM: Uses fresh 5-min TA from `ta_snapshots_v2`
+   - SMA50 always from daily cache (50-day average)
+   - Intraday cache refreshes every 5 minutes
+   - File: `paper_trading/signal_filter.py:SignalGenerator`
+
+2. **Auto-track symbols on signal pass** (v37)
+   - Symbols that pass filters are now added to `tracked_tickers_v2`
+   - Ensures new symbols get 5-min TA updates from ta_pipeline
+   - File: `paper_trading/signal_filter.py:track_symbol_for_ta()`
+
+### Prerequisite
+- `ta_pipeline_v2` job must be running during market hours
+- Job writes to `ta_snapshots_v2` every 5 minutes
+- Run: `python -m scripts.ta_pipeline_v2`
+
+---
+
 ## [2026-02-05] - WebSocket Stability & Price Fix (v36 LOCKED)
 
 ### Summary
