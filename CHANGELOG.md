@@ -29,6 +29,14 @@ Live trading now uses fresh 5-minute TA data from `ta_snapshots_v2` instead of s
    - Ensures new symbols get 5-min TA updates from ta_pipeline
    - File: `paper_trading/signal_filter.py:track_symbol_for_ta()`
 
+3. **Pipeline health check script** (v37)
+   - Comprehensive test suite for V2 pipeline integrity
+   - Covers: GCP jobs, data freshness, tracking, signal filtering, Alpaca integration
+   - 18 automated checks across 5 categories
+   - Run: `python -m tests.pipeline_health_check`
+   - File: `tests/pipeline_health_check.py`
+   - Docs: `tests/V2_PIPELINE_HEALTH_CHECK.md`
+
 ### Prerequisite
 - `ta_pipeline_v2` job must be running during market hours
 - Job writes to `ta_snapshots_v2` every 5 minutes
