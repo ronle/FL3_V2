@@ -69,11 +69,11 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
    - Fix: Aggregator now returns `price: None`, signal_filter fetches from Alpaca
    - Files: `trade_aggregator.py`, `main.py`, `signal_filter.py`
 
-2. **TA JSON cache not shared between containers**
-   - `premarket-ta-cache` job writes to its container filesystem
-   - `paper-trading-live` has separate container, never sees the cache
-   - Falls back to Polygon API (slower, rate-limited)
-   - Fix: Use Cloud Storage bucket or database for TA cache
+2. **~~TA JSON cache not shared between containers~~** - FIXED in PR #2
+   - Root cause: JSON file written to container filesystem, not shared
+   - Fix: `main.py` now reads from `ta_daily_close` database table (shared)
+   - Premarket job already writes to database, paper-trading now reads from it
+   - Files: `paper_trading/main.py`
 
 ### Medium Priority
 3. **TA fetch timeout may skip filters**
