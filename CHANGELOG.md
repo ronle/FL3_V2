@@ -64,10 +64,10 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
 ## Technical Debt (as of 2026-02-05)
 
 ### High Priority
-1. **Aggregator always returns price=0**
-   - Root cause: `trade_aggregator.py` hardcodes `price: 0` at line 286
-   - Current workaround: Fetch real-time price from Alpaca in signal_filter
-   - Fix: Pass actual price from firehose trades through aggregator
+1. **~~Aggregator always returns price=0~~** - FIXED in PR #1
+   - Root cause: Options trades don't contain stock prices, only option premiums
+   - Fix: Aggregator now returns `price: None`, signal_filter fetches from Alpaca
+   - Files: `trade_aggregator.py`, `main.py`, `signal_filter.py`
 
 2. **TA JSON cache not shared between containers**
    - `premarket-ta-cache` job writes to its container filesystem

@@ -3,6 +3,11 @@ Trade Aggregator for Paper Trading
 
 Bridges firehose trades with the rolling aggregator and adds
 scoring logic for signal detection.
+
+Note: Options trades from Polygon firehose do not contain stock prices.
+The `price` and `trend` fields in triggered signals are set to None here
+and must be enriched downstream by signal_filter.create_signal_async(),
+which fetches real-time stock prices from Alpaca snapshot API.
 """
 
 import logging
@@ -283,8 +288,11 @@ class TradeAggregator:
                 "sweep_pct": sweep_pct,
                 "num_strikes": len(state.unique_strikes),
                 "trade_count": stats.trade_count,
-                "price": 0,  # Would need current price
-                "trend": 0,  # Would need trend calculation
+                # NOTE: price and trend are NOT available from options trades.
+                # They are enriched by signal_filter.create_signal_async() which
+                # fetches real-time stock price from Alpaca snapshot API.
+                "price": None,
+                "trend": None,
                 # Score breakdown
                 "score_volume": breakdown["score_volume"],
                 "score_call_pct": breakdown["score_call_pct"],

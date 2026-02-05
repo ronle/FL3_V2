@@ -39,6 +39,7 @@ from paper_trading.trade_aggregator import TradeAggregator
 from paper_trading.dashboard import get_dashboard
 
 from firehose.client import FirehoseClient, Trade
+from firehose.stock_price_monitor import StockPriceMonitor
 
 ET = pytz.timezone("America/New_York")
 
@@ -72,10 +73,21 @@ class PaperTradingEngine:
     ):
         self.config = config
         self.dry_run = dry_run
+        self.polygon_api_key = polygon_api_key
 
         # Initialize components
         self.firehose = FirehoseClient(polygon_api_key)
         self.aggregator = TradeAggregator()
+
+        # Stock price monitor for real-time prices (PROD-1)
+        self.stock_monitor = StockPriceMonitor(
+            api_key=polygon_api_key,
+            subscribe_trades=True,
+            subscribe_quotes=True,
+        )
+        self.stock_monitor.on_price_update = self._on_stock_price_update
+        self.stock_monitor.on_connect = self._on_websocket_connect
+        self.stock_monitor.on_disconnect = self._on_websocket_disconnect
 
         self.trader = AlpacaTrader(alpaca_api_key, alpaca_secret_key, config)
         self.position_manager = PositionManager(self.trader, config)
@@ -96,6 +108,14 @@ class PaperTradingEngine:
         # TA cache (loaded at startup)
         self._ta_cache: Dict[str, Dict] = {}
 
+        # Real-time price cache from WebSocket
+        self._realtime_prices: Dict[str, float] = {}
+
+        # WebSocket health tracking (PROD-1 graceful degradation)
+        self._websocket_healthy = False
+        self._websocket_enabled = config.USE_STOCK_WEBSOCKET
+        self._websocket_reconnect_failures = 0
+
     def _get_et_now(self) -> datetime:
         """Get current time in ET."""
         return datetime.now(ET)
@@ -104,6 +124,92 @@ class PaperTradingEngine:
         """Check if within trading hours."""
         now = self._get_et_now().time()
         return self.config.MARKET_OPEN <= now <= self.config.MARKET_CLOSE
+
+    def _on_stock_price_update(self, symbol: str, price: float, timestamp: datetime):
+        """
+        Callback for real-time stock price updates from WebSocket.
+
+        Used for:
+        - Hard stop monitoring (faster than REST polling)
+        - Entry price validation
+        """
+        self._realtime_prices[symbol] = price
+
+        # Check hard stop if we have a position in this symbol
+        if symbol in self.position_manager.active_trades and self.config.USE_HARD_STOP:
+            trade = self.position_manager.active_trades[symbol]
+            pnl_pct = (price - trade.entry_price) / trade.entry_price
+
+            if pnl_pct <= self.config.HARD_STOP_PCT:
+                logger.warning(
+                    f"HARD STOP triggered via WebSocket: {symbol} "
+                    f"@ ${price:.2f} ({pnl_pct*100:.1f}%)"
+                )
+                # Schedule async close
+                asyncio.create_task(self._async_hard_stop(symbol))
+
+    async def _async_hard_stop(self, symbol: str):
+        """Execute hard stop asynchronously."""
+        if self.dry_run:
+            logger.info(f"[DRY RUN] Would close {symbol} for hard stop")
+            return
+
+        try:
+            trade = await self.position_manager.close_position(symbol, "stop")
+            if trade:
+                logger.info(f"Hard stop executed: {symbol} P&L: ${trade.pnl:+.2f}")
+        except Exception as e:
+            logger.error(f"Hard stop execution failed for {symbol}: {e}")
+
+    def get_realtime_price(self, symbol: str) -> Optional[float]:
+        """Get real-time price from WebSocket cache."""
+        return self._realtime_prices.get(symbol)
+
+    def _on_websocket_connect(self):
+        """Callback when WebSocket connects successfully."""
+        self._websocket_healthy = True
+        self._websocket_reconnect_failures = 0
+        logger.info("Stock WebSocket connected - using real-time prices")
+
+    def _on_websocket_disconnect(self):
+        """Callback when WebSocket disconnects."""
+        self._websocket_healthy = False
+        self._websocket_reconnect_failures += 1
+        logger.warning(f"Stock WebSocket disconnected (failure #{self._websocket_reconnect_failures})")
+
+        # Check if we should disable WebSocket entirely
+        if self._websocket_reconnect_failures >= self.config.WEBSOCKET_MAX_RECONNECT_ATTEMPTS:
+            if self.config.WEBSOCKET_FALLBACK_TO_REST:
+                logger.warning(
+                    f"WebSocket failed {self._websocket_reconnect_failures} times - "
+                    "falling back to REST polling permanently for this session"
+                )
+                self._websocket_enabled = False
+            else:
+                logger.error("WebSocket failed and fallback is disabled!")
+
+    @property
+    def use_websocket_prices(self) -> bool:
+        """Check if we should use WebSocket prices (healthy and enabled)."""
+        return self._websocket_enabled and self._websocket_healthy
+
+    async def _update_stock_subscriptions(self):
+        """Update stock monitor subscriptions based on active positions."""
+        # Skip if WebSocket is disabled
+        if not self._websocket_enabled:
+            return
+
+        # Subscribe to all symbols with active positions
+        position_symbols = list(self.position_manager.active_trades.keys())
+
+        # Also subscribe to pending buys
+        pending_symbols = list(self.position_manager._pending_buys)
+
+        all_symbols = list(set(position_symbols + pending_symbols))
+
+        if all_symbols and self.stock_monitor.is_connected:
+            await self.stock_monitor.set_symbols(all_symbols)
+            logger.debug(f"Stock subscriptions updated: {all_symbols}")
 
     def _check_daily_reset(self):
         """Reset daily state if new trading day."""
@@ -149,6 +255,57 @@ class PaperTradingEngine:
 
         self.signal_generator.load_ta_cache(self._ta_cache)
 
+    async def load_baselines(self):
+        """
+        Load per-symbol baselines from intraday_baselines_30m table.
+
+        Calculates average notional per symbol from recent trading days.
+        Falls back to $50K default if query fails or no data.
+        """
+        database_url = os.environ.get("DATABASE_URL")
+        if not database_url:
+            logger.warning("DATABASE_URL not set, using default $50K baselines")
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(database_url.strip())
+            cur = conn.cursor()
+
+            # Get average notional per symbol from last 20 trading days
+            cur.execute("""
+                SELECT
+                    symbol,
+                    AVG(notional) as avg_notional
+                FROM intraday_baselines_30m
+                WHERE trade_date > CURRENT_DATE - 20
+                  AND bucket_start BETWEEN '09:30' AND '16:00'
+                GROUP BY symbol
+                HAVING AVG(notional) > 0
+            """)
+
+            baselines = {}
+            for row in cur.fetchall():
+                symbol, avg_notional = row
+                baselines[symbol] = float(avg_notional)
+
+            cur.close()
+            conn.close()
+
+            if baselines:
+                self.aggregator.load_baselines(baselines)
+                logger.info(f"Loaded baselines: {len(baselines)} symbols from intraday_baselines_30m")
+                # Log some stats
+                avg_baseline = sum(baselines.values()) / len(baselines)
+                logger.info(f"  Average baseline: ${avg_baseline:,.0f}")
+                logger.info(f"  Range: ${min(baselines.values()):,.0f} - ${max(baselines.values()):,.0f}")
+            else:
+                logger.warning("No baselines found in database, using default $50K")
+
+        except Exception as e:
+            logger.warning(f"Failed to load baselines from database: {e}")
+            logger.warning("Using default $50K baselines")
+
     async def _process_trade(self, trade: Trade):
         """Process a single trade from firehose."""
         # Add to aggregator
@@ -174,6 +331,11 @@ class PaperTradingEngine:
         # Get symbols with elevated activity
         triggered = self.aggregator.get_triggered_symbols()
 
+        # Pre-subscribe to triggered symbols for real-time prices
+        if triggered and self.stock_monitor.is_connected:
+            triggered_symbols = list(triggered.keys())[:10]  # Limit to 10 candidates
+            await self.stock_monitor.subscribe(triggered_symbols)
+
         for symbol, stats in triggered.items():
             # Skip if already traded or have position
             if self.position_manager.already_traded(symbol):
@@ -185,13 +347,14 @@ class PaperTradingEngine:
                 break
 
             # Create signal from aggregated stats (with dynamic TA fetch if needed)
+            # Note: price/trend are None from aggregator - signal_filter fetches from Alpaca
             signal = await self.signal_generator.create_signal_async(
                 symbol=symbol,
                 score=stats.get("score", 0),
                 notional=stats.get("notional", 0),
                 contracts=stats.get("contracts", 0),
-                price=stats.get("price", 0),
-                trend=stats.get("trend", 0),
+                price=stats.get("price"),  # None from aggregator, fetched by signal_filter
+                trend=stats.get("trend"),  # None from aggregator, computed from TA
                 # Score breakdown
                 ratio=stats.get("ratio", 0),
                 call_pct=stats.get("call_pct", 0),
@@ -229,13 +392,26 @@ class PaperTradingEngine:
                         )
 
     async def _check_hard_stops(self):
-        """Check if any positions hit hard stop."""
+        """
+        Check if any positions hit hard stop.
+
+        This is the REST-based fallback check. When WebSocket is healthy,
+        hard stops are triggered immediately via _on_stock_price_update callback.
+        This periodic check serves as a safety net.
+        """
         if self.dry_run:
             return
 
+        # Log which mode we're using (occasionally)
+        if not hasattr(self, '_last_mode_log') or \
+           (asyncio.get_event_loop().time() - self._last_mode_log) > 300:  # Every 5 min
+            mode = "WebSocket" if self.use_websocket_prices else "REST polling"
+            logger.info(f"Price monitoring mode: {mode}")
+            self._last_mode_log = asyncio.get_event_loop().time()
+
         stopped = await self.position_manager.check_hard_stops()
         for symbol in stopped:
-            logger.warning(f"Hard stop triggered: {symbol}")
+            logger.warning(f"Hard stop triggered (REST check): {symbol}")
 
     def _on_eod_complete(self, closed_trades):
         """Callback when EOD close completes."""
@@ -306,6 +482,9 @@ class PaperTradingEngine:
         # Load TA cache
         await self.load_ta_cache()
 
+        # Load per-symbol baselines from database
+        await self.load_baselines()
+
         # Check account
         if not self.dry_run:
             account = await self.trader.get_account()
@@ -323,12 +502,33 @@ class PaperTradingEngine:
         # Start EOD closer
         self.eod_closer.start()
 
+        # Start stock price WebSocket monitor (PROD-1)
+        if self.config.USE_STOCK_WEBSOCKET:
+            logger.info("Starting stock price WebSocket monitor...")
+            stock_monitor_started = await self.stock_monitor.start()
+            if stock_monitor_started:
+                self._websocket_healthy = True
+                logger.info("Stock price WebSocket connected - real-time prices enabled")
+            else:
+                self._websocket_healthy = False
+                if self.config.WEBSOCKET_FALLBACK_TO_REST:
+                    logger.warning("Stock WebSocket failed to connect - using REST fallback")
+                    self._websocket_enabled = False
+                else:
+                    logger.error("Stock WebSocket failed and fallback is disabled!")
+        else:
+            logger.info("Stock WebSocket disabled by config - using REST polling")
+
         self._running = True
         signal_check_interval = self.config.SIGNAL_CHECK_INTERVAL_SEC
         stop_check_interval = self.config.POSITION_CHECK_INTERVAL_SEC
+        subscription_update_interval = 5  # Update subscriptions every 5 seconds
+        dashboard_update_interval = 30  # Update dashboard positions every 30 seconds
 
         last_signal_check = 0
         last_stop_check = 0
+        last_subscription_update = 0
+        last_dashboard_update = 0
 
         try:
             async for trade in self.firehose.stream():
@@ -351,10 +551,20 @@ class PaperTradingEngine:
                     await self._check_for_signals()
                     last_signal_check = now
 
-                # Periodic stop check
+                # Periodic stop check (fallback if WebSocket missed something)
                 if now - last_stop_check >= stop_check_interval:
                     await self._check_hard_stops()
                     last_stop_check = now
+
+                # Periodic subscription update for stock monitor
+                if now - last_subscription_update >= subscription_update_interval:
+                    await self._update_stock_subscriptions()
+                    last_subscription_update = now
+
+                # Periodic dashboard position update (current prices and PnL)
+                if now - last_dashboard_update >= dashboard_update_interval:
+                    await self.position_manager.update_dashboard_positions()
+                    last_dashboard_update = now
 
         except KeyboardInterrupt:
             logger.info("Shutdown requested...")
@@ -375,6 +585,10 @@ class PaperTradingEngine:
         if self._is_trading_hours() and not self.dry_run:
             logger.warning("Closing positions on shutdown...")
             await self.position_manager.close_all_positions(reason="shutdown")
+
+        # Stop stock price monitor
+        await self.stock_monitor.stop()
+        logger.info(f"Stock monitor metrics: {self.stock_monitor.get_metrics()}")
 
         await self.firehose.disconnect()
         await self.trader.close()
@@ -490,6 +704,41 @@ async def main():
 
         finally:
             await firehose.disconnect()
+
+        # Test stock price WebSocket
+        logger.info("\n3. Testing Stock Price WebSocket...")
+        stock_monitor = StockPriceMonitor(polygon_key)
+
+        try:
+            started = await stock_monitor.start()
+            if started:
+                logger.info("   Stock WebSocket connected")
+
+                # Subscribe to test symbols
+                await stock_monitor.subscribe(["AAPL", "SPY"])
+                logger.info("   Subscribed to AAPL, SPY")
+
+                # Wait for some price updates
+                await asyncio.sleep(5)
+
+                aapl_price = stock_monitor.get_last_price("AAPL")
+                spy_price = stock_monitor.get_last_price("SPY")
+                metrics = stock_monitor.get_metrics()
+
+                logger.info(f"   AAPL price: ${aapl_price:.2f}" if aapl_price else "   AAPL: no data yet")
+                logger.info(f"   SPY price: ${spy_price:.2f}" if spy_price else "   SPY: no data yet")
+                logger.info(f"   Trades received: {metrics['trades_received']}")
+                logger.info(f"   Quotes received: {metrics['quotes_received']}")
+
+                await stock_monitor.stop()
+                logger.info("   Stock WebSocket OK")
+            else:
+                logger.warning("   Stock WebSocket failed to connect")
+
+        except Exception as e:
+            logger.error(f"   Stock WebSocket error: {e}")
+        finally:
+            await stock_monitor.stop()
 
         logger.info("\n" + "=" * 60)
         logger.info("TEST COMPLETE")
