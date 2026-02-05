@@ -56,6 +56,7 @@ class FirehoseMetrics:
     reconnect_count: int = 0
     last_message_time: float = 0
     max_lag_ms: float = 0
+    current_lag_ms: float = 0  # Most recent trade lag
     symbols_seen: set = field(default_factory=set)
 
     def messages_per_second(self) -> float:
@@ -115,21 +116,33 @@ class FirehoseClient:
                 close_timeout=5,
             )
 
-            # Authenticate
-            auth_msg = {"action": "auth", "params": self.api_key}
-            await self._ws.send(json.dumps(auth_msg))
+            # First, receive the "connected" message from Polygon
             response = await self._ws.recv()
             data = json.loads(response)
 
             if isinstance(data, list) and data[0].get("status") == "connected":
                 logger.info("Connected to Polygon websocket")
             else:
-                logger.warning(f"Unexpected auth response: {response[:100]}")
+                logger.warning(f"Unexpected connection response: {response[:100]}")
+
+            # Now send authentication
+            auth_msg = {"action": "auth", "params": self.api_key}
+            await self._ws.send(json.dumps(auth_msg))
 
             # Wait for auth success
             response = await self._ws.recv()
             data = json.loads(response)
-            if isinstance(data, list) and data[0].get("status") == "auth_success":
+
+            # Check for auth success (handle multiple response formats like V1)
+            auth_success = False
+            if isinstance(data, list):
+                for msg in data:
+                    status = (msg.get("status") or msg.get("message") or "").lower()
+                    if "auth_success" in status or "authenticated" in status:
+                        auth_success = True
+                        break
+
+            if auth_success:
                 logger.info("Authentication successful")
             else:
                 logger.error(f"Authentication failed: {response[:100]}")
@@ -140,6 +153,15 @@ class FirehoseClient:
             await self._ws.send(json.dumps(sub_msg))
             response = await self._ws.recv()
             logger.info(f"Subscribed to T.*: {response[:100]}")
+
+            # Check for max_connections error (Polygon Basic tier limit)
+            if "max_connections" in response.lower():
+                logger.error("Max WebSocket connections exceeded - Polygon Basic tier limit reached")
+                logger.error("Waiting 60s for stale connections to timeout...")
+                await self._ws.close()
+                self._ws = None
+                await asyncio.sleep(60)  # Wait for Polygon to release stale connections
+                return False
 
             if self.on_status:
                 self.on_status("connected")
@@ -229,6 +251,7 @@ class FirehoseClient:
                                     # Track lag
                                     if trade.timestamp > 0:
                                         lag_ms = (time.time() * 1000) - trade.timestamp
+                                        self.metrics.current_lag_ms = lag_ms
                                         self.metrics.max_lag_ms = max(self.metrics.max_lag_ms, lag_ms)
 
                                     # Callback
@@ -290,6 +313,7 @@ class FirehoseClient:
             "parse_errors": self.metrics.parse_errors,
             "reconnect_count": self.metrics.reconnect_count,
             "unique_symbols": len(self.metrics.symbols_seen),
+            "current_lag_ms": self.metrics.current_lag_ms,
             "max_lag_ms": self.metrics.max_lag_ms,
         }
 
@@ -316,6 +340,7 @@ async def quick_test(api_key: str, duration: int = 30):
     print(f"  Total trades: {metrics.trades_received:,}")
     print(f"  Trade rate: {metrics.trades_per_second():.1f}/sec")
     print(f"  Unique symbols: {len(metrics.symbols_seen):,}")
+    print(f"  Current lag: {metrics.current_lag_ms:.0f}ms")
     print(f"  Max lag: {metrics.max_lag_ms:.0f}ms")
     print(f"  Reconnects: {metrics.reconnect_count}")
 

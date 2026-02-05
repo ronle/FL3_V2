@@ -32,8 +32,25 @@ class TradingConfig:
     SENTIMENT_MAX_MENTIONS: int = 5  # Reject if mentions >= this (crowded trade)
     SENTIMENT_MIN_INDEX: float = 0.0  # Reject if sentiment < this (negative)
 
+    # Earnings proximity filter (5.5)
+    USE_EARNINGS_FILTER: bool = True
+    EARNINGS_PROXIMITY_DAYS: int = 2  # Reject if earnings within +/- this many days
+
+    # Market regime filter (V28)
+    USE_MARKET_REGIME_FILTER: bool = True
+    MARKET_REGIME_SYMBOL: str = "SPY"  # Benchmark to check
+    MARKET_REGIME_MAX_DECLINE: float = -0.005  # -0.5% from open = pause entries
+
+    # Stock WebSocket (PROD-1)
+    # NOTE: Polygon stocks WebSocket provides 15-min delayed data on Stocks Starter plan.
+    # Options Advanced plan provides real-time data (used for T.* firehose).
+    # Stock WebSocket disabled - using Alpaca REST API for real-time position monitoring instead.
+    USE_STOCK_WEBSOCKET: bool = False  # Disabled due to 15-min delay on Starter plan
+    WEBSOCKET_FALLBACK_TO_REST: bool = True  # Fall back to REST if WebSocket fails
+    WEBSOCKET_MAX_RECONNECT_ATTEMPTS: int = 3  # Max reconnect attempts before fallback
+
     # Position limits
-    MAX_CONCURRENT_POSITIONS: int = 3
+    MAX_CONCURRENT_POSITIONS: int = 5
     MAX_POSITION_SIZE_PCT: float = 0.10  # 10% of portfolio per trade
 
     # Exit rules

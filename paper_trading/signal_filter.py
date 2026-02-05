@@ -22,14 +22,78 @@ logger = logging.getLogger(__name__)
 
 # ETFs to exclude — our edge is on individual stocks
 ETF_EXCLUSIONS = {
-    'SPY', 'QQQ', 'IWM', 'DIA',  # Major index ETFs
-    'XLE', 'XLF', 'XLK', 'XLV', 'XLI', 'XLU', 'XLP', 'XLY', 'XLB', 'XLRE',  # Sector SPDRs
-    'VTI', 'VOO', 'VXX', 'UVXY', 'SQQQ', 'TQQQ', 'SPXU', 'SPXS',  # Other common ETFs
-    'GLD', 'SLV', 'USO', 'UNG',  # Commodity ETFs
-    'TLT', 'HYG', 'LQD', 'JNK',  # Bond ETFs
-    'EEM', 'EFA', 'VWO', 'IEMG',  # International ETFs
-    'ARKK', 'ARKG', 'ARKW', 'ARKF',  # ARK ETFs
+    # Major index ETFs
+    'SPY', 'QQQ', 'IWM', 'DIA', 'RSP', 'MDY', 'IJR', 'IJH',
+    # Sector SPDRs
+    'XLE', 'XLF', 'XLK', 'XLV', 'XLI', 'XLU', 'XLP', 'XLY', 'XLB', 'XLRE', 'XLC',
+    # Thematic / Industry ETFs
+    'ITB', 'XHB', 'XOP', 'XBI', 'XRT', 'XME', 'KWEB', 'MCHI', 'FXI',
+    'SOXX', 'SMH', 'HACK', 'BOTZ', 'ROBO', 'IBB',
+    'IYR', 'VNQ', 'GDXJ', 'GDX', 'JETS', 'KRE', 'KBE',
+    # Leveraged / Inverse
+    'VTI', 'VOO', 'VXX', 'UVXY', 'SQQQ', 'TQQQ', 'SPXU', 'SPXS',
+    'UPRO', 'LABU', 'LABD', 'SOXL', 'SOXS', 'TNA', 'TZA',
+    # Commodity ETFs
+    'GLD', 'SLV', 'USO', 'UNG', 'WEAT', 'DBA', 'DBC',
+    # Bond ETFs
+    'TLT', 'HYG', 'LQD', 'JNK', 'AGG', 'BND', 'SHY', 'IEF',
+    # International ETFs
+    'EEM', 'EFA', 'VWO', 'IEMG',
+    # ARK ETFs
+    'ARKK', 'ARKG', 'ARKW', 'ARKF', 'ARKQ', 'ARKX',
+    # Crypto ETFs
+    'IBIT', 'BITO', 'GBTC', 'ETHE', 'FBTC', 'BITB',
 }
+
+# Sector concentration limit (max positions per sector)
+MAX_SECTOR_CONCENTRATION = 2
+
+
+# Global sector cache - loaded once at startup
+_SECTOR_CACHE: Dict[str, str] = {}
+_SECTOR_CACHE_LOADED = False
+
+
+def _load_sector_cache(db_url: str) -> None:
+    """Load all sectors into cache at startup (non-blocking after first call)."""
+    global _SECTOR_CACHE, _SECTOR_CACHE_LOADED
+    if _SECTOR_CACHE_LOADED:
+        return
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url.strip())
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT symbol, sector FROM master_tickers
+            WHERE sector IS NOT NULL
+        """)
+        for row in cur.fetchall():
+            _SECTOR_CACHE[row[0]] = row[1]
+        cur.close()
+        conn.close()
+        _SECTOR_CACHE_LOADED = True
+        logger.info(f"Loaded sector cache: {len(_SECTOR_CACHE)} symbols")
+    except Exception as e:
+        logger.warning(f"Failed to load sector cache: {e}")
+
+
+def get_sector_for_symbol(symbol: str, db_url: str = None) -> str:
+    """
+    Look up sector for a symbol from cache.
+
+    Returns sector name or "Unknown" if not found.
+    """
+    if not db_url:
+        db_url = os.environ.get("DATABASE_URL")
+    if not db_url:
+        return "Unknown"
+
+    # Load cache on first call
+    if not _SECTOR_CACHE_LOADED:
+        _load_sector_cache(db_url)
+
+    return _SECTOR_CACHE.get(symbol, "Unknown")
 
 
 @dataclass
@@ -45,6 +109,7 @@ class Signal:
     rsi_14_prior: Optional[float] = None
     macd_hist_prior: Optional[float] = None
     sma_20_prior: Optional[float] = None
+    sma_50_prior: Optional[float] = None  # Multi-week momentum guard
 
     # Current price context
     price_at_signal: Optional[float] = None
@@ -104,14 +169,81 @@ class SignalFilter:
             "trend": 0,
             "rsi": 0,
             "notional": 0,
+            "sma50": 0,
             "sentiment_mentions": 0,
             "sentiment_negative": 0,
+            "earnings": 0,
         }
+
+        # Earnings cache to avoid repeated DB lookups
+        self._earnings_cache: Dict[str, Tuple[bool, Optional[int], Optional[str]]] = {}
+        self._earnings_loaded = False
 
         # Sentiment cache to avoid repeated DB lookups
         self._sentiment_cache: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
 
-    def _log_evaluation(self, signal: Signal, passed: bool, rejection_reason: str):
+        # Pre-load caches at startup
+        self._preload_caches()
+
+    def _preload_caches(self):
+        """Pre-load earnings and sector data to avoid blocking during signal processing."""
+        if not self.database_url:
+            return
+
+        # Load sector cache (global)
+        _load_sector_cache(self.database_url)
+
+        # Load earnings cache for all symbols with earnings in window
+        self._load_earnings_cache()
+
+    def _load_earnings_cache(self):
+        """Load all earnings data within the proximity window at startup."""
+        if self._earnings_loaded or not self.database_url:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+
+            days = self.config.EARNINGS_PROXIMITY_DAYS
+
+            cur.execute("""
+                SELECT
+                    symbol,
+                    event_date,
+                    event_date - CURRENT_DATE as days_until,
+                    hour
+                FROM earnings_calendar
+                WHERE event_date BETWEEN CURRENT_DATE - %s AND CURRENT_DATE + %s
+                  AND is_current = true
+            """, (days, days))
+
+            for row in cur.fetchall():
+                symbol = row[0]
+                days_until = row[2]
+
+                if days_until == 0:
+                    timing = "TODAY"
+                elif days_until == 1:
+                    timing = "TOMORROW"
+                elif days_until == -1:
+                    timing = "YESTERDAY"
+                elif days_until > 0:
+                    timing = f"+{days_until} DAYS"
+                else:
+                    timing = f"{days_until} DAYS"
+
+                self._earnings_cache[symbol] = (True, days_until, timing)
+
+            cur.close()
+            conn.close()
+            self._earnings_loaded = True
+            logger.info(f"Loaded earnings cache: {len(self._earnings_cache)} symbols with upcoming earnings")
+        except Exception as e:
+            logger.warning(f"Failed to load earnings cache: {e}")
+
+    def _log_evaluation_sync(self, signal: Signal, passed: bool, rejection_reason: str):
         """Log signal evaluation to database for analysis."""
         if not self.database_url:
             return
@@ -159,11 +291,35 @@ class SignalFilter:
         except Exception as e:
             logger.warning(f"Failed to log evaluation to DB: {e}")
 
+    def _log_evaluation(self, signal: Signal, passed: bool, rejection_reason: str):
+        """
+        Log signal evaluation to database (non-blocking).
+
+        Runs the DB insert in a thread pool to avoid blocking the event loop.
+        """
+        import concurrent.futures
+        try:
+            # Use a thread pool to run the sync DB call without blocking
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+            executor.submit(self._log_evaluation_sync, signal, passed, rejection_reason)
+            # Don't wait for result - fire and forget
+        except Exception as e:
+            logger.debug(f"Failed to submit log evaluation: {e}")
+
     def _get_sentiment_data(self, symbol: str, signal_date: datetime) -> Tuple[Optional[int], Optional[float]]:
         """
-        Fetch sentiment data from sentiment_daily table.
+        Fetch sentiment data from vw_media_daily_features view.
 
         Uses prior day's sentiment (T-1) since that's the latest available at signal time.
+
+        NOTE: Migrated from sentiment_daily table to vw_media_daily_features view
+        as of Feb 2026. The view computes on-the-fly from source tables (articles,
+        article_insights) so it never goes stale, unlike the table which depends
+        on the fr-sentiment-agg batch job.
+
+        Column mapping:
+        - mentions_total -> media_count (count of articles/media items)
+        - sentiment_index -> avg_stance_weighted (weighted stance score)
 
         Returns:
             Tuple of (mentions_total, sentiment_index) or (None, None) if not found
@@ -183,9 +339,12 @@ class SignalFilter:
             # Use prior day's sentiment (T-1)
             prior_date = (signal_date - timedelta(days=1)).date()
 
+            # Query vw_media_daily_features view (always fresh, no batch job dependency)
             cur.execute("""
-                SELECT mentions_total, sentiment_index
-                FROM sentiment_daily
+                SELECT
+                    COALESCE(media_count, 0) as mentions_total,
+                    COALESCE(avg_stance_weighted, 0.0) as sentiment_index
+                FROM vw_media_daily_features
                 WHERE ticker = %s AND asof_date = %s
             """, (symbol, prior_date))
 
@@ -194,7 +353,7 @@ class SignalFilter:
             conn.close()
 
             if row:
-                result = (row[0], row[1])
+                result = (int(row[0]), float(row[1]))
             else:
                 result = (None, None)
 
@@ -204,6 +363,107 @@ class SignalFilter:
         except Exception as e:
             logger.warning(f"Failed to fetch sentiment for {symbol}: {e}")
             return (None, None)
+
+    def _check_earnings_proximity(self, symbol: str) -> Tuple[bool, Optional[int], Optional[str]]:
+        """
+        Check if symbol has earnings within proximity window.
+
+        Uses pre-loaded cache from startup to avoid blocking DB calls.
+
+        Returns:
+            Tuple of (is_adjacent, days_to_earnings, timing)
+            - is_adjacent: True if earnings within window
+            - days_to_earnings: Days until earnings (negative = past)
+            - timing: 'TODAY', 'TOMORROW', '+2 DAYS', etc.
+        """
+        # Ensure cache is loaded
+        if not self._earnings_loaded:
+            self._load_earnings_cache()
+
+        # Check cache - if not in cache, no earnings in window
+        if symbol in self._earnings_cache:
+            return self._earnings_cache[symbol]
+
+        # Not in cache = no earnings within window
+        return (False, None, None)
+
+    def _check_earnings_proximity_UNUSED(self, symbol: str) -> Tuple[bool, Optional[int], Optional[str]]:
+        """DEPRECATED: Old per-symbol DB lookup. Kept for reference."""
+        if symbol in self._earnings_cache:
+            return self._earnings_cache[symbol]
+
+        if not self.database_url:
+            return (False, None, None)
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+
+            days = self.config.EARNINGS_PROXIMITY_DAYS
+
+            cur.execute("""
+                SELECT
+                    event_date,
+                    event_date - CURRENT_DATE as days_until,
+                    hour
+                FROM earnings_calendar
+                WHERE symbol = %s
+                  AND event_date BETWEEN CURRENT_DATE - %s AND CURRENT_DATE + %s
+                  AND is_current = true
+                ORDER BY ABS(event_date - CURRENT_DATE)
+                LIMIT 1
+            """, (symbol, days, days))
+
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+
+            if row is None:
+                result = (False, None, None)
+            else:
+                days_until = row[1]
+
+                if days_until == 0:
+                    timing = "TODAY"
+                elif days_until == 1:
+                    timing = "TOMORROW"
+                elif days_until == -1:
+                    timing = "YESTERDAY"
+                elif days_until > 0:
+                    timing = f"+{days_until} DAYS"
+                else:
+                    timing = f"{days_until} DAYS"
+
+                result = (True, days_until, timing)
+
+            self._earnings_cache[symbol] = result
+            return result
+
+        except Exception as e:
+            logger.warning(f"Earnings check failed for {symbol}: {e}")
+            return (False, None, None)
+
+    def passes_earnings_filter(self, symbol: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check if symbol passes earnings proximity filter.
+
+        Filter logic:
+        - PASS if no earnings data within window
+        - FAIL if earnings within +/- EARNINGS_PROXIMITY_DAYS
+
+        Returns:
+            Tuple of (passed, rejection_reason)
+        """
+        if not self.config.USE_EARNINGS_FILTER:
+            return (True, None)
+
+        is_adjacent, days_until, timing = self._check_earnings_proximity(symbol)
+
+        if is_adjacent:
+            return (False, f"earnings {timing}")
+
+        return (True, None)
 
     def passes_sentiment_filter(self, symbol: str, signal_date: datetime) -> Tuple[bool, Optional[str]]:
         """
@@ -276,6 +536,12 @@ class SignalFilter:
             reasons.append("no RSI data")
             self.filter_reasons["rsi"] += 1
 
+        # Check 50d SMA (multi-week momentum guard)
+        if signal.sma_50_prior is not None and signal.price_at_signal is not None:
+            if signal.price_at_signal < signal.sma_50_prior:
+                reasons.append(f"below 50d SMA ({signal.price_at_signal:.2f} < {signal.sma_50_prior:.2f})")
+                self.filter_reasons["sma50"] += 1
+
         # Check notional
         if signal.notional < self.config.MIN_NOTIONAL:
             reasons.append(f"notional ${signal.notional:,.0f} < ${self.config.MIN_NOTIONAL:,.0f}")
@@ -291,6 +557,12 @@ class SignalFilter:
                 self.filter_reasons["sentiment_mentions"] += 1
             else:
                 self.filter_reasons["sentiment_negative"] += 1
+
+        # Check earnings proximity (5.5)
+        earnings_passed, earnings_reason = self.passes_earnings_filter(signal.symbol)
+        if not earnings_passed:
+            reasons.append(earnings_reason)
+            self.filter_reasons["earnings"] += 1
 
         passed = len(reasons) == 0
         rejection_reason = "; ".join(reasons) if reasons else None
@@ -364,6 +636,7 @@ class SignalFilter:
         self.passed_signals = 0
         self.filter_reasons = {k: 0 for k in self.filter_reasons}
         self._sentiment_cache.clear()  # Clear sentiment cache for new day
+        self._earnings_cache.clear()  # Clear earnings cache for new day
 
 
 class SignalGenerator:
@@ -426,9 +699,9 @@ class SignalGenerator:
 
             try:
                 logger.info(f"Fetching TA for {symbol} from Polygon...")
-                bar_data = await fetcher.get_bars(symbol, days=45)
+                bar_data = await fetcher.get_bars(symbol, days=70)  # Extended for 50d SMA
 
-                if not bar_data.bars or len(bar_data.bars) < 15:
+                if not bar_data.bars or len(bar_data.bars) < 20:
                     logger.warning(f"Insufficient bar data for {symbol}: {len(bar_data.bars) if bar_data.bars else 0} bars")
                     return None
 
@@ -437,6 +710,7 @@ class SignalGenerator:
                 # Calculate indicators (same as premarket_ta_cache)
                 rsi_14 = self._calculate_rsi(closes, 14)
                 sma_20 = self._calculate_sma(closes, 20)
+                sma_50 = self._calculate_sma(closes, 50)  # Multi-week momentum
                 macd_line, macd_signal, macd_hist = self._calculate_macd(closes)
 
                 last_close = closes[-1] if closes else None
@@ -448,6 +722,7 @@ class SignalGenerator:
                     "rsi_14": rsi_14,
                     "macd_hist": macd_hist,
                     "sma_20": sma_20,
+                    "sma_50": sma_50,
                     "last_close": last_close,
                     "trend": trend,
                 }
@@ -518,6 +793,46 @@ class SignalGenerator:
             round(histogram, 4) if histogram else None
         )
 
+    async def _fetch_current_price(self, symbol: str) -> float:
+        """
+        Fetch current stock price from Alpaca snapshot API.
+
+        Returns real-time price during market hours, 0 if fetch fails.
+        """
+        try:
+            import aiohttp
+            api_key = os.environ.get("ALPACA_API_KEY")
+            secret_key = os.environ.get("ALPACA_SECRET_KEY")
+
+            if not api_key or not secret_key:
+                return 0
+
+            headers = {
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": secret_key,
+            }
+
+            url = f"https://data.alpaca.markets/v2/stocks/{symbol}/snapshot"
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                    if resp.status != 200:
+                        return 0
+
+                    data = await resp.json()
+                    # Use latest trade price, or daily bar close as fallback
+                    latest_trade = data.get("latestTrade", {})
+                    if latest_trade.get("p"):
+                        return float(latest_trade["p"])
+
+                    daily_bar = data.get("dailyBar", {})
+                    if daily_bar.get("c"):
+                        return float(daily_bar["c"])
+
+                    return 0
+        except Exception as e:
+            logger.debug(f"Failed to fetch price for {symbol}: {e}")
+            return 0
+
     async def create_signal_async(
         self,
         symbol: str,
@@ -541,13 +856,39 @@ class SignalGenerator:
         Create a Signal object from aggregated data (async version with dynamic TA fetch).
 
         If symbol is not in TA cache, fetches from Polygon in real-time.
+        Fetches current price from Alpaca if aggregator price is 0.
+
+        IMPORTANT: Uses strict timeouts to avoid blocking WebSocket ping/pong.
         """
-        # Check if we need to fetch TA
+        # Check if we need to fetch TA - use strict 3s timeout to avoid blocking
         if symbol not in self.ta_cache:
-            await self.fetch_ta_for_symbol(symbol)
+            try:
+                await asyncio.wait_for(self.fetch_ta_for_symbol(symbol), timeout=3.0)
+            except asyncio.TimeoutError:
+                logger.warning(f"TA fetch timeout for {symbol}, using defaults")
+            except Exception as e:
+                logger.warning(f"TA fetch failed for {symbol}: {e}")
+
+        # Get real-time price from Alpaca if aggregator didn't provide one
+        # Use strict 2s timeout
+        effective_price = price
+        if not price or price <= 0:
+            try:
+                effective_price = await asyncio.wait_for(self._fetch_current_price(symbol), timeout=2.0)
+            except asyncio.TimeoutError:
+                logger.debug(f"Price fetch timeout for {symbol}")
+                effective_price = 0
+            except Exception as e:
+                logger.debug(f"Price fetch failed for {symbol}: {e}")
+                effective_price = 0
+
+            if effective_price <= 0:
+                # Final fallback to TA cache's last_close
+                ta = self.ta_cache.get(symbol, {})
+                effective_price = ta.get("last_close", 0)
 
         return self.create_signal(
-            symbol, score, notional, contracts, price, trend,
+            symbol, score, notional, contracts, effective_price, trend,
             ratio=ratio, call_pct=call_pct, sweep_pct=sweep_pct,
             num_strikes=num_strikes, score_volume=score_volume,
             score_call_pct=score_call_pct, score_sweep=score_sweep,
@@ -600,6 +941,10 @@ class SignalGenerator:
         ta_trend = ta.get("trend")
         final_trend = ta_trend if ta_trend is not None else trend
 
+        # Price should be set by caller (create_signal_async fetches from Alpaca)
+        # Only use last_close as last resort for sync callers
+        effective_price = price if price and price > 0 else ta.get("last_close", 0)
+
         return Signal(
             symbol=symbol,
             detection_time=datetime.now(),
@@ -609,7 +954,8 @@ class SignalGenerator:
             rsi_14_prior=ta.get("rsi_14"),
             macd_hist_prior=ta.get("macd_hist"),
             sma_20_prior=ta.get("sma_20"),
-            price_at_signal=price,
+            sma_50_prior=ta.get("sma_50"),  # Multi-week momentum
+            price_at_signal=effective_price,
             trend=final_trend,
             # Additional context
             ratio=ratio,
