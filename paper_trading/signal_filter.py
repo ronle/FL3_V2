@@ -851,7 +851,7 @@ class SignalGenerator:
         score_sweep: int = 0,
         score_strikes: int = 0,
         score_notional: int = 0,
-    ) -> Signal:
+    ) -> Optional[Signal]:
         """
         Create a Signal object from aggregated data (async version with dynamic TA fetch).
 
@@ -859,15 +859,25 @@ class SignalGenerator:
         Fetches current price from Alpaca if aggregator price is 0.
 
         IMPORTANT: Uses strict timeouts to avoid blocking WebSocket ping/pong.
+
+        Returns:
+            Signal object if TA data available, None if critical data missing.
         """
         # Check if we need to fetch TA - use strict 3s timeout to avoid blocking
         if symbol not in self.ta_cache:
             try:
                 await asyncio.wait_for(self.fetch_ta_for_symbol(symbol), timeout=3.0)
             except asyncio.TimeoutError:
-                logger.warning(f"TA fetch timeout for {symbol}, using defaults")
+                logger.warning(f"TA fetch timeout for {symbol}, rejecting signal")
             except Exception as e:
-                logger.warning(f"TA fetch failed for {symbol}: {e}")
+                logger.warning(f"TA fetch failed for {symbol}: {e}, rejecting signal")
+
+        # CRITICAL: Reject signal if we don't have required TA data
+        # Without RSI and SMA data, we can't properly filter the signal
+        ta = self.ta_cache.get(symbol, {})
+        if not ta or ta.get("rsi_14") is None or ta.get("sma_20") is None:
+            logger.info(f"Signal REJECTED: {symbol} - missing TA data (RSI/SMA not available)")
+            return None
 
         # Get real-time price from Alpaca since aggregator doesn't have stock prices
         # (options trades only contain option premiums, not underlying stock prices)

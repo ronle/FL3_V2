@@ -76,10 +76,11 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
    - Files: `paper_trading/main.py`
 
 ### Medium Priority
-3. **TA fetch timeout may skip filters**
-   - If 3s timeout triggers, signal evaluated with missing TA data
-   - Could pass signals that should be filtered (RSI, SMA checks)
-   - Fix: Require TA data or reject signal if fetch fails
+3. **~~TA fetch timeout may skip filters~~** - FIXED in PR #3
+   - Root cause: Signals with missing TA data could bypass RSI/SMA filters
+   - Fix: `create_signal_async()` returns None if TA data unavailable
+   - main.py skips signals where TA fetch failed
+   - Files: `paper_trading/signal_filter.py`, `paper_trading/main.py`
 
 4. **No TA cache persistence across restarts**
    - Every restart starts with empty TA cache

@@ -391,6 +391,7 @@ class PaperTradingEngine:
 
             # Create signal from aggregated stats (with dynamic TA fetch if needed)
             # Note: price/trend are None from aggregator - signal_filter fetches from Alpaca
+            # Returns None if TA data unavailable (fetch timeout/failure)
             signal = await self.signal_generator.create_signal_async(
                 symbol=symbol,
                 score=stats.get("score", 0),
@@ -409,6 +410,10 @@ class PaperTradingEngine:
                 score_strikes=stats.get("score_strikes", 0),
                 score_notional=stats.get("score_notional", 0),
             )
+
+            # Skip if signal creation failed (missing TA data)
+            if signal is None:
+                continue
 
             # Apply filter
             result = self.signal_filter.apply(signal)
