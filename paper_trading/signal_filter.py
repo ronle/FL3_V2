@@ -869,10 +869,11 @@ class SignalGenerator:
             except Exception as e:
                 logger.warning(f"TA fetch failed for {symbol}: {e}")
 
-        # Get real-time price from Alpaca if aggregator didn't provide one
-        # Use strict 2s timeout
-        effective_price = price
-        if not price or price <= 0:
+        # Get real-time price from Alpaca since aggregator doesn't have stock prices
+        # (options trades only contain option premiums, not underlying stock prices)
+        # Use strict 2s timeout to avoid blocking WebSocket ping
+        effective_price = price if price and price > 0 else 0
+        if effective_price <= 0:
             try:
                 effective_price = await asyncio.wait_for(self._fetch_current_price(symbol), timeout=2.0)
             except asyncio.TimeoutError:
