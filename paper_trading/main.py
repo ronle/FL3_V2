@@ -92,7 +92,9 @@ class PaperTradingEngine:
         self.trader = AlpacaTrader(alpaca_api_key, alpaca_secret_key, config)
         self.position_manager = PositionManager(self.trader, config)
         self.signal_filter = SignalFilter(config)
-        self.signal_generator = SignalGenerator()
+        self.signal_generator = SignalGenerator(
+            database_url=os.environ.get("DATABASE_URL")
+        )
 
         self.eod_closer = EODCloser(
             self.position_manager,

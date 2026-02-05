@@ -264,6 +264,26 @@ Gamma Flip = Price where Net GEX crosses zero
 
 ---
 
+## Live Trading TA Data Sources (v37+)
+
+The paper trading service uses different TA data sources based on time of day:
+
+| Time | RSI/SMA20 Source | SMA50 Source | Notes |
+|------|------------------|--------------|-------|
+| Before 9:35 AM | `ta_daily_close` | `ta_daily_close` | Prior day close values |
+| After 9:35 AM | `ta_snapshots_v2` | `ta_daily_close` | 5-min refresh for RSI/SMA20 |
+
+**Key Files:**
+- `paper_trading/signal_filter.py:SignalGenerator` - Smart TA lookup
+- `scripts/ta_pipeline_v2.py` - Writes to `ta_snapshots_v2` every 5 min
+
+**Prerequisite:** The TA pipeline job must be running during market hours:
+```bash
+python -m scripts.ta_pipeline_v2
+```
+
+---
+
 ## Project Structure
 
 ```
