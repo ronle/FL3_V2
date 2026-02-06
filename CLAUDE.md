@@ -264,6 +264,67 @@ Gamma Flip = Price where Net GEX crosses zero
 
 ---
 
+## CRITICAL: Live Trading Architecture (Verified 2026-02-05)
+
+### Signal Flow
+```
+Polygon Firehose (T.* options trades)
+    ↓
+TradeAggregator (60s rolling window, per-symbol baselines from intraday_baselines_30m)
+    ↓
+SignalGenerator.create_signal_async()
+    ├── Load TA from ta_daily_close (before 9:35 AM) or ta_snapshots_v2 (after 9:35 AM)
+    ├── Fetch current price from Alpaca snapshot API (2s timeout)
+    └── Assemble Signal object
+    ↓
+SignalFilter.apply() — 10 filter steps:
+    1. ETF exclusion (hardcoded list)
+    2. Score threshold (>= 10)
+    3. RSI < 50 (from TA cache)
+    4. Uptrend SMA20 (from TA cache)
+    5. SMA50 momentum (from TA cache)
+    6. Notional >= per-symbol baseline (intraday_baselines_30m DB)
+    7. Crowded trade filter (vw_media_daily_features VIEW — mentions < 5, sentiment >= 0)
+    8. Sector limit max 2 (master_tickers DB)
+    9. Market regime (Alpaca API — SPY snapshot)
+   10. Earnings proximity (earnings_calendar DB — reject if earnings within 2 days)
+    ↓
+If PASSED → Submit buy order via Alpaca API → Write to paper_trades_log, active_signals
+         → Add symbol to tracked_tickers_v2 for intraday TA updates
+```
+
+### Database Tables Read by Live Trading
+
+| Table/View | Purpose |
+|------------|---------|
+| `vw_media_daily_features` | Crowded trade + sentiment filter |
+| `master_tickers` | Sector concentration limit |
+| `earnings_calendar` | Earnings proximity filter |
+| `intraday_baselines_30m` | Per-symbol notional baselines |
+| `ta_daily_close` | Prior-day TA (before 9:35 AM) |
+| `ta_snapshots_v2` | Intraday TA (after 9:35 AM, 5-min refresh) |
+
+### Database Tables Written by Live Trading
+
+| Table | Purpose |
+|-------|---------|
+| `active_signals` | Signals that passed all filters |
+| `paper_trades_log` | Executed trades |
+| `tracked_tickers_v2` | Symbols added for intraday TA updates |
+
+### What's NOT in the Live Path (Yet)
+
+| Item | Status |
+|------|--------|
+| `signal_evaluations` table | Designed but FR3_User lacks permissions |
+| `spot_prices` table | Market regime uses Alpaca API directly |
+| Phase detection | Code exists in `phase_detectors/` - NOT integrated yet |
+| GEX calculations | **PLANNED** - code exists, to be added later |
+| Greeks (Black-Scholes) | Code exists - NOT used in live trading |
+| ORATS scanner | `identify_uoa_candidates.py` runs independently, does NOT feed live trader |
+
+---
+
 ## Live Trading TA Data Sources (v37+)
 
 The paper trading service uses different TA data sources based on time of day:
