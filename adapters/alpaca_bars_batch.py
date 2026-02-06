@@ -129,6 +129,7 @@ class AlpacaBarsFetcher:
         limit: int = 50,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        feed: Optional[str] = None,
     ) -> BarData:
         """
         Get bars for a single symbol.
@@ -139,11 +140,12 @@ class AlpacaBarsFetcher:
             limit: Number of bars to fetch
             start: Start datetime (optional)
             end: End datetime (optional)
+            feed: Data feed ("sip" for full coverage, "iex" default)
 
         Returns:
             BarData with list of bars
         """
-        result = await self.get_bars_batch([symbol], timeframe, limit, start, end)
+        result = await self.get_bars_batch([symbol], timeframe, limit, start, end, feed)
         return result.get(symbol, BarData(symbol=symbol, bars=[]))
 
     async def get_bars_batch(
@@ -153,6 +155,7 @@ class AlpacaBarsFetcher:
         limit: int = 50,
         start: Optional[datetime] = None,
         end: Optional[datetime] = None,
+        feed: Optional[str] = None,
     ) -> dict[str, BarData]:
         """
         Get bars for multiple symbols in a single request.
@@ -165,6 +168,7 @@ class AlpacaBarsFetcher:
             limit: Number of bars per symbol
             start: Start datetime (optional)
             end: End datetime (optional)
+            feed: Data feed override (default "iex"; use "sip" for full coverage)
 
         Returns:
             Dict mapping symbol to BarData
@@ -178,12 +182,12 @@ class AlpacaBarsFetcher:
             for i in range(0, len(symbols), self.max_symbols_per_request):
                 batch = symbols[i:i + self.max_symbols_per_request]
                 batch_result = await self._fetch_bars_batch(
-                    batch, timeframe, limit, start, end
+                    batch, timeframe, limit, start, end, feed
                 )
                 result.update(batch_result)
             return result
 
-        return await self._fetch_bars_batch(symbols, timeframe, limit, start, end)
+        return await self._fetch_bars_batch(symbols, timeframe, limit, start, end, feed)
 
     async def _fetch_bars_batch(
         self,
@@ -192,70 +196,123 @@ class AlpacaBarsFetcher:
         limit: int,
         start: Optional[datetime],
         end: Optional[datetime],
+        feed: Optional[str] = None,
     ) -> dict[str, BarData]:
-        """Internal batch fetch implementation."""
-        await self._rate_limit()
+        """
+        Internal batch fetch implementation with pagination.
 
+        Alpaca's multi-symbol bars API paginates by total bar count across all symbols.
+        We need to follow next_page_token until we have 'limit' bars per symbol.
+        """
         session = await self._get_session()
         self._total_requests += 1
         self._total_symbols += len(symbols)
 
         # Build request params
+        # Use limit=10000 per request to minimize API calls (max is 10000)
+        # We'll accumulate until each symbol has 'limit' bars
         params = {
             "symbols": ",".join(symbols),
             "timeframe": timeframe,
-            "limit": limit,
+            "limit": 10000,  # Max per request - we paginate to get all
             "adjustment": "raw",
-            "feed": "iex",  # Use IEX for free tier
+            "feed": feed or "iex",
         }
 
         if start:
-            params["start"] = start.isoformat() + "Z"
+            # RFC3339 format: append Z only if naive (no timezone info)
+            if start.tzinfo is None:
+                params["start"] = start.isoformat() + "Z"
+            else:
+                params["start"] = start.isoformat()
         if end:
-            params["end"] = end.isoformat() + "Z"
+            if end.tzinfo is None:
+                params["end"] = end.isoformat() + "Z"
+            else:
+                params["end"] = end.isoformat()
 
         url = f"{ALPACA_DATA_URL}/stocks/bars"
+        feed_used = params.get("feed", "iex")
+
+        logger.info(f"Alpaca bars request: {len(symbols)} symbols, feed={feed_used}, timeframe={timeframe}, limit_per_symbol={limit}")
+
+        # Accumulate bars across pages
+        all_bars: dict[str, list] = {s: [] for s in symbols}
+        page_count = 0
+        max_pages = 500  # Safety limit (500 pages * 10000 bars = 5M bars max)
 
         try:
-            async with session.get(url, params=params) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    return self._parse_bars_response(data, symbols)
+            while page_count < max_pages:
+                page_count += 1
+                await self._rate_limit()
 
-                elif response.status == 429:
-                    # Rate limited - wait and retry
-                    logger.warning("Rate limited by Alpaca, waiting 60s...")
-                    await asyncio.sleep(60)
-                    return await self._fetch_bars_batch(
-                        symbols, timeframe, limit, start, end
-                    )
+                async with session.get(url, params=params) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        bars_data = data.get("bars", {})
 
-                else:
-                    text = await response.text()
-                    logger.error(f"Alpaca API error {response.status}: {text}")
-                    self._errors += 1
-                    return {s: BarData(symbol=s, bars=[]) for s in symbols}
+                        # Accumulate bars for each symbol
+                        for sym, bars in bars_data.items():
+                            if sym in all_bars:
+                                all_bars[sym].extend(bars)
+
+                        # Check if we have enough bars for all symbols
+                        symbols_complete = sum(1 for s in symbols if len(all_bars[s]) >= limit)
+
+                        # Check for next page
+                        next_token = data.get("next_page_token")
+                        if not next_token:
+                            # No more pages
+                            break
+
+                        # If all symbols have enough bars, stop
+                        if symbols_complete == len(symbols):
+                            break
+
+                        # Continue to next page
+                        params["page_token"] = next_token
+
+                    elif response.status == 429:
+                        # Rate limited - wait and retry
+                        logger.warning("Rate limited by Alpaca, waiting 60s...")
+                        await asyncio.sleep(60)
+                        continue
+                    else:
+                        text = await response.text()
+                        logger.error(f"Alpaca API error {response.status}: {text}")
+                        self._errors += 1
+                        break
+
+            # Log final stats
+            symbols_with_data = sum(1 for s in symbols if len(all_bars[s]) > 0)
+            total_bars = sum(len(bars) for bars in all_bars.values())
+            logger.info(f"Alpaca fetch complete: {symbols_with_data}/{len(symbols)} symbols, {total_bars} total bars, {page_count} pages")
+
+            # Trim to requested limit per symbol and convert to BarData
+            return self._parse_accumulated_bars(all_bars, symbols, limit)
 
         except Exception as e:
             logger.error(f"Alpaca request failed: {e}")
             self._errors += 1
             return {s: BarData(symbol=s, bars=[]) for s in symbols}
 
-    def _parse_bars_response(
+    def _parse_accumulated_bars(
         self,
-        data: dict,
+        all_bars: dict[str, list],
         symbols: list[str],
+        limit: int,
     ) -> dict[str, BarData]:
-        """Parse Alpaca bars response."""
+        """Parse accumulated bars from pagination, trimming to limit."""
         result = {}
 
-        bars_data = data.get("bars", {})
-
         for symbol in symbols:
-            symbol_bars = bars_data.get(symbol, [])
-            bars = []
+            raw_bars = all_bars.get(symbol, [])
+            # Trim to limit - take most recent bars (end of list)
+            if len(raw_bars) > limit:
+                raw_bars = raw_bars[-limit:]
 
-            for bar in symbol_bars:
+            bars = []
+            for bar in raw_bars:
                 bars.append(Bar(
                     symbol=symbol,
                     timestamp=datetime.fromisoformat(bar["t"].replace("Z", "+00:00")),

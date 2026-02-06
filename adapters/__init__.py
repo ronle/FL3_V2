@@ -1,11 +1,15 @@
 """Adapters module for FL3_V2 - external API integrations."""
 
-from .polygon_snapshot import (
-    PolygonSnapshotFetcher,
-    SnapshotResult,
-    OptionContract,
-    fetch_snapshot,
-)
+try:
+    from .polygon_snapshot import (
+        PolygonSnapshotFetcher,
+        SnapshotResult,
+        OptionContract,
+        fetch_snapshot,
+    )
+except ImportError:
+    pass
+
 from .alpaca_bars_batch import (
     AlpacaBarsFetcher,
     Bar,

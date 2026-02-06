@@ -257,10 +257,17 @@ Gamma Flip = Price where Net GEX crosses zero
 |------|-------|-----------|
 | Free | 200 req/min | ~4 req/min (batched) |
 
+**CRITICAL: Multi-Symbol Pagination (v38c fix)**
+Alpaca's multi-symbol bars endpoint (`/v2/stocks/bars`) paginates by **total bar count across all symbols**, NOT per-symbol:
+- Requesting `limit=70` for 100 symbols returns ~70 bars TOTAL (1-2 symbols), not 70 per symbol
+- Must follow `next_page_token` until all symbols have sufficient data
+- Use `limit=10000` (API max) per request to minimize round-trips
+- File: `adapters/alpaca_bars_batch.py:_fetch_bars_batch()`
+
 **Batching Strategy:**
-- 50-100 symbols per bars request
-- 1,000 symbols ÷ 50 = 20 calls per refresh
-- 5-min refresh = 4 calls/min average
+- 100 symbols per request (max supported)
+- Uses SIP feed for full market coverage
+- Pagination handles 300+ symbols in 1-2 pages with limit=10000
 
 ---
 
@@ -578,9 +585,59 @@ ORDER BY staleness DESC;
 1. **Start session**: Check date/time and market status
 2. **Check shared data**: Verify ORATS and spot_prices are fresh
 3. **Test locally**: Use `python -m scripts.firehose_main --test-mode`
-4. **Build image**: `docker build -t ... .`
-5. **Deploy**: Update Cloud Run job with new image
-6. **Monitor**: Check logs for errors, verify triggers are reasonable
+4. **MANDATORY: Check context size before build** (see below)
+5. **Build image**: `docker build -t ... .`
+6. **Deploy**: Update Cloud Run job with new image
+7. **Monitor**: Check logs for errors, verify triggers are reasonable
+
+---
+
+## MANDATORY: Pre-Deployment Size Check
+
+**ALWAYS check Docker context size before building/deploying.** The repository contains large local data files that MUST NOT be uploaded.
+
+### Check Command
+```bash
+# Check total directory size
+du -sh C:/Users/levir/Documents/FL3_V2
+
+# Should be < 10MB after .dockerignore exclusions
+# If > 50MB, something is wrong - investigate!
+```
+
+### Expected Sizes
+| Directory | Expected | Notes |
+|-----------|----------|-------|
+| Total repo | ~27GB | Contains polygon_data, backups |
+| Docker context | < 5MB | After .dockerignore exclusions |
+| Built image | ~260MB | Python 3.11 slim + deps |
+
+### Common Issues
+| File/Dir | Size | Fix |
+|----------|------|-----|
+| `polygon_data/` | ~22GB | Already in .dockerignore |
+| `backups/` | ~4.7GB | Already in .dockerignore |
+| `nul` | Variable | Windows artifact - delete if exists |
+| `*.csv.gz` | ~50MB+ | Data files - in .dockerignore |
+| Root `*.py` scripts | ~55 files | Dev scripts - in .dockerignore |
+
+### CRITICAL: Two Ignore Files Required
+
+| File | Used By | Purpose |
+|------|---------|---------|
+| `.dockerignore` | `docker build` (local) | Excludes files from Docker context |
+| `.gcloudignore` | `gcloud builds submit` | Excludes files from Cloud Build upload |
+
+**Both files must be kept in sync!** If you update one, update the other.
+
+### If Build Takes > 2 Minutes
+1. Stop the build immediately (Ctrl+C)
+2. Check what's being uploaded: `du -sh */ | sort -rh | head -10`
+3. Update BOTH `.dockerignore` AND `.gcloudignore`
+4. Verify locally with: `docker build --no-cache .` (watch context size)
+5. Verify gcloud with first line of output: `Creating temporary archive of X file(s) totalling Y`
+
+**DO NOT proceed with deployment if context upload exceeds 1MB (should be ~700KB).**
 
 ---
 
@@ -660,3 +717,79 @@ def get_baseline(symbol: str, bucket: str) -> float:
 - [ ] Tune detection thresholds based on backtest results
 - [ ] Review phase detection accuracy
 - [ ] Database maintenance (VACUUM ANALYZE)
+
+---
+
+## Pipeline Health Check
+
+Comprehensive test suite for validating the entire V2 pipeline.
+
+### Running the Health Check
+
+**Local (recommended):**
+```bash
+# Requires Cloud SQL Auth Proxy running on localhost:5433
+python -m tests.pipeline_health_check
+```
+
+**On Cloud Run:**
+```bash
+gcloud run jobs execute fl3-v2-health-check --region=us-west1 --wait
+```
+
+### Prerequisites for Local Testing
+
+1. **Cloud SQL Auth Proxy** must be running:
+   ```bash
+   cloud_sql_proxy -instances=spartan-buckeye-474319-q8:us-west1:fr3-pg=tcp:5433
+   ```
+
+2. **GCP credentials** - `gcloud auth login` completed
+
+3. **Alpaca credentials** - Set via environment or GCP secrets
+
+### Environment Variables
+
+| Variable | Purpose | Auto-detected |
+|----------|---------|---------------|
+| `DATABASE_URL` | Cloud SQL socket (for Cloud Run) | Yes - transforms to TCP locally |
+| `DATABASE_URL_LOCAL` | TCP connection for local testing | Optional override |
+| `ALPACA_API_KEY` | Alpaca API key | From GCP secrets |
+| `ALPACA_SECRET_KEY` | Alpaca secret | From GCP secrets |
+| `GOOGLE_CLOUD_PROJECT` | GCP project (default: fl3-v2-prod) | Yes |
+
+### Test Sections (19 tests)
+
+| Section | Tests | What It Checks |
+|---------|-------|----------------|
+| GCP Infrastructure | 1.1-1.4 | Scheduler jobs, Cloud Run service, errors |
+| Data Freshness | 2.1-2.7 | TA cache, baselines, earnings, tickers |
+| Tracking Pipeline | 3.1-3.3 | Symbol tracking, TA coverage |
+| Signal Filtering | 4.1-4.2 | Filter chain, sentiment data |
+| Alpaca Integration | 5.1-5.3 | Connection, buying power, trades |
+
+### How Local DB Access Works
+
+The script auto-detects Windows environment and transforms the Cloud SQL socket URL to TCP:
+
+```
+Cloud Run:  postgresql://...?host=/cloudsql/project:region:instance
+Local:      postgresql://FR3_User:***@127.0.0.1:5433/fl3
+```
+
+This requires Cloud SQL Auth Proxy running on port 5433.
+
+### Expected Results
+
+| Status | Meaning |
+|--------|---------|
+| PASS | Test passed |
+| WARN | Minor issue (e.g., stale data but still usable) |
+| FAIL | Critical issue requiring attention |
+| SKIP | Test skipped (e.g., outside market hours) |
+
+### Typical Warnings (Not Failures)
+
+- **Baselines X days old** - OK if within 20-day window
+- **None added recently to tracking** - OK if v37 just deployed
+- **No trades today** - OK if market closed

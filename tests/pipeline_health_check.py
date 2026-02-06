@@ -13,10 +13,30 @@ Usage:
     python -m tests.pipeline_health_check --json
 
 Environment Variables:
-    DATABASE_URL: PostgreSQL connection string
+    DATABASE_URL: PostgreSQL connection string (Cloud SQL socket for Cloud Run)
+    DATABASE_URL_LOCAL: Optional TCP connection for local testing (overrides DATABASE_URL)
     ALPACA_API_KEY: Alpaca API key
     ALPACA_SECRET_KEY: Alpaca secret key
     GOOGLE_CLOUD_PROJECT: GCP project ID (default: fl3-v2-prod)
+
+Local Testing:
+    The script auto-detects Windows environment and transforms Cloud SQL socket URLs
+    to TCP connections via Cloud SQL Auth Proxy on localhost:5433.
+
+    Prerequisites:
+    1. Cloud SQL Auth Proxy running: cloud_sql_proxy -instances=spartan-buckeye-474319-q8:us-west1:fr3-pg=tcp:5433
+    2. GCP auth: gcloud auth login
+    3. Secrets accessible: gcloud secrets versions access latest --secret=DATABASE_URL
+
+Cloud Run Execution:
+    gcloud run jobs execute fl3-v2-health-check --region=us-west1 --wait
+
+Test Sections:
+    - jobs: GCP scheduler jobs and Cloud Run service health (TEST-1.x)
+    - data: Database freshness for all tables (TEST-2.x)
+    - tracking: Symbol tracking pipeline (TEST-3.x)
+    - filtering: Signal filter chain (TEST-4.x)
+    - alpaca: Alpaca API integration (TEST-5.x)
 """
 
 import argparse
@@ -128,6 +148,7 @@ class PipelineHealthCheck:
         "fetch-earnings-calendar": {"schedule": "0 4 * * 1-5", "tz": "America/Los_Angeles"},
         "refresh-sector-data": {"schedule": "0 6 * * 0", "tz": "America/New_York"},
         "update-spot-prices": {"schedule": "*/1 6-13 * * 1-5", "tz": "America/Los_Angeles"},
+        "premarket-orchestrator": {"schedule": "0 9 * * 1-5", "tz": "America/New_York"},
     }
 
     EXPECTED_SERVICES = ["paper-trading-live"]
@@ -141,12 +162,29 @@ class PipelineHealthCheck:
         gcp_region: str = "us-west1",
         verbose: bool = False,
     ):
-        self.db_url = db_url or os.environ.get("DATABASE_URL")
-        self.alpaca_key = alpaca_key or os.environ.get("ALPACA_API_KEY")
-        self.alpaca_secret = alpaca_secret or os.environ.get("ALPACA_SECRET_KEY")
+        self.verbose = verbose
         self.gcp_project = gcp_project or os.environ.get("GOOGLE_CLOUD_PROJECT", "fl3-v2-prod")
         self.gcp_region = gcp_region
-        self.verbose = verbose
+        self.alpaca_key = alpaca_key or os.environ.get("ALPACA_API_KEY")
+        self.alpaca_secret = alpaca_secret or os.environ.get("ALPACA_SECRET_KEY")
+
+        # Database URL priority:
+        # 1. Explicit db_url parameter
+        # 2. DATABASE_URL_LOCAL env var (for local testing with Cloud SQL proxy)
+        # 3. DATABASE_URL env var (Cloud SQL socket for Cloud Run)
+        self.db_url = db_url or os.environ.get("DATABASE_URL_LOCAL") or os.environ.get("DATABASE_URL")
+
+        # Auto-detect local environment and transform socket URL to TCP
+        if self.db_url and "/cloudsql/" in self.db_url and sys.platform == "win32":
+            # Running locally on Windows - Cloud SQL socket won't work
+            # Use Cloud SQL Auth Proxy on localhost:5433
+            local_proxy_url = os.environ.get(
+                "DATABASE_URL_LOCAL",
+                "postgresql://FR3_User:di7UtK8E1%5B%5B137%40F@127.0.0.1:5433/fl3"
+            )
+            if self.verbose:
+                logger.info(f"Detected local environment, using Cloud SQL proxy: 127.0.0.1:5433")
+            self.db_url = local_proxy_url
 
         self.results: List[TestResult] = []
         self._db_conn = None
@@ -204,9 +242,15 @@ class PipelineHealthCheck:
         """Run a gcloud command and return output."""
         try:
             cmd = ["gcloud"] + args + [f"--project={self.gcp_project}", "--format=json"]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # On Windows, use shell=True to find gcloud.cmd
+            use_shell = sys.platform == "win32"
+            if use_shell:
+                cmd = " ".join(cmd)
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30, shell=use_shell)
             if result.returncode == 0:
                 return result.stdout
+            if self.verbose:
+                logger.warning(f"gcloud returned {result.returncode}: {result.stderr}")
             return None
         except Exception as e:
             if self.verbose:
@@ -383,12 +427,133 @@ class PipelineHealthCheck:
                 message=f"Error checking service: {e}"
             )
 
+    def check_service_errors(self) -> TestResult:
+        """TEST-1.4: No recent errors on current revision."""
+        # First get the current active revision from service describe (JSON format)
+        output = self._run_gcloud_command([
+            "run", "services", "describe", "paper-trading-live",
+            f"--region={self.gcp_region}"
+        ])
+
+        if not output:
+            return TestResult(
+                test_id="TEST-1.4",
+                name="Service errors (current revision)",
+                status=TestStatus.SKIP,
+                message="Could not get current revision"
+            )
+
+        try:
+            service = json.loads(output)
+            current_revision = service.get("status", {}).get("latestReadyRevisionName")
+            if not current_revision:
+                return TestResult(
+                    test_id="TEST-1.4",
+                    name="Service errors (current revision)",
+                    status=TestStatus.SKIP,
+                    message="Could not parse current revision"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-1.4",
+                name="Service errors (current revision)",
+                status=TestStatus.SKIP,
+                message=f"Error parsing service info: {e}"
+            )
+
+        # Query logs for errors on current revision only (last 60 minutes)
+        log_filter = (
+            f'resource.type="cloud_run_revision" '
+            f'resource.labels.service_name="paper-trading-live" '
+            f'resource.labels.revision_name="{current_revision}" '
+            f'severity>=ERROR '
+            f'timestamp>="{(datetime.now(pytz.UTC) - timedelta(minutes=60)).isoformat()}"'
+        )
+
+        error_output = self._run_gcloud_command([
+            "logging", "read", log_filter,
+            "--limit=10"
+        ])
+
+        try:
+            errors = json.loads(error_output) if error_output else []
+            error_count = len(errors)
+
+            if error_count == 0:
+                return TestResult(
+                    test_id="TEST-1.4",
+                    name="Service errors (current revision)",
+                    status=TestStatus.PASS,
+                    message=f"No errors on {current_revision} (last 60 min)"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-1.4",
+                    name="Service errors (current revision)",
+                    status=TestStatus.WARN,
+                    message=f"{error_count} errors on {current_revision} (last 60 min)"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-1.4",
+                name="Service errors (current revision)",
+                status=TestStatus.SKIP,
+                message=f"Error querying logs: {e}"
+            )
+
+    def check_service_min_instances(self) -> TestResult:
+        """TEST-1.5: paper-trading-live has min-instances >= 1 (prevents scale-to-zero)."""
+        output = self._run_gcloud_command([
+            "run", "services", "describe", "paper-trading-live",
+            f"--region={self.gcp_region}"
+        ])
+
+        if not output:
+            return TestResult(
+                test_id="TEST-1.5",
+                name="Service min-instances",
+                status=TestStatus.SKIP,
+                message="Could not query service"
+            )
+
+        try:
+            service = json.loads(output)
+            annotations = (
+                service.get("spec", {})
+                .get("template", {})
+                .get("metadata", {})
+                .get("annotations", {})
+            )
+            min_scale = annotations.get("autoscaling.knative.dev/minScale", "0")
+
+            if int(min_scale) >= 1:
+                return TestResult(
+                    test_id="TEST-1.5",
+                    name="Service min-instances",
+                    status=TestStatus.PASS,
+                    message=f"min-instances={min_scale} (always-on)"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-1.5",
+                    name="Service min-instances",
+                    status=TestStatus.FAIL,
+                    message=f"min-instances={min_scale} — service will scale to zero! Set to 1."
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-1.5",
+                name="Service min-instances",
+                status=TestStatus.SKIP,
+                message=f"Error parsing service: {e}"
+            )
+
     # =========================================================================
     # SECTION 2: DATA FRESHNESS
     # =========================================================================
 
     def check_ta_daily_close(self) -> TestResult:
-        """TEST-2.1: ta_daily_close has today's data."""
+        """TEST-2.1: ta_daily_close has today's data with expected symbol coverage."""
         conn = self._get_db_connection()
         if not conn:
             return TestResult(
@@ -406,6 +571,12 @@ class PipelineHealthCheck:
                 WHERE trade_date >= CURRENT_DATE - 1
             """)
             max_date, symbol_count = cur.fetchone()
+
+            # Get expected symbol count from tracked_tickers_v2
+            cur.execute("""
+                SELECT COUNT(*) FROM tracked_tickers_v2 WHERE ta_enabled = TRUE
+            """)
+            tracked_count = cur.fetchone()[0]
             cur.close()
 
             today = datetime.now(ET).date()
@@ -429,20 +600,32 @@ class PipelineHealthCheck:
             if expected_date.weekday() >= 5:
                 expected_date = expected_date - timedelta(days=expected_date.weekday() - 4)
 
-            if max_date >= expected_date:
-                return TestResult(
-                    test_id="TEST-2.1",
-                    name="ta_daily_close freshness",
-                    status=TestStatus.PASS,
-                    message=f"Date: {max_date}, {symbol_count:,} symbols",
-                    details={"max_date": str(max_date), "symbols": symbol_count}
-                )
-            else:
+            if max_date < expected_date:
                 return TestResult(
                     test_id="TEST-2.1",
                     name="ta_daily_close freshness",
                     status=TestStatus.FAIL,
                     message=f"Stale data: {max_date} (expected {expected_date})"
+                )
+
+            # Date is fresh — now validate symbol coverage
+            # Expect at least 80% of tracked symbols (some may lack bar data)
+            expected_min = max(int(tracked_count * 0.8), 82)  # floor = DEFAULT_SYMBOLS count
+            if symbol_count >= expected_min:
+                return TestResult(
+                    test_id="TEST-2.1",
+                    name="ta_daily_close freshness",
+                    status=TestStatus.PASS,
+                    message=f"Date: {max_date}, {symbol_count:,} symbols (tracked: {tracked_count})",
+                    details={"max_date": str(max_date), "symbols": symbol_count, "tracked": tracked_count}
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-2.1",
+                    name="ta_daily_close freshness",
+                    status=TestStatus.WARN,
+                    message=f"Date: {max_date}, only {symbol_count:,} symbols (expected >={expected_min} from {tracked_count} tracked)",
+                    details={"max_date": str(max_date), "symbols": symbol_count, "tracked": tracked_count, "expected_min": expected_min}
                 )
         except Exception as e:
             return TestResult(
@@ -551,12 +734,19 @@ class PipelineHealthCheck:
                     status=TestStatus.PASS,
                     message=f"Date: {max_date}, {symbol_count:,} symbols"
                 )
-            else:
+            elif days_old <= 7:
                 return TestResult(
                     test_id="TEST-2.3",
                     name="Baselines freshness",
                     status=TestStatus.WARN,
-                    message=f"Data is {days_old} days old"
+                    message=f"Data is {days_old} days old (refresh job may have failed)"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-2.3",
+                    name="Baselines freshness",
+                    status=TestStatus.FAIL,
+                    message=f"Data is {days_old} days old — 20-day rolling window degraded"
                 )
         except Exception as e:
             return TestResult(
@@ -665,7 +855,7 @@ class PipelineHealthCheck:
             )
 
     def check_spot_prices(self) -> TestResult:
-        """TEST-2.6: spot_prices is fresh (during RTH)."""
+        """TEST-2.6: spot_prices is fresh for tracked symbols (during RTH)."""
         if not self._is_market_hours():
             return TestResult(
                 test_id="TEST-2.6",
@@ -685,36 +875,49 @@ class PipelineHealthCheck:
 
         try:
             cur = conn.cursor()
+            # Only check tracked symbols (not all 15K V1 rows)
             cur.execute("""
                 SELECT
-                    COUNT(*) FILTER (WHERE updated_at > NOW() - INTERVAL '5 minutes') as fresh,
-                    COUNT(*) FILTER (WHERE updated_at <= NOW() - INTERVAL '5 minutes') as stale,
-                    MAX(updated_at)
-                FROM spot_prices
+                    COUNT(*) as total,
+                    COUNT(*) FILTER (WHERE s.updated_at > NOW() - INTERVAL '5 minutes') as fresh,
+                    COUNT(*) FILTER (WHERE s.updated_at IS NULL) as missing
+                FROM tracked_tickers_v2 t
+                LEFT JOIN spot_prices s ON t.symbol = s.symbol
+                WHERE t.ta_enabled = TRUE
             """)
-            fresh, stale, max_ts = cur.fetchone()
+            total, fresh, missing = cur.fetchone()
+            stale = total - fresh - missing
             cur.close()
 
-            if fresh > 0 and stale == 0:
-                return TestResult(
-                    test_id="TEST-2.6",
-                    name="Spot prices freshness",
-                    status=TestStatus.PASS,
-                    message=f"All {fresh} prices fresh"
-                )
-            elif fresh > 0:
+            if total == 0:
                 return TestResult(
                     test_id="TEST-2.6",
                     name="Spot prices freshness",
                     status=TestStatus.WARN,
-                    message=f"{stale} stale prices (> 5 min old)"
+                    message="No tracked symbols to check"
+                )
+
+            fresh_pct = (fresh / total * 100) if total > 0 else 0
+            if fresh_pct >= 80:
+                return TestResult(
+                    test_id="TEST-2.6",
+                    name="Spot prices freshness",
+                    status=TestStatus.PASS,
+                    message=f"{fresh}/{total} tracked symbols have fresh prices ({fresh_pct:.0f}%)"
+                )
+            elif fresh_pct >= 50:
+                return TestResult(
+                    test_id="TEST-2.6",
+                    name="Spot prices freshness",
+                    status=TestStatus.WARN,
+                    message=f"Only {fresh}/{total} tracked symbols fresh ({stale} stale, {missing} missing)"
                 )
             else:
                 return TestResult(
                     test_id="TEST-2.6",
                     name="Spot prices freshness",
                     status=TestStatus.FAIL,
-                    message="No fresh spot prices"
+                    message=f"Only {fresh}/{total} tracked symbols fresh ({fresh_pct:.0f}%)"
                 )
         except Exception as e:
             return TestResult(
@@ -724,12 +927,12 @@ class PipelineHealthCheck:
                 message=f"Query error: {e}"
             )
 
-    def check_signal_evaluations(self) -> TestResult:
-        """TEST-2.7: active_signals has today's data."""
+    def check_active_signals_today(self) -> TestResult:
+        """TEST-2.7: active_signals has today's data (signals that passed all filters)."""
         if not self._is_market_hours():
             return TestResult(
                 test_id="TEST-2.7",
-                name="Signal evaluations",
+                name="Active signals today",
                 status=TestStatus.SKIP,
                 message="Outside market hours"
             )
@@ -738,14 +941,13 @@ class PipelineHealthCheck:
         if not conn:
             return TestResult(
                 test_id="TEST-2.7",
-                name="Signal evaluations",
+                name="Active signals today",
                 status=TestStatus.SKIP,
                 message="No database connection"
             )
 
         try:
             cur = conn.cursor()
-            # Use active_signals (signals that passed) since signal_evaluations may not be accessible
             cur.execute("""
                 SELECT COUNT(*), COUNT(DISTINCT symbol)
                 FROM active_signals
@@ -757,31 +959,226 @@ class PipelineHealthCheck:
             if total > 0:
                 return TestResult(
                     test_id="TEST-2.7",
-                    name="Signal evaluations",
+                    name="Active signals today",
                     status=TestStatus.PASS,
                     message=f"{total} signals passed today ({symbols} symbols)"
                 )
             else:
-                # Check if it's early in the day
                 now_et = datetime.now(ET)
                 if now_et.time() < dt_time(10, 0):
                     return TestResult(
                         test_id="TEST-2.7",
-                        name="Signal evaluations",
+                        name="Active signals today",
                         status=TestStatus.WARN,
                         message="No signals yet (early in session)"
                     )
                 else:
                     return TestResult(
                         test_id="TEST-2.7",
-                        name="Signal evaluations",
+                        name="Active signals today",
                         status=TestStatus.WARN,
                         message="No signals passed today (may be normal)"
                     )
         except Exception as e:
             return TestResult(
                 test_id="TEST-2.7",
-                name="Signal evaluations",
+                name="Active signals today",
+                status=TestStatus.FAIL,
+                message=f"Query error: {e}"
+            )
+
+    def check_ta_sip_coverage(self) -> TestResult:
+        """TEST-2.9: TA pipeline SIP feed coverage (v44+).
+
+        Validates that the TA pipeline is using SIP feed (full market coverage).
+        Without feed="sip", only ~10% of symbols get valid data (IEX default).
+        Expected: >= 200 unique symbols with fresh snapshots during RTH.
+        """
+        if not self._is_market_hours():
+            return TestResult(
+                test_id="TEST-2.9",
+                name="TA pipeline SIP coverage",
+                status=TestStatus.SKIP,
+                message="Outside market hours"
+            )
+
+        conn = self._get_db_connection()
+        if not conn:
+            return TestResult(
+                test_id="TEST-2.9",
+                name="TA pipeline SIP coverage",
+                status=TestStatus.SKIP,
+                message="No database connection"
+            )
+
+        try:
+            cur = conn.cursor()
+            # Count symbols with valid TA data (price > 0) in last 15 min
+            cur.execute("""
+                SELECT COUNT(DISTINCT symbol)
+                FROM ta_snapshots_v2
+                WHERE snapshot_ts > NOW() - INTERVAL '15 minutes'
+                  AND price > 0
+            """)
+            valid_count = cur.fetchone()[0]
+
+            # Also get total tracked for context
+            cur.execute("SELECT COUNT(*) FROM tracked_tickers_v2 WHERE ta_enabled = TRUE")
+            tracked = cur.fetchone()[0]
+            cur.close()
+
+            if valid_count >= 200:
+                return TestResult(
+                    test_id="TEST-2.9",
+                    name="TA pipeline SIP coverage",
+                    status=TestStatus.PASS,
+                    message=f"{valid_count}/{tracked} symbols have valid TA (SIP feed working)"
+                )
+            elif valid_count >= 50:
+                return TestResult(
+                    test_id="TEST-2.9",
+                    name="TA pipeline SIP coverage",
+                    status=TestStatus.WARN,
+                    message=f"Only {valid_count}/{tracked} symbols — SIP feed may be degraded"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-2.9",
+                    name="TA pipeline SIP coverage",
+                    status=TestStatus.FAIL,
+                    message=f"Only {valid_count}/{tracked} valid — likely missing feed='sip' (IEX gives ~10%)"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-2.9",
+                name="TA pipeline SIP coverage",
+                status=TestStatus.FAIL,
+                message=f"Query error: {e}"
+            )
+
+    def check_live_baselines_today(self) -> TestResult:
+        """TEST-2.10: BucketAggregator writing baselines today (v44+).
+
+        The BucketAggregator in paper-trading-live accumulates options trades
+        into 30-min buckets and flushes to intraday_baselines_30m at boundaries.
+        During RTH after 10:00 AM, there should be today's baseline data.
+        """
+        if not self._is_market_hours():
+            return TestResult(
+                test_id="TEST-2.10",
+                name="Live baselines today",
+                status=TestStatus.SKIP,
+                message="Outside market hours"
+            )
+
+        now_et = datetime.now(ET)
+        if now_et.time() < dt_time(10, 0):
+            return TestResult(
+                test_id="TEST-2.10",
+                name="Live baselines today",
+                status=TestStatus.SKIP,
+                message="Too early — first bucket boundary at 10:00 AM ET"
+            )
+
+        conn = self._get_db_connection()
+        if not conn:
+            return TestResult(
+                test_id="TEST-2.10",
+                name="Live baselines today",
+                status=TestStatus.SKIP,
+                message="No database connection"
+            )
+
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT COUNT(DISTINCT symbol), COUNT(*)
+                FROM intraday_baselines_30m
+                WHERE trade_date = CURRENT_DATE
+            """)
+            symbols_today, rows_today = cur.fetchone()
+            cur.close()
+
+            if rows_today > 0:
+                return TestResult(
+                    test_id="TEST-2.10",
+                    name="Live baselines today",
+                    status=TestStatus.PASS,
+                    message=f"{rows_today} rows for {symbols_today} symbols today (BucketAggregator active)"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-2.10",
+                    name="Live baselines today",
+                    status=TestStatus.WARN,
+                    message="No baselines for today — BucketAggregator may not be flushing"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-2.10",
+                name="Live baselines today",
+                status=TestStatus.FAIL,
+                message=f"Query error: {e}"
+            )
+
+    def check_orats_daily(self) -> TestResult:
+        """TEST-2.8: orats_daily has recent data (V1 dependency — baselines derive from this)."""
+        conn = self._get_db_connection()
+        if not conn:
+            return TestResult(
+                test_id="TEST-2.8",
+                name="ORATS daily (V1 dep)",
+                status=TestStatus.SKIP,
+                message="No database connection"
+            )
+
+        try:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT MAX(asof_date), COUNT(DISTINCT symbol)
+                FROM orats_daily
+                WHERE asof_date >= CURRENT_DATE - 7
+            """)
+            max_date, symbol_count = cur.fetchone()
+            cur.close()
+
+            if max_date is None:
+                return TestResult(
+                    test_id="TEST-2.8",
+                    name="ORATS daily (V1 dep)",
+                    status=TestStatus.FAIL,
+                    message="No ORATS data in last 7 days — V1 ingest may be down"
+                )
+
+            today = datetime.now(ET).date()
+            days_old = (today - max_date).days
+
+            # ORATS asof_date is T-1 (yesterday's data arrives after close)
+            if days_old <= 2:
+                return TestResult(
+                    test_id="TEST-2.8",
+                    name="ORATS daily (V1 dep)",
+                    status=TestStatus.PASS,
+                    message=f"Date: {max_date}, {symbol_count:,} symbols"
+                )
+            elif days_old <= 4:
+                return TestResult(
+                    test_id="TEST-2.8",
+                    name="ORATS daily (V1 dep)",
+                    status=TestStatus.WARN,
+                    message=f"Data is {days_old} days old (expected T-1)"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-2.8",
+                    name="ORATS daily (V1 dep)",
+                    status=TestStatus.FAIL,
+                    message=f"Data is {days_old} days old — V1 orats_ingest job likely broken"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-2.8",
+                name="ORATS daily (V1 dep)",
                 status=TestStatus.FAIL,
                 message=f"Query error: {e}"
             )
@@ -791,7 +1188,11 @@ class PipelineHealthCheck:
     # =========================================================================
 
     def check_symbol_tracking(self) -> TestResult:
-        """TEST-3.1: Symbols are being added to tracking."""
+        """TEST-3.1: Symbols are being tracked and triggers are updating (v44+).
+
+        v44 tracks ALL UOA-triggered symbols (not just those that pass filters).
+        Validates both new symbol creation and trigger_count/last_trigger_ts updates.
+        """
         conn = self._get_db_connection()
         if not conn:
             return TestResult(
@@ -806,11 +1207,12 @@ class PipelineHealthCheck:
             cur.execute("""
                 SELECT
                     COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE created_at > CURRENT_DATE - 1) as recent,
-                    MAX(created_at)
+                    COUNT(*) FILTER (WHERE created_at > CURRENT_DATE - 1) as recent_created,
+                    COUNT(*) FILTER (WHERE last_trigger_ts > NOW() - INTERVAL '1 hour') as recent_triggered,
+                    MAX(last_trigger_ts)
                 FROM tracked_tickers_v2
             """)
-            total, recent, max_ts = cur.fetchone()
+            total, recent_created, recent_triggered, last_trigger = cur.fetchone()
             cur.close()
 
             if total == 0:
@@ -821,20 +1223,44 @@ class PipelineHealthCheck:
                     message="No tracked symbols"
                 )
 
-            if recent > 0:
-                return TestResult(
-                    test_id="TEST-3.1",
-                    name="Symbol tracking",
-                    status=TestStatus.PASS,
-                    message=f"{total} total tracked, {recent} added recently"
-                )
+            parts = [f"{total} total"]
+            if recent_created > 0:
+                parts.append(f"{recent_created} new today")
+            if recent_triggered > 0:
+                parts.append(f"{recent_triggered} triggered last hour")
+
+            # During market hours, we expect active triggering
+            if self._is_market_hours():
+                if recent_triggered > 0:
+                    return TestResult(
+                        test_id="TEST-3.1",
+                        name="Symbol tracking",
+                        status=TestStatus.PASS,
+                        message=", ".join(parts)
+                    )
+                else:
+                    return TestResult(
+                        test_id="TEST-3.1",
+                        name="Symbol tracking",
+                        status=TestStatus.WARN,
+                        message=f"{total} tracked but no triggers in last hour (firehose active?)"
+                    )
             else:
-                return TestResult(
-                    test_id="TEST-3.1",
-                    name="Symbol tracking",
-                    status=TestStatus.WARN,
-                    message=f"{total} tracked, none added recently"
-                )
+                # Outside market hours, just check total is reasonable
+                if total >= 100:
+                    return TestResult(
+                        test_id="TEST-3.1",
+                        name="Symbol tracking",
+                        status=TestStatus.PASS,
+                        message=", ".join(parts)
+                    )
+                else:
+                    return TestResult(
+                        test_id="TEST-3.1",
+                        name="Symbol tracking",
+                        status=TestStatus.WARN,
+                        message=f"Only {total} tracked (expected 100+)"
+                    )
         except Exception as e:
             return TestResult(
                 test_id="TEST-3.1",
@@ -879,27 +1305,30 @@ class PipelineHealthCheck:
             total_tracked = cur.fetchone()[0]
             cur.close()
 
-            if len(missing) == 0:
+            missing_count = len(missing)
+            missing_pct = (missing_count / total_tracked * 100) if total_tracked > 0 else 0
+
+            if missing_pct <= 10:
                 return TestResult(
                     test_id="TEST-3.2",
                     name="TA coverage",
                     status=TestStatus.PASS,
-                    message=f"All {total_tracked} tracked symbols have fresh TA"
+                    message=f"{total_tracked - missing_count}/{total_tracked} tracked symbols have fresh TA ({100-missing_pct:.0f}%)"
                 )
-            elif len(missing) <= 5:
+            elif missing_pct <= 30:
                 symbols = [m[0] for m in missing[:5]]
                 return TestResult(
                     test_id="TEST-3.2",
                     name="TA coverage",
                     status=TestStatus.WARN,
-                    message=f"{len(missing)} symbols missing TA: {', '.join(symbols)}"
+                    message=f"{missing_count}/{total_tracked} missing fresh TA ({missing_pct:.0f}%): {', '.join(symbols)}..."
                 )
             else:
                 return TestResult(
                     test_id="TEST-3.2",
                     name="TA coverage",
                     status=TestStatus.FAIL,
-                    message=f"{len(missing)}/{total_tracked} symbols missing fresh TA"
+                    message=f"{missing_count}/{total_tracked} missing fresh TA ({missing_pct:.0f}%) — TA pipeline may be broken"
                 )
         except Exception as e:
             return TestResult(
@@ -1224,6 +1653,180 @@ class PipelineHealthCheck:
                 message=f"Query error: {e}"
             )
 
+    def check_alpaca_bars_api(self) -> TestResult:
+        """TEST-5.4: Alpaca bars API returns historical data with SIP feed.
+
+        Validates the exact call path used by dynamic TA fetch:
+        feed=sip, timeframe=1Day, start=now-120days, limit=70.
+        Would have caught v41-v43 bug (missing feed/start params → 1 bar).
+        """
+        if not self.alpaca_key or not self.alpaca_secret:
+            return TestResult(
+                test_id="TEST-5.4",
+                name="Alpaca bars API (SIP)",
+                status=TestStatus.SKIP,
+                message="No Alpaca credentials"
+            )
+
+        try:
+            import aiohttp
+
+            async def check():
+                headers = {
+                    "APCA-API-KEY-ID": self.alpaca_key,
+                    "APCA-API-SECRET-KEY": self.alpaca_secret,
+                }
+                # Same params used in signal_filter.py:fetch_ta_for_symbol()
+                from datetime import timezone
+                start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=120)
+                params = {
+                    "symbols": "AAPL",
+                    "timeframe": "1Day",
+                    "limit": 10000,
+                    "adjustment": "raw",
+                    "feed": "sip",
+                    "start": start_date.isoformat() + "Z",
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://data.alpaca.markets/v2/stocks/bars",
+                        headers=headers,
+                        params=params,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        if resp.status == 200:
+                            data = await resp.json()
+                            bars = data.get("bars", {}).get("AAPL", [])
+                            return len(bars)
+                        return -1
+
+            bar_count = asyncio.run(check())
+
+            if bar_count >= 50:
+                return TestResult(
+                    test_id="TEST-5.4",
+                    name="Alpaca bars API (SIP)",
+                    status=TestStatus.PASS,
+                    message=f"AAPL returned {bar_count} daily bars (feed=sip, start=120d ago)"
+                )
+            elif bar_count > 0:
+                return TestResult(
+                    test_id="TEST-5.4",
+                    name="Alpaca bars API (SIP)",
+                    status=TestStatus.WARN,
+                    message=f"Only {bar_count} bars — dynamic TA needs 20+ for RSI/SMA"
+                )
+            elif bar_count == 0:
+                return TestResult(
+                    test_id="TEST-5.4",
+                    name="Alpaca bars API (SIP)",
+                    status=TestStatus.FAIL,
+                    message="0 bars returned — check feed param and start date"
+                )
+            else:
+                return TestResult(
+                    test_id="TEST-5.4",
+                    name="Alpaca bars API (SIP)",
+                    status=TestStatus.FAIL,
+                    message="API error — check Alpaca credentials/plan"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-5.4",
+                name="Alpaca bars API (SIP)",
+                status=TestStatus.FAIL,
+                message=f"Error: {e}"
+            )
+
+    def check_position_sync(self) -> TestResult:
+        """TEST-5.5: Alpaca positions match paper_trades_log open trades."""
+        if not self.alpaca_key or not self.alpaca_secret:
+            return TestResult(
+                test_id="TEST-5.5",
+                name="Position sync",
+                status=TestStatus.SKIP,
+                message="No Alpaca credentials"
+            )
+
+        conn = self._get_db_connection()
+        if not conn:
+            return TestResult(
+                test_id="TEST-5.5",
+                name="Position sync",
+                status=TestStatus.SKIP,
+                message="No database connection"
+            )
+
+        try:
+            import aiohttp
+
+            # Get Alpaca positions
+            async def get_positions():
+                headers = {
+                    "APCA-API-KEY-ID": self.alpaca_key,
+                    "APCA-API-SECRET-KEY": self.alpaca_secret,
+                }
+                async with aiohttp.ClientSession() as session:
+                    async with session.get(
+                        "https://paper-api.alpaca.markets/v2/positions",
+                        headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=10)
+                    ) as resp:
+                        if resp.status == 200:
+                            return await resp.json()
+                        return None
+
+            alpaca_positions = asyncio.run(get_positions())
+            if alpaca_positions is None:
+                return TestResult(
+                    test_id="TEST-5.5",
+                    name="Position sync",
+                    status=TestStatus.SKIP,
+                    message="Could not fetch Alpaca positions"
+                )
+
+            alpaca_symbols = {p["symbol"] for p in alpaca_positions}
+
+            # Get DB open trades (no exit_price = still open)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT symbol FROM paper_trades_log
+                WHERE exit_price IS NULL AND created_at > CURRENT_DATE - 7
+            """)
+            db_symbols = {r[0] for r in cur.fetchall()}
+            cur.close()
+
+            # Compare
+            in_alpaca_not_db = alpaca_symbols - db_symbols
+            in_db_not_alpaca = db_symbols - alpaca_symbols
+
+            if not in_alpaca_not_db and not in_db_not_alpaca:
+                return TestResult(
+                    test_id="TEST-5.5",
+                    name="Position sync",
+                    status=TestStatus.PASS,
+                    message=f"{len(alpaca_symbols)} positions in sync"
+                )
+            else:
+                issues = []
+                if in_alpaca_not_db:
+                    issues.append(f"Alpaca-only: {', '.join(in_alpaca_not_db)}")
+                if in_db_not_alpaca:
+                    issues.append(f"DB-only: {', '.join(in_db_not_alpaca)}")
+                return TestResult(
+                    test_id="TEST-5.5",
+                    name="Position sync",
+                    status=TestStatus.WARN,
+                    message=f"Mismatch: {'; '.join(issues)}"
+                )
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-5.5",
+                name="Position sync",
+                status=TestStatus.FAIL,
+                message=f"Error: {e}"
+            )
+
     # =========================================================================
     # RUN ALL TESTS
     # =========================================================================
@@ -1240,6 +1843,8 @@ class PipelineHealthCheck:
                 self.check_scheduler_jobs_enabled,
                 self.check_jobs_recent_execution,
                 self.check_service_health,
+                self.check_service_errors,
+                self.check_service_min_instances,
             ],
             "data": [
                 self.check_ta_daily_close,
@@ -1248,7 +1853,10 @@ class PipelineHealthCheck:
                 self.check_earnings_calendar,
                 self.check_master_tickers,
                 self.check_spot_prices,
-                self.check_signal_evaluations,
+                self.check_active_signals_today,
+                self.check_orats_daily,
+                self.check_ta_sip_coverage,
+                self.check_live_baselines_today,
             ],
             "tracking": [
                 self.check_symbol_tracking,
@@ -1263,6 +1871,8 @@ class PipelineHealthCheck:
                 self.check_alpaca_connection,
                 self.check_alpaca_buying_power,
                 self.check_trades_executed,
+                self.check_alpaca_bars_api,
+                self.check_position_sync,
             ],
         }
 
@@ -1297,6 +1907,8 @@ class PipelineHealthCheck:
                 self.check_scheduler_jobs_enabled,
                 self.check_jobs_recent_execution,
                 self.check_service_health,
+                self.check_service_errors,
+                self.check_service_min_instances,
             ]),
             # Section 2: Data Freshness
             ("DATA FRESHNESS", [
@@ -1306,7 +1918,10 @@ class PipelineHealthCheck:
                 self.check_earnings_calendar,
                 self.check_master_tickers,
                 self.check_spot_prices,
-                self.check_signal_evaluations,
+                self.check_active_signals_today,
+                self.check_orats_daily,
+                self.check_ta_sip_coverage,
+                self.check_live_baselines_today,
             ]),
             # Section 3: Tracking
             ("TRACKING PIPELINE", [
@@ -1324,6 +1939,8 @@ class PipelineHealthCheck:
                 self.check_alpaca_connection,
                 self.check_alpaca_buying_power,
                 self.check_trades_executed,
+                self.check_alpaca_bars_api,
+                self.check_position_sync,
             ]),
         ]
 

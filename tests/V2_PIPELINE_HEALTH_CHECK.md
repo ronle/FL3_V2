@@ -6,6 +6,55 @@ This document defines a comprehensive health check for the FL3_V2 paper trading 
 
 ---
 
+## Quick Start
+
+### Run Locally (Recommended)
+```bash
+# Requires Cloud SQL Auth Proxy running on localhost:5433
+python -m tests.pipeline_health_check
+```
+
+### Run on Cloud
+```bash
+gcloud run jobs execute fl3-v2-health-check --region=us-west1 --wait
+```
+
+---
+
+## Prerequisites for Local Testing
+
+### 1. Cloud SQL Auth Proxy
+The script needs database access. Locally, this requires Cloud SQL Auth Proxy:
+```bash
+cloud_sql_proxy -instances=spartan-buckeye-474319-q8:us-west1:fr3-pg=tcp:5433
+```
+
+### 2. GCP Authentication
+```bash
+gcloud auth login
+gcloud config set project fl3-v2-prod
+```
+
+### 3. Environment Variables
+The script auto-fetches from GCP secrets, or you can set manually:
+```bash
+export ALPACA_API_KEY=$(gcloud secrets versions access latest --secret=ALPACA_API_KEY)
+export ALPACA_SECRET_KEY=$(gcloud secrets versions access latest --secret=ALPACA_SECRET_KEY)
+export DATABASE_URL=$(gcloud secrets versions access latest --secret=DATABASE_URL)
+```
+
+### How Database Connection Works
+
+| Environment | DATABASE_URL Format | How It Connects |
+|-------------|---------------------|-----------------|
+| Cloud Run | `?host=/cloudsql/project:region:instance` | Cloud SQL socket |
+| Local (Windows) | Auto-transformed | TCP via `127.0.0.1:5433` |
+| Local (override) | `DATABASE_URL_LOCAL` | Direct TCP connection |
+
+The script auto-detects Windows and transforms Cloud SQL socket URLs to TCP connections.
+
+---
+
 ## 1. GCP Job Inventory & Status
 
 ### 1.1 Cloud Run Jobs
@@ -52,15 +101,14 @@ TEST-1.3: paper-trading-live service is healthy
 | Table | Written By | Expected Freshness |
 |-------|------------|-------------------|
 | `ta_daily_close` | premarket-ta-cache | Today's date (after 6 AM ET) |
-| `ta_snapshots_v2` | fl3-v2-ta-pipeline | Within 10 min (during RTH) |
-| `intraday_baselines_30m` | fl3-v2-baseline-refresh | Yesterday or today |
+| `ta_snapshots_v2` | fl3-v2-ta-pipeline (feed=sip) | Within 10 min (during RTH), 200+ symbols |
+| `intraday_baselines_30m` | fl3-v2-baseline-refresh + paper-trading-live (BucketAggregator) | Yesterday or today |
 | `earnings_calendar` | fetch-earnings-calendar | Has future dates |
 | `master_tickers` | refresh-sector-data | >5000 rows |
 | `spot_prices` | update-spot-prices | Within 5 min (during RTH) |
-| `signal_evaluations` | paper-trading-live | Today (during RTH) |
 | `active_signals` | paper-trading-live | Today (during RTH) |
 | `paper_trades_log` | paper-trading-live | Today (if trades executed) |
-| `tracked_tickers_v2` | paper-trading-live | Growing over time |
+| `tracked_tickers_v2` | paper-trading-live (all UOA triggers) | Growing over time |
 
 ### Test Cases - Data Freshness
 
@@ -95,10 +143,21 @@ TEST-2.6: spot_prices is fresh (during RTH)
   - Expected: > 0
   - Failure indicates: update-spot-prices job not running
 
-TEST-2.7: signal_evaluations has today's data (during RTH)
-  - Query: SELECT COUNT(*) FROM signal_evaluations WHERE evaluated_at::date = CURRENT_DATE
-  - Expected: > 0 (after 9:35 AM ET)
-  - Failure indicates: paper-trading-live not processing signals
+TEST-2.7: active_signals has today's data (during RTH)
+  - Query: SELECT COUNT(*) FROM active_signals WHERE detected_at::date = CURRENT_DATE
+  - Expected: > 0 (after 10:00 AM ET, may be 0 early)
+  - Failure indicates: paper-trading-live not passing any signals
+
+TEST-2.9: TA pipeline SIP coverage (v44+)
+  - Query: SELECT COUNT(DISTINCT symbol) FROM ta_snapshots_v2
+           WHERE snapshot_ts > NOW() - INTERVAL '15 minutes' AND price > 0
+  - Expected: >= 200 symbols (with feed="sip")
+  - Failure indicates: Missing feed="sip" in ta_pipeline_v2.py (IEX gives ~10% coverage)
+
+TEST-2.10: Live baselines today (v44+)
+  - Query: SELECT COUNT(*) FROM intraday_baselines_30m WHERE trade_date = CURRENT_DATE
+  - Expected: > 0 (after 10:00 AM ET, first 30-min bucket boundary)
+  - Failure indicates: BucketAggregator not wired or not flushing in paper-trading-live
 ```
 
 ---
@@ -139,7 +198,7 @@ TEST-3.4: Earnings calendar has upcoming week
 
 ## 4. UOA Detection Flow
 
-### 4.1 Flow Diagram
+### 4.1 Flow Diagram (v44+)
 
 ```
 Polygon WebSocket (T.*)
@@ -150,16 +209,20 @@ TradeAggregator (paper_trading/trade_aggregator.py)
     - 60-second rolling window
     - Per-symbol baseline comparison
     ↓
+BucketAggregator (v44+) — accumulates 30-min baselines → intraday_baselines_30m
+    ↓
 UOA Detection (score >= 10, notional >= baseline)
+    ↓
+ALL triggered symbols → tracked_tickers_v2 (v44+)
     ↓
 SignalGenerator.create_signal_async()
     - Fetch TA (intraday or daily)
     - Fetch price (Alpaca)
     ↓
 SignalFilter.apply()
-    - 10 filter checks
+    - 8 active filter checks
     ↓
-If PASSED → Execute trade + Track symbol
+If PASSED → Execute trade via Alpaca → active_signals + paper_trades_log
 ```
 
 ### Test Cases - UOA Detection
@@ -170,60 +233,63 @@ TEST-4.1: Polygon WebSocket is connected
   - Expected: No reconnection loops, stable connection
 
 TEST-4.2: Trades are being processed
-  - Query: Check live service metrics
+  - Check: Service logs for trade processing metrics
   - Expected: trades_processed > 0 and increasing
 
-TEST-4.3: Aggregator is triggering signals
-  - Query: SELECT COUNT(*) FROM signal_evaluations WHERE evaluated_at > NOW() - INTERVAL '1 hour'
-  - Expected: > 0 during RTH
+TEST-4.3: Symbols are being triggered
+  - Query: SELECT COUNT(*) FROM tracked_tickers_v2
+           WHERE last_trigger_ts > NOW() - INTERVAL '1 hour'
+  - Expected: > 0 during RTH (v44 tracks all triggered symbols)
 
-TEST-4.4: Score calculation is working
-  - Query: SELECT AVG(score) FROM signal_evaluations WHERE evaluated_at::date = CURRENT_DATE
-  - Expected: Reasonable distribution (5-15 typical)
+TEST-4.4: BucketAggregator is flushing baselines
+  - Query: SELECT COUNT(*) FROM intraday_baselines_30m WHERE trade_date = CURRENT_DATE
+  - Expected: > 0 after 10:00 AM ET (v44+ BucketAggregator)
 
-TEST-4.5: Baseline comparison is active
-  - Check: signal_evaluations contains baseline-related rejections
-  - Expected: Some signals rejected for "notional < baseline"
+TEST-4.5: Active signals flowing through filters
+  - Query: SELECT COUNT(*) FROM active_signals WHERE detected_at::date = CURRENT_DATE
+  - Expected: > 0 (after sufficient market activity)
 ```
 
 ---
 
 ## 5. Tracked Tickers Pipeline
 
-### 5.1 Flow
+### 5.1 Flow (v44+)
 
 ```
-Signal passes filters
+UOA trigger detected (score >= 10)
     ↓
-track_symbol_for_ta() called
+ALL triggered symbols upserted to tracked_tickers_v2 (v44+)
+    ├── New symbols: INSERT with trigger_count=1
+    └── Existing: UPDATE trigger_count + last_trigger_ts
     ↓
-INSERT/UPDATE tracked_tickers_v2
+ta_pipeline picks up symbol (next 5-min cycle, feed=sip)
     ↓
-ta_pipeline picks up symbol (next 5-min cycle)
-    ↓
-ta_snapshots_v2 gets intraday TA
+ta_snapshots_v2 gets intraday TA (200+ symbols with SIP)
 ```
 
-### Test Cases - Tracking
+**Note (v44 change):** Previously only symbols that passed all 8 filters were tracked. Now ALL UOA-triggered symbols are tracked, growing the universe from ~3-5/day to dozens/day.
+
+### Test Cases - Tracking (v44+)
 
 ```
-TEST-5.1: New symbols are being added
-  - Query: SELECT COUNT(*) FROM tracked_tickers_v2 WHERE created_at > CURRENT_DATE - 1
-  - Expected: > 0 (if trading occurred)
+TEST-5.1: Symbols are being tracked with active triggers
+  - Query: SELECT COUNT(*),
+           COUNT(*) FILTER (WHERE last_trigger_ts > NOW() - INTERVAL '1 hour')
+           FROM tracked_tickers_v2
+  - Expected: > 0 total, recent triggers during RTH
+  - v44 change: ALL triggered symbols tracked, not just filter-passed
 
 TEST-5.2: Trigger count is incrementing
-  - Query: SELECT symbol, trigger_count FROM tracked_tickers_v2 WHERE trigger_count > 1 LIMIT 5
-  - Expected: Some symbols have multiple triggers
+  - Query: SELECT symbol, trigger_count, last_trigger_ts FROM tracked_tickers_v2
+           WHERE trigger_count > 1 ORDER BY last_trigger_ts DESC LIMIT 5
+  - Expected: Some symbols have multiple triggers with recent timestamps
 
-TEST-5.3: TA pipeline covers tracked symbols
+TEST-5.3: TA pipeline covers tracked symbols (200+ with SIP)
   - Query:
-    SELECT t.symbol, MAX(s.snapshot_ts) as last_ta
-    FROM tracked_tickers_v2 t
-    LEFT JOIN ta_snapshots_v2 s ON t.symbol = s.symbol
-    WHERE t.ta_enabled = TRUE
-    GROUP BY t.symbol
-    HAVING MAX(s.snapshot_ts) < NOW() - INTERVAL '10 minutes'
-  - Expected: No stale symbols during RTH
+    SELECT COUNT(DISTINCT symbol) FROM ta_snapshots_v2
+    WHERE snapshot_ts > NOW() - INTERVAL '15 minutes' AND price > 0
+  - Expected: >= 200 symbols (validates SIP feed, not just IEX ~10%)
 
 TEST-5.4: Active signals match tracked symbols
   - Query:
@@ -238,42 +304,39 @@ TEST-5.4: Active signals match tracked symbols
 
 ## 6. Signal Filtering Validation
 
-### 6.1 Filter Chain
+### 6.1 Filter Chain (8 active as of v44)
 
-| # | Filter | Source Table | Rejection Keyword |
-|---|--------|--------------|-------------------|
-| 1 | ETF exclusion | (hardcoded) | "ETF excluded" |
-| 2 | Score >= 10 | - | "score X < 10" |
-| 3 | RSI < 50 | ta_daily_close / ta_snapshots_v2 | "RSI X >= 50" |
-| 4 | Price > SMA20 | ta_* | "not uptrend" |
-| 5 | Price > SMA50 | ta_daily_close | "below 50d SMA" |
-| 6 | Notional >= baseline | intraday_baselines_30m | "notional < baseline" |
-| 7 | Mentions < 5 | vw_media_daily_features | "high mentions" |
-| 8 | Sentiment >= 0 | vw_media_daily_features | "negative sentiment" |
-| 9 | Sector limit | master_tickers | (sector concentration) |
-| 10 | Earnings proximity | earnings_calendar | "earnings TODAY/TOMORROW" |
+| # | Filter | Source Table | Rejection Keyword | Status |
+|---|--------|--------------|-------------------|--------|
+| 1 | ETF exclusion | (hardcoded) | "ETF excluded" | Active |
+| 2 | Score >= 10 | - | "score X < 10" | Active |
+| 3 | RSI < 50 | ta_daily_close / ta_snapshots_v2 | "RSI X >= 50" | Active |
+| 4 | Price > SMA20 | ta_* | "not uptrend" | Active |
+| 5 | Price > SMA50 | ta_daily_close | "below 50d SMA" | Active |
+| 6 | Notional >= baseline | intraday_baselines_30m | "notional < baseline" | Active |
+| 7 | Crowded trade | vw_media_daily_features | "high mentions" / "negative sentiment" | Active |
+| 8 | Earnings proximity | earnings_calendar | "earnings TODAY/TOMORROW" | Active |
+
+**Note:** Sector concentration and market regime filters exist in code but are not currently called in the live filter chain.
 
 ### Test Cases - Filtering
 
 ```
-TEST-6.1: All filters are operational
-  - Query:
-    SELECT rejection_reason, COUNT(*)
-    FROM signal_evaluations
-    WHERE evaluated_at::date = CURRENT_DATE AND NOT passed_all_filters
-    GROUP BY rejection_reason
-  - Expected: Multiple rejection types present
+TEST-6.1: Filters are passing signals
+  - Query: SELECT COUNT(*), COUNT(DISTINCT symbol) FROM active_signals
+           WHERE detected_at > CURRENT_DATE - 7
+  - Expected: > 0 signals passed within the week
 
 TEST-6.2: RSI filter uses correct source
   - Check logs for: "Refreshed intraday TA cache: X symbols" after 9:35 AM
-  - Expected: Intraday cache is being used
+  - Expected: Intraday cache is being used (200+ symbols with SIP feed)
 
 TEST-6.3: Earnings filter is blocking appropriately
-  - Query: Check if symbols with upcoming earnings are rejected
+  - Check service logs for: "FILTERED: earnings" rejection messages
   - Expected: Symbols within 2 days of earnings are rejected
 
 TEST-6.4: Sentiment data is available
-  - Query: SELECT COUNT(*) FROM vw_media_daily_features WHERE asof_date = CURRENT_DATE
+  - Query: SELECT COUNT(*) FROM vw_media_daily_features WHERE asof_date >= CURRENT_DATE - 2
   - Expected: > 0
   - Failure indicates: V1 media pipeline not running
 ```
@@ -524,6 +587,9 @@ INFO (logged only):
 | No signals evaluated | WebSocket disconnected | Service logs |
 | All signals rejected | TA data missing | ta_daily_close freshness |
 | Stale intraday TA | ta_pipeline job failed | Job execution logs |
+| Only ~11 valid TA symbols (not 200+) | Missing `feed="sip"` in ta_pipeline | TEST-2.9 |
+| No baselines for today | BucketAggregator not wired/flushing | TEST-2.10 |
+| Tracked symbols not growing | Symbol tracking only on PASS (pre-v44) | TEST-3.1 last_trigger_ts |
 | No trades executing | Alpaca API issue | Alpaca connection test |
 | Sentiment filter blocking all | V1 media pipeline down | vw_media_daily_features |
-| Missing baselines | Baseline refresh failed | intraday_baselines_30m |
+| Missing baselines (historical) | Baseline refresh failed | intraday_baselines_30m |

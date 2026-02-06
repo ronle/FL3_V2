@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from datetime import datetime, date, time as dt_time
@@ -40,6 +41,7 @@ from paper_trading.dashboard import get_dashboard
 
 from firehose.client import FirehoseClient, Trade
 from firehose.stock_price_monitor import StockPriceMonitor
+from firehose.bucket_aggregator import BucketAggregator
 
 ET = pytz.timezone("America/New_York")
 
@@ -104,6 +106,7 @@ class PaperTradingEngine:
 
         # State
         self._running = False
+        self._graceful_shutdown = False
         self._last_daily_reset: Optional[date] = None
         self._eod_complete = False  # Flag to stop signal processing after EOD close
 
@@ -112,6 +115,10 @@ class PaperTradingEngine:
 
         # Real-time price cache from WebSocket
         self._realtime_prices: Dict[str, float] = {}
+
+        # BucketAggregator for baseline generation (initialized in run())
+        self.bucket_aggregator = None
+        self._db_pool = None
 
         # WebSocket health tracking (PROD-1 graceful degradation)
         self._websocket_healthy = False
@@ -356,6 +363,24 @@ class PaperTradingEngine:
         # Add to aggregator
         self.aggregator.add_trade(trade)
 
+        # Feed bucket aggregator for baseline generation
+        if self.bucket_aggregator:
+            match = re.match(r"O:([A-Z]+)\d{6}[CP]\d{8}", trade.symbol)
+            if match:
+                underlying = match.group(1)
+                boundary_crossed = self.bucket_aggregator.add_trade(
+                    underlying=underlying,
+                    option_symbol=trade.symbol,
+                    price=trade.price,
+                    size=trade.size,
+                )
+                if boundary_crossed:
+                    try:
+                        rows = await self.bucket_aggregator.flush()
+                        logger.info(f"Bucket boundary: flushed {rows} baseline rows to DB")
+                    except Exception as e:
+                        logger.warning(f"Bucket flush failed: {e}")
+
     def _is_entry_allowed(self) -> bool:
         """Check if we're within the time window to open new positions."""
         now = self._get_et_now().time()
@@ -375,6 +400,22 @@ class PaperTradingEngine:
 
         # Get symbols with elevated activity
         triggered = self.aggregator.get_triggered_symbols()
+
+        # Track ALL triggered symbols for TA monitoring (not just passed)
+        if triggered and self._db_pool:
+            try:
+                now = self._get_et_now()
+                async with self._db_pool.acquire() as conn:
+                    await conn.executemany("""
+                        INSERT INTO tracked_tickers_v2
+                        (symbol, first_trigger_ts, trigger_count, last_trigger_ts, ta_enabled)
+                        VALUES ($1, $2, 1, $2, TRUE)
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            trigger_count = tracked_tickers_v2.trigger_count + 1,
+                            last_trigger_ts = $2
+                    """, [(sym, now) for sym in triggered.keys()])
+            except Exception as e:
+                logger.warning(f"Failed to track triggered symbols: {e}")
 
         # Pre-subscribe to triggered symbols for real-time prices
         if triggered and self.stock_monitor.is_connected:
@@ -535,6 +576,19 @@ class PaperTradingEngine:
         # Load per-symbol baselines from database
         await self.load_baselines()
 
+        # Create asyncpg pool for BucketAggregator and symbol tracking
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url:
+            try:
+                import asyncpg
+                self._db_pool = await asyncpg.create_pool(
+                    db_url.strip(), min_size=1, max_size=5, command_timeout=30
+                )
+                self.bucket_aggregator = BucketAggregator(db_pool=self._db_pool)
+                logger.info("BucketAggregator initialized with asyncpg pool")
+            except Exception as e:
+                logger.warning(f"Failed to create asyncpg pool for BucketAggregator: {e}")
+
         # Check account
         if not self.dry_run:
             account = await self.trader.get_account()
@@ -613,13 +667,18 @@ class PaperTradingEngine:
 
                 # Periodic dashboard position update (current prices and PnL)
                 if now - last_dashboard_update >= dashboard_update_interval:
-                    await self.position_manager.update_dashboard_positions()
+                    try:
+                        await self.position_manager.update_dashboard_positions()
+                    except Exception as e:
+                        logger.warning(f"Dashboard position update failed: {e}")
                     last_dashboard_update = now
 
         except KeyboardInterrupt:
             logger.info("Shutdown requested...")
+            self._graceful_shutdown = True
         except Exception as e:
             logger.error(f"Engine error: {e}")
+            self._graceful_shutdown = False
             raise
         finally:
             await self.shutdown()
@@ -631,14 +690,30 @@ class PaperTradingEngine:
         self._running = False
         self.eod_closer.stop()
 
-        # Close any remaining positions if during market hours
-        if self._is_trading_hours() and not self.dry_run:
-            logger.warning("Closing positions on shutdown...")
+        # Only close positions on intentional shutdown (KeyboardInterrupt / EOD)
+        # Do NOT close on code crashes — positions are safer left open
+        if self._graceful_shutdown and self._is_trading_hours() and not self.dry_run:
+            logger.warning("Closing positions on graceful shutdown...")
             await self.position_manager.close_all_positions(reason="shutdown")
+        elif not self._graceful_shutdown:
+            logger.warning("Crash shutdown — preserving positions (not closing)")
 
         # Stop stock price monitor
         await self.stock_monitor.stop()
         logger.info(f"Stock monitor metrics: {self.stock_monitor.get_metrics()}")
+
+        # Flush remaining bucket data
+        if self.bucket_aggregator:
+            try:
+                rows = await self.bucket_aggregator.flush()
+                if rows:
+                    logger.info(f"Shutdown: flushed {rows} remaining baseline rows")
+            except Exception:
+                pass
+
+        if self._db_pool:
+            await self._db_pool.close()
+            logger.info("Asyncpg pool closed")
 
         await self.firehose.disconnect()
         await self.trader.close()

@@ -142,7 +142,7 @@ class Dashboard:
 
         try:
             ts = timestamp or datetime.now(ET)
-            time_str = ts.strftime("%H:%M:%S")
+            time_str = ts.strftime("%Y-%m-%d %H:%M:%S")
 
             row = [
                 time_str,
@@ -214,7 +214,7 @@ class Dashboard:
 
             # Add to Closed tab
             row = [
-                ts.strftime("%H:%M"),
+                ts.strftime("%Y-%m-%d %H:%M:%S"),
                 symbol,
                 f"${entry_price:.2f}",
                 f"${exit_price:.2f}",
@@ -249,7 +249,7 @@ class Dashboard:
 
             # Add headers
             self._signals_tab.append_row(
-                ['Time', 'Symbol', 'Score', 'RSI', 'Ratio', 'Notional', 'Price', 'Action'],
+                ['Date/Time', 'Symbol', 'Score', 'RSI', 'Ratio', 'Notional', 'Price', 'Action'],
                 value_input_option='USER_ENTERED'
             )
             self._positions_tab.append_row(
@@ -257,7 +257,7 @@ class Dashboard:
                 value_input_option='USER_ENTERED'
             )
             self._closed_tab.append_row(
-                ['Time', 'Symbol', 'Entry', 'Exit', 'P/L %', 'Result'],
+                ['Date/Time', 'Symbol', 'Entry', 'Exit', 'P/L %', 'Result'],
                 value_input_option='USER_ENTERED'
             )
 

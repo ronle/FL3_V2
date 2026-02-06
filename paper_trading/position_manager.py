@@ -452,6 +452,23 @@ class PositionManager:
             "open_positions": self.num_positions,
         }
 
+    async def update_dashboard_positions(self):
+        """Update dashboard with current position prices and PnL."""
+        dashboard = get_dashboard()
+        if not dashboard.enabled:
+            return
+
+        positions = await self.trader.get_positions()
+        for pos in positions:
+            if pos.symbol in self.active_trades:
+                trade = self.active_trades[pos.symbol]
+                dashboard.update_position(
+                    symbol=pos.symbol,
+                    entry_price=trade.entry_price,
+                    current_price=pos.current_price,
+                    status="HOLDING",
+                )
+
     def record_signal(self, passed_filter: bool):
         """Record a signal for stats."""
         self.daily_stats.signals_seen += 1

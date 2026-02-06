@@ -179,6 +179,7 @@ class TAPipelineOrchestrator:
                     symbols=batch,
                     timeframe="5Min",
                     limit=BARS_TO_FETCH,
+                    feed="sip",
                 )
                 all_bars.update(bars)
                 logger.debug(f"Fetched batch {i+1}/{len(batches)}: {len(batch)} symbols")

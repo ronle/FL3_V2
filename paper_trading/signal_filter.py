@@ -708,7 +708,7 @@ class SignalGenerator:
         """
         self.ta_cache = ta_cache or {}  # Daily TA cache (prior day close)
         self.database_url = database_url or os.environ.get("DATABASE_URL")
-        self._polygon_fetcher = None
+        self._alpaca_fetcher = None
         self._fetch_lock = asyncio.Lock()
         self._fetched_symbols: set = set()  # Track symbols we've already tried to fetch
 
@@ -825,21 +825,22 @@ class SignalGenerator:
 
         return merged
 
-    async def _get_polygon_fetcher(self):
-        """Lazy-load Polygon fetcher."""
-        if self._polygon_fetcher is None:
-            from adapters.polygon_bars import PolygonBarsFetcher
-            api_key = os.environ.get("POLYGON_API_KEY")
-            if api_key:
-                self._polygon_fetcher = PolygonBarsFetcher(api_key, requests_per_minute=5)
-                logger.info("Initialized Polygon fetcher for dynamic TA")
+    async def _get_alpaca_fetcher(self):
+        """Lazy-load Alpaca bars fetcher."""
+        if self._alpaca_fetcher is None:
+            from adapters.alpaca_bars_batch import AlpacaBarsFetcher
+            api_key = os.environ.get("ALPACA_API_KEY")
+            secret_key = os.environ.get("ALPACA_SECRET_KEY")
+            if api_key and secret_key:
+                self._alpaca_fetcher = AlpacaBarsFetcher(api_key, secret_key)
+                logger.info("Initialized Alpaca fetcher for dynamic TA")
             else:
-                logger.warning("POLYGON_API_KEY not set, dynamic TA fetch disabled")
-        return self._polygon_fetcher
+                logger.warning("ALPACA_API_KEY/ALPACA_SECRET_KEY not set, dynamic TA fetch disabled")
+        return self._alpaca_fetcher
 
     async def fetch_ta_for_symbol(self, symbol: str) -> Optional[Dict]:
         """
-        Fetch TA data for a symbol from Polygon (on-demand).
+        Fetch TA data for a symbol from Alpaca (on-demand).
 
         Returns dict with rsi_14, macd_hist, sma_20, last_close, trend
         or None if fetch fails.
@@ -857,13 +858,16 @@ class SignalGenerator:
 
             self._fetched_symbols.add(symbol)
 
-            fetcher = await self._get_polygon_fetcher()
+            fetcher = await self._get_alpaca_fetcher()
             if not fetcher:
                 return None
 
             try:
-                logger.info(f"Fetching TA for {symbol} from Polygon...")
-                bar_data = await fetcher.get_bars(symbol, days=70)  # Extended for 50d SMA
+                logger.info(f"Fetching TA for {symbol} from Alpaca...")
+                # Explicit start date required — without it Alpaca returns only today's bar
+                from datetime import timezone
+                start_date = datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(days=120)
+                bar_data = await fetcher.get_bars(symbol, timeframe="1Day", limit=70, start=start_date, feed="sip")
 
                 if not bar_data.bars or len(bar_data.bars) < 20:
                     logger.warning(f"Insufficient bar data for {symbol}: {len(bar_data.bars) if bar_data.bars else 0} bars")
@@ -1022,7 +1026,7 @@ class SignalGenerator:
         TA data source priority:
         1. Before 9:35 AM: Daily cache (prior day close from ta_daily_close)
         2. After 9:35 AM: Intraday cache (5-min refresh from ta_snapshots_v2)
-        3. Fallback: On-demand fetch from Polygon API
+        3. Fallback: On-demand fetch from Alpaca API
 
         Fetches current price from Alpaca if aggregator price is 0.
 
@@ -1040,7 +1044,7 @@ class SignalGenerator:
             except Exception as e:
                 logger.warning(f"Intraday TA cache refresh failed: {e}")
 
-        # Check if we need to fetch TA from Polygon (fallback for unknown symbols)
+        # Check if we need to fetch TA from Alpaca (fallback for unknown symbols)
         # Only do this if symbol is not in daily cache AND not in intraday cache
         if symbol not in self.ta_cache and symbol not in self._intraday_ta_cache:
             try:
