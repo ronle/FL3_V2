@@ -2,6 +2,185 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-08] - Adaptive RSI: Bounce-Day Relaxation (v48)
+
+### Summary
+Implements adaptive RSI threshold that relaxes from 50 → 60 on market bounce-back days (SPY opens green after 2+ consecutive red closes). Backtest-validated over 7 months: 19 new trades, 73.7% WR, +$1,647 incremental PnL, Sharpe 5.75 → 5.88, zero hard stops hit.
+
+### Modified Files
+- **`paper_trading/config.py`**:
+  - Added `USE_ADAPTIVE_RSI: bool = True`
+  - Added `ADAPTIVE_RSI_THRESHOLD: float = 60.0`
+  - Added `ADAPTIVE_RSI_MIN_RED_DAYS: int = 2`
+- **`paper_trading/signal_filter.py`**:
+  - Added bounce-day state vars to `SignalFilter.__init__` (`_bounce_eligible`, `_bounce_checked`, `_is_bounce_day`, `_effective_rsi_threshold`)
+  - Added `_check_bounce_day_eligible()` — queries `ta_daily_close` for SPY's last 5 closes, counts red streak
+  - Added `_auto_confirm_bounce_day()` — fetches SPY open via Alpaca REST at 9:31 AM ET, confirms bounce day if open > prior close
+  - Modified RSI check in `apply()` to use `_effective_rsi_threshold` (50 normal, 60 bounce)
+  - Added bounce-day tag to pass log: `[BOUNCE DAY: RSI<60]`
+  - Added metadata tagging: `bounce_day`, `rsi_threshold_used`
+  - Updated `reset_stats()` to reset bounce state and re-check for new day
+  - Added bounce check to `_preload_caches()`
+- **`tests/pipeline_health_check.py`**:
+  - Added TEST-2.12: `check_adaptive_rsi_config()` — validates config sanity
+- **`CLAUDE.md`**:
+  - Updated filter chain step 3 to note adaptive RSI (V29)
+
+### Backtest Support Files (New)
+- **`scripts/enrich_signals_ta.py`** — TA enrichment for historical signals (joins ta_daily_close, master_tickers, earnings_calendar, sentiment)
+- **`scripts/backtest_rsi_regime.py`** — Extended with `--input` flag for enriched JSON signals
+
+### Rollback
+Set `USE_ADAPTIVE_RSI = False` in `config.py`. One-line change, no code removal needed.
+
+---
+
+## [2026-02-07] - GEX Cache Optimization (v47)
+
+### Summary
+Replaced per-signal `psycopg2.connect()` in `_lookup_gex()` with a bulk-loaded in-memory cache. GEX data only changes nightly (ORATS ingest), so opening a new DB connection for every signal was unnecessary churn — especially during busy periods with 50+ signals.
+
+### Modified Files
+- **`paper_trading/signal_filter.py`**:
+  - Added `_gex_cache` dict and `_gex_cache_loaded` flag to `SignalGenerator.__init__`
+  - New `_load_gex_cache()` — bulk loads latest GEX for all ~5,500 symbols in one `DISTINCT ON` query, lazy-loaded on first call
+  - `_lookup_gex()` now returns `self._gex_cache.get(symbol)` — O(1) dict lookup, zero DB connections
+
+### Impact
+- **Before**: ~50+ DB connections per busy period (one per signal)
+- **After**: 1 DB query total (on first signal of the day), then pure in-memory lookups
+- No behavioral change — same GEX metadata attached to signals
+
+---
+
+## [2026-02-07] - GEX + ORATS Ingest Migration to V2 (v46a)
+
+### Summary
+Migrated the V1 ORATS daily ingest job to V2, extended it with GEX (Gamma Exposure) computation from raw per-strike data, created a historical backfill CLI, and added shadow GEX metadata to live signal evaluations. Backfilled 2+ years of historical GEX data (2.85M rows).
+
+### New Files
+- **`sources/__init__.py`** — New package for data source modules
+- **`sources/orats_ingest.py`** (~1050 lines) — V1 ORATS ingest adapted for V2:
+  - `_get_secret()` — Secret Manager resolution with env var fallback for local dev
+  - GEX accumulator in `_parse_orats_csv()` — parallel to existing symbol aggregation
+  - `_find_gamma_flip()` — Interpolated zero-crossing of cumulative GEX (filters strikes to 20%-300% of spot, returns crossing nearest to spot)
+  - `_finalize_gex_metrics()` — Computes call/put walls, gamma flip, snapshot_ts at 4PM ET
+  - `_bulk_upsert_gex()` — Batch upsert via `execute_values` with ON CONFLICT
+  - All V1 functions preserved: FTP download, CSV parsing, IV rank, HV 30d, EMAs
+  - psycopg v3 → psycopg2 conversion (`execute_values` instead of COPY API)
+- **`scripts/backfill_gex.py`** (~165 lines) — Historical GEX backfill CLI:
+  - `--dir "D:\ORATS_TMP_Files"` — Process all files in directory
+  - `--file` — Process single file
+  - `--from` / `--to` — Date range filter
+  - Imports GEX functions from `sources.orats_ingest`
+  - Progress logging with elapsed time
+
+### Modified Files
+- **`paper_trading/signal_filter.py`**:
+  - Added `metadata: Optional[Dict] = None` to `Signal` dataclass
+  - Added `_lookup_gex(symbol)` method to `SignalGenerator` — queries latest GEX from `gex_metrics_snapshot`
+  - Added GEX lookup in `create_signal_async()` after signal creation (wrapped in try/except, failure doesn't affect signal)
+  - Added `metadata` column to `_log_evaluation_sync()` INSERT (JSONB)
+- **`sql/create_signal_evaluations.sql`** — Added `trade_placed`, `entry_price`, `metadata JSONB` columns
+- **`.dockerignore`** / **`.gcloudignore`** — Updated production code comment to include `sources/`
+
+### DDL Applied
+- `ALTER TABLE gex_metrics_snapshot ADD CONSTRAINT uq_gex_symbol_ts UNIQUE (symbol, snapshot_ts)` — Enables idempotent UPSERT
+- `ALTER TABLE signal_evaluations ADD COLUMN metadata JSONB` — Shadow GEX data on signals
+- `CREATE INDEX idx_signal_evaluations_date ON signal_evaluations(detected_at DESC)`
+- Grants: `FR3_User` SELECT on `signal_evaluations`
+
+### GEX Computation
+Per-strike from ORATS CSV (~900K rows/day):
+```
+GEX per strike = gamma x OI x 100 x spot^2 x 0.01  (call positive, put negative)
+DEX per strike = delta x callOI x 100 - |delta-1| x putOI x 100
+Call wall = strike with max call OI
+Put wall = strike with max put OI
+Gamma flip = interpolated zero-crossing of cumulative GEX (nearest to spot)
+```
+
+### Infrastructure
+- **Cloud Run Job**: `orats-daily-ingest` (image: `paper-trading:v46a`, CMD: `python -m sources.orats_ingest`, 2Gi memory, 30m timeout)
+- **Cloud Scheduler**: `orats-daily-ingest-trigger` — 10 PM PT Mon-Fri
+- **Cloud SQL**: Added `--add-cloudsql-instances` to job for DB socket access
+- **Secrets**: All 3 (`DATABASE_URL`, `ORATS_FTP_USER`, `ORATS_FTP_PASSWORD`) resolved via Secret Manager at runtime
+- **Service account**: `660675366661-compute@developer.gserviceaccount.com` — has `secretmanager.secretAccessor`
+
+### Bug Fix (v46 → v46a)
+- **`_find_gamma_flip()` returning bogus values** — Was returning first zero crossing (at deep OTM strikes with minimal OI, e.g., TSLA gamma_flip = $6.32 with spot at $394). Fixed to:
+  1. Filter strikes to 20%-300% of spot price
+  2. Collect ALL zero crossings
+  3. Return crossing nearest to spot
+- After fix: AAPL flip=$268 (spot $276), TSLA/NVDA/SPY correctly return `null` when GEX is uniformly negative
+
+### Historical Backfill Results
+- **528 files** processed (Jan 2, 2024 → Feb 5, 2026), **0 errors**
+- **2,847,480 GEX rows** across **526 trading days**, **6,751 unique symbols**
+- Runtime: 84 minutes (~9s/file)
+
+### First Scheduled Run Verified (Feb 6 → Feb 7 1AM ET)
+- Scheduler triggered at 10 PM PT Feb 6 (6:00 AM UTC Feb 7)
+- Completed in 7m 42s, exit(0)
+- **orats_daily**: 5,831 rows for Feb 6 (matches V1)
+- **gex_metrics_snapshot**: 5,573 rows for Feb 6
+
+### GEX Data Quality (Feb 6)
+| Symbol | Spot | Net GEX | Gamma Flip | Call Wall | Put Wall |
+|--------|------|---------|------------|-----------|----------|
+| AAPL | $278.20 | +$1.74B | $268.75 | $280 | $250 |
+| NVDA | $186.26 | +$1.06B | $184.92 | $200 | $140 |
+| SPY | $690.87 | +$2.99B | $711.57 | $700 | $600 |
+| TSLA | $414.29 | +$529M | $432.18 | $960 | $300 |
+| META | $660.17 | +$83M | $946.31 | $700 | $600 |
+
+### Deployed
+- Image: `paper-trading:v46a` (`sha256:ef7d7ca7...`)
+- `paper-trading-live` service: revision `paper-trading-live-00067-2vq`
+- `orats-daily-ingest` job: generation 3
+
+### Backfill Complete
+- **Historical GEX backfill executed** on 2026-02-07 via `scripts/backfill_gex.py --dir "D:\ORATS_TMP_Files"`
+- 528 ORATS ZIP files (Jan 2, 2024 → Feb 5, 2026) processed locally through Cloud SQL Auth Proxy
+- 2,847,480 rows written to `gex_metrics_snapshot` (526 trading days, 6,751 symbols)
+- Zero errors, 84 minutes runtime, idempotent via UPSERT (safe to re-run)
+
+### Pending
+- After 3-5 days of V2 running cleanly, disable V1's `orats-daily-ingest` scheduler in `spartan-buckeye-474319-q8`
+- Shadow GEX metadata will appear in `signal_evaluations.metadata` on next market-hours signal
+
+---
+
+## [2026-02-06] - Crash-Resilient Trade Persistence (v45)
+
+### Critical Fixes
+- **`paper_trades_log` never written to** (`paper_trading/dashboard.py`, `paper_trading/position_manager.py`): Trade state was in-memory only. Added `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()` functions. Wired into `open_position()` and `close_position()`.
+- **Cross-day WHERE bug** (`paper_trading/dashboard.py`): `update_signal_trade_placed()` and `close_signal_in_db()` used `DATE(detected_at) = CURRENT_DATE`, preventing exits for positions opened on prior days. Fixed with subquery matching by symbol + action status.
+- **Startup 3-way reconciliation** (`paper_trading/position_manager.py:sync_on_startup()`): Rewrote to reconcile DB (`paper_trades_log`) with Alpaca positions — Case A (both = restore metadata), Case B (DB-only = crash_recovery), Case C (Alpaca-only = create record).
+
+### Changes
+- `paper_trading/dashboard.py`:
+  - Fixed `update_signal_trade_placed()` WHERE clause (removed `DATE(detected_at) = CURRENT_DATE`)
+  - Fixed `close_signal_in_db()` WHERE clause (same)
+  - Added `log_trade_open()` — INSERT with `RETURNING id`
+  - Added `log_trade_close()` — UPDATE by `trade_db_id` (fallback by symbol)
+  - Added `load_open_trades_from_db()` — SELECT open trades for startup recovery
+- `paper_trading/position_manager.py`:
+  - Added `trade_db_id: Optional[int]` to `TradeRecord` dataclass
+  - Wired `log_trade_open()` in `open_position()`
+  - Wired `log_trade_close()` in `close_position()`
+  - Rewrote `sync_on_startup()` with 3-way DB+Alpaca reconciliation
+
+### DDL
+- `CREATE INDEX idx_paper_trades_log_open ON paper_trades_log (symbol) WHERE exit_time IS NULL`
+- Cleaned 5 orphaned `active_signals` stuck in HOLDING from Feb 5
+
+### Deployed
+- Image: `paper-trading:v45` → `paper-trading-live` service
+- Revision: `paper-trading-live-00065-9gb`
+
+---
+
 ## [2026-02-06] - Pipeline Coverage Fix: SIP Feed, BucketAggregator, Symbol Tracking (v44)
 
 ### Critical Fixes
@@ -345,12 +524,18 @@ The signal filter applies these **8 active** checks in `apply()`:
 
 ---
 
-## Database Tables (as of v43)
+## Database Tables (as of v46a)
 
 ### Written by Live Trading
 - `active_signals` - Signals that passed all filters
-- `paper_trades_log` - Executed trades
+- `paper_trades_log` - Executed trades (open/close with DB IDs)
 - `tracked_tickers_v2` - Symbols added for intraday TA updates
+- `signal_evaluations` - All signal evaluations with pass/fail + `metadata` JSONB (shadow GEX)
+- `intraday_baselines_30m` - Live bucket aggregation from firehose
+
+### Written by ORATS Ingest (nightly)
+- `orats_daily` - Symbol-level options activity (~5,831 rows/day)
+- `gex_metrics_snapshot` - Per-symbol GEX/DEX/walls/gamma flip (~5,570 rows/day, 2.85M total)
 
 ### Read by Live Trading
 - `ta_daily_close` - Prior-day TA (before 9:35 AM)
@@ -359,3 +544,4 @@ The signal filter applies these **8 active** checks in `apply()`:
 - `master_tickers` - Sector lookup (used in signal creation, not filtering)
 - `earnings_calendar` - Earnings proximity filter
 - `intraday_baselines_30m` - Per-symbol notional baselines
+- `gex_metrics_snapshot` - Shadow GEX lookup for signal metadata

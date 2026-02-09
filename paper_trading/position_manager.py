@@ -12,7 +12,10 @@ from typing import Optional, List, Dict
 
 from .config import TradingConfig, DEFAULT_CONFIG
 from .alpaca_trader import AlpacaTrader, Position, Order
-from .dashboard import get_dashboard, update_signal_trade_placed, close_signal_in_db
+from .dashboard import (
+    get_dashboard, update_signal_trade_placed, close_signal_in_db,
+    log_trade_open, log_trade_close, load_open_trades_from_db,
+)
 import os
 
 logger = logging.getLogger(__name__)
@@ -28,6 +31,7 @@ class TradeRecord:
     signal_score: int
     signal_rsi: float
     signal_notional: float
+    trade_db_id: Optional[int] = None  # paper_trades_log.id for targeted updates
     exit_time: Optional[datetime] = None
     exit_price: Optional[float] = None
     pnl: Optional[float] = None
@@ -146,21 +150,71 @@ class PositionManager:
 
     async def sync_on_startup(self):
         """
-        Sync positions at startup.
+        Sync positions at startup via 3-way reconciliation (DB + Alpaca).
 
-        This ensures we don't open duplicate positions if the system restarts
-        with existing Alpaca positions.
+        Cases:
+        - DB + Alpaca: Restore TradeRecord with signal metadata from DB, live data from Alpaca
+        - DB only (no Alpaca position): Position was closed externally / crash recovery — mark closed in DB
+        - Alpaca only (no DB record): External trade — create DB record with zeroed signal metadata
         """
-        logger.info("Syncing positions with Alpaca at startup...")
+        logger.info("Syncing positions at startup (3-way reconciliation)...")
+
+        # 1. Load open trades from paper_trades_log
+        db_url = os.environ.get("DATABASE_URL")
+        db_trades = {}
+        if db_url:
+            raw = load_open_trades_from_db(db_url)
+            for t in raw:
+                db_trades[t["symbol"]] = t
+            logger.info(f"Loaded {len(db_trades)} open trades from paper_trades_log")
+
+        # 2. Get current Alpaca positions
         positions = await self.trader.get_positions()
+        alpaca_map = {pos.symbol: pos for pos in positions}
+        logger.info(f"Found {len(alpaca_map)} Alpaca positions")
 
-        for pos in positions:
-            # Mark as already traded to prevent re-entry
-            self.traded_today.add(pos.symbol)
+        # Case A: DB + Alpaca — restore with full metadata
+        for symbol in set(db_trades) & set(alpaca_map):
+            db = db_trades[symbol]
+            pos = alpaca_map[symbol]
+            self.traded_today.add(symbol)
+            self.active_trades[symbol] = TradeRecord(
+                symbol=symbol,
+                entry_time=db["entry_time"] or datetime.now(),
+                entry_price=pos.avg_entry_price,
+                shares=int(pos.qty),
+                signal_score=db["signal_score"],
+                signal_rsi=db["signal_rsi"],
+                signal_notional=db["signal_notional"],
+                trade_db_id=db["db_id"],
+            )
+            logger.info(f"Restored from DB+Alpaca: {symbol} "
+                       f"({pos.qty} shares @ ${pos.avg_entry_price:.2f}, "
+                       f"score={db['signal_score']})")
 
-            # Add to active trades
-            self.active_trades[pos.symbol] = TradeRecord(
-                symbol=pos.symbol,
+        # Case B: DB only — position closed externally or during crash
+        for symbol in set(db_trades) - set(alpaca_map):
+            db = db_trades[symbol]
+            self.traded_today.add(symbol)
+            if db_url:
+                log_trade_close(
+                    db_url=db_url,
+                    trade_db_id=db["db_id"],
+                    symbol=symbol,
+                    exit_time=datetime.now(),
+                    exit_price=db["entry_price"],
+                    pnl=0.0,
+                    pnl_pct=0.0,
+                    exit_reason="crash_recovery",
+                )
+            logger.warning(f"DB-only (no Alpaca position): {symbol} — marked closed as crash_recovery")
+
+        # Case C: Alpaca only — external trade, no DB record
+        for symbol in set(alpaca_map) - set(db_trades):
+            pos = alpaca_map[symbol]
+            self.traded_today.add(symbol)
+            trade = TradeRecord(
+                symbol=symbol,
                 entry_time=datetime.now(),
                 entry_price=pos.avg_entry_price,
                 shares=int(pos.qty),
@@ -168,10 +222,22 @@ class PositionManager:
                 signal_rsi=0,
                 signal_notional=0,
             )
-            logger.info(f"Synced existing position: {pos.symbol} "
-                       f"({pos.qty} shares @ ${pos.avg_entry_price:.2f})")
+            if db_url:
+                trade.trade_db_id = log_trade_open(
+                    db_url=db_url,
+                    symbol=symbol,
+                    entry_time=trade.entry_time,
+                    entry_price=trade.entry_price,
+                    shares=trade.shares,
+                    signal_score=0,
+                    signal_rsi=0,
+                    signal_notional=0,
+                )
+            self.active_trades[symbol] = trade
+            logger.warning(f"Alpaca-only (no DB record): {symbol} "
+                          f"({pos.qty} shares @ ${pos.avg_entry_price:.2f}) — created DB record")
 
-        logger.info(f"Startup sync complete: {len(positions)} positions, "
+        logger.info(f"Startup sync complete: {len(self.active_trades)} positions, "
                    f"can_open={self.can_open_position} "
                    f"(max {self.config.MAX_CONCURRENT_POSITIONS})")
 
@@ -303,9 +369,19 @@ class PositionManager:
             if dashboard.enabled:
                 dashboard.update_position(symbol, trade.entry_price, trade.entry_price, "HOLDING")
 
-            # Update active_signals in DB
+            # Persist trade to DB
             db_url = os.environ.get("DATABASE_URL")
             if db_url:
+                trade.trade_db_id = log_trade_open(
+                    db_url=db_url,
+                    symbol=trade.symbol,
+                    entry_time=trade.entry_time,
+                    entry_price=trade.entry_price,
+                    shares=trade.shares,
+                    signal_score=trade.signal_score,
+                    signal_rsi=trade.signal_rsi,
+                    signal_notional=trade.signal_notional,
+                )
                 update_signal_trade_placed(db_url, symbol, trade.entry_price)
 
             return trade
@@ -383,9 +459,19 @@ class PositionManager:
         if dashboard.enabled:
             dashboard.close_position(symbol, trade.entry_price, exit_price, trade.exit_time)
 
-        # Update active_signals in DB
+        # Persist trade close to DB
         db_url = os.environ.get("DATABASE_URL")
         if db_url:
+            log_trade_close(
+                db_url=db_url,
+                trade_db_id=trade.trade_db_id,
+                symbol=trade.symbol,
+                exit_time=trade.exit_time,
+                exit_price=trade.exit_price,
+                pnl=trade.pnl,
+                pnl_pct=trade.pnl_pct,
+                exit_reason=trade.exit_reason,
+            )
             close_signal_in_db(db_url, symbol, exit_price, trade.pnl_pct)
 
         return trade

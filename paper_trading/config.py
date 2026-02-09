@@ -4,9 +4,9 @@ Paper Trading Configuration
 Entry Rules:
 - Uptrend (price > 20d SMA at signal time)
 - Score >= 10
-- Prior-day RSI < 50
+- Prior-day RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
 - $50K+ notional
-- Max 3 concurrent positions
+- Max 10 concurrent positions
 
 Exit Rules:
 - Hold to market close (3:55 PM ET)
@@ -36,6 +36,11 @@ class TradingConfig:
     USE_EARNINGS_FILTER: bool = True
     EARNINGS_PROXIMITY_DAYS: int = 2  # Reject if earnings within +/- this many days
 
+    # Adaptive RSI — bounce-day relaxation (V29)
+    USE_ADAPTIVE_RSI: bool = True
+    ADAPTIVE_RSI_THRESHOLD: float = 60.0  # RSI threshold on bounce days (normal = RSI_THRESHOLD)
+    ADAPTIVE_RSI_MIN_RED_DAYS: int = 2    # Minimum consecutive red SPY closes for bounce day
+
     # Market regime filter (V28)
     USE_MARKET_REGIME_FILTER: bool = True
     MARKET_REGIME_SYMBOL: str = "SPY"  # Benchmark to check
@@ -50,7 +55,7 @@ class TradingConfig:
     WEBSOCKET_MAX_RECONNECT_ATTEMPTS: int = 3  # Max reconnect attempts before fallback
 
     # Position limits
-    MAX_CONCURRENT_POSITIONS: int = 5
+    MAX_CONCURRENT_POSITIONS: int = 10
     MAX_POSITION_SIZE_PCT: float = 0.10  # 10% of portfolio per trade
 
     # Exit rules

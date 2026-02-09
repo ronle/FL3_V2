@@ -343,8 +343,12 @@ def update_signal_trade_placed(db_url: str, symbol: str, entry_price: float):
         cur.execute("""
             UPDATE active_signals
             SET trade_placed = TRUE, entry_price = %s, action = 'HOLDING'
-            WHERE symbol = %s AND DATE(detected_at) = CURRENT_DATE
-            AND trade_placed = FALSE
+            WHERE id = (
+                SELECT id FROM active_signals
+                WHERE symbol = %s AND trade_placed = FALSE AND action = 'BUY'
+                ORDER BY detected_at DESC
+                LIMIT 1
+            )
         """, (entry_price, symbol))
 
         conn.commit()
@@ -367,8 +371,12 @@ def close_signal_in_db(db_url: str, symbol: str, exit_price: float, pnl_pct: flo
         cur.execute("""
             UPDATE active_signals
             SET exit_price = %s, exit_time = NOW(), pnl_pct = %s, action = 'CLOSED'
-            WHERE symbol = %s AND DATE(detected_at) = CURRENT_DATE
-            AND action = 'HOLDING'
+            WHERE id = (
+                SELECT id FROM active_signals
+                WHERE symbol = %s AND action = 'HOLDING'
+                ORDER BY detected_at DESC
+                LIMIT 1
+            )
         """, (exit_price, pnl_pct, symbol))
 
         conn.commit()
@@ -376,3 +384,141 @@ def close_signal_in_db(db_url: str, symbol: str, exit_price: float, pnl_pct: flo
         conn.close()
     except Exception as e:
         logger.warning(f"Failed to close signal in DB: {e}")
+
+
+def log_trade_open(
+    db_url: str,
+    symbol: str,
+    entry_time,
+    entry_price: float,
+    shares: int,
+    signal_score: int,
+    signal_rsi: float,
+    signal_notional: float,
+):
+    """
+    Log a new trade to paper_trades_log when a position is opened.
+
+    Returns the row id on success, None on failure.
+    """
+    if not db_url:
+        return None
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url.strip())
+        cur = conn.cursor()
+
+        cur.execute("""
+            INSERT INTO paper_trades_log
+            (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            RETURNING id
+        """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional))
+
+        row = cur.fetchone()
+        trade_id = row[0] if row else None
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"Logged trade open to paper_trades_log: {symbol} (id={trade_id})")
+        return trade_id
+    except Exception as e:
+        logger.warning(f"Failed to log trade open to DB: {e}")
+        return None
+
+
+def log_trade_close(
+    db_url: str,
+    trade_db_id,
+    symbol: str,
+    exit_time,
+    exit_price: float,
+    pnl: float,
+    pnl_pct: float,
+    exit_reason: str,
+):
+    """
+    Update paper_trades_log when a position is closed.
+
+    Uses trade_db_id (primary key) for precise targeting.
+    Falls back to symbol + exit_time IS NULL if id is not available.
+    """
+    if not db_url:
+        return
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url.strip())
+        cur = conn.cursor()
+
+        if trade_db_id:
+            cur.execute("""
+                UPDATE paper_trades_log
+                SET exit_time = %s, exit_price = %s, pnl = %s, pnl_pct = %s, exit_reason = %s
+                WHERE id = %s
+            """, (exit_time, exit_price, pnl, pnl_pct, exit_reason, trade_db_id))
+        else:
+            cur.execute("""
+                UPDATE paper_trades_log
+                SET exit_time = %s, exit_price = %s, pnl = %s, pnl_pct = %s, exit_reason = %s
+                WHERE id = (
+                    SELECT id FROM paper_trades_log
+                    WHERE symbol = %s AND exit_time IS NULL
+                    ORDER BY entry_time DESC
+                    LIMIT 1
+                )
+            """, (exit_time, exit_price, pnl, pnl_pct, exit_reason, symbol))
+
+        conn.commit()
+        cur.close()
+        conn.close()
+        logger.info(f"Logged trade close to paper_trades_log: {symbol} (id={trade_db_id})")
+    except Exception as e:
+        logger.warning(f"Failed to log trade close to DB: {e}")
+
+
+def load_open_trades_from_db(db_url: str) -> list:
+    """
+    Load open trades from paper_trades_log for startup recovery.
+
+    Returns list of dicts with trade data where exit_time IS NULL.
+    Only looks at trades from the last 7 days to avoid stale data.
+    """
+    if not db_url:
+        return []
+
+    try:
+        import psycopg2
+        conn = psycopg2.connect(db_url.strip())
+        cur = conn.cursor()
+
+        cur.execute("""
+            SELECT id, symbol, entry_time, entry_price, shares,
+                   signal_score, signal_rsi, signal_notional
+            FROM paper_trades_log
+            WHERE exit_time IS NULL
+            AND created_at > CURRENT_DATE - 7
+            ORDER BY entry_time DESC
+        """)
+
+        trades = []
+        for row in cur.fetchall():
+            trades.append({
+                "db_id": row[0],
+                "symbol": row[1],
+                "entry_time": row[2],
+                "entry_price": float(row[3]) if row[3] else 0,
+                "shares": row[4] or 0,
+                "signal_score": row[5] or 0,
+                "signal_rsi": float(row[6]) if row[6] else 0,
+                "signal_notional": float(row[7]) if row[7] else 0,
+            })
+
+        cur.close()
+        conn.close()
+        logger.info(f"Loaded {len(trades)} open trades from paper_trades_log")
+        return trades
+    except Exception as e:
+        logger.warning(f"Failed to load open trades from DB: {e}")
+        return []

@@ -287,7 +287,7 @@ SignalGenerator.create_signal_async()
 SignalFilter.apply() — 10 filter steps:
     1. ETF exclusion (hardcoded list)
     2. Score threshold (>= 10)
-    3. RSI < 50 (from TA cache)
+    3. RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
     4. Uptrend SMA20 (from TA cache)
     5. SMA50 momentum (from TA cache)
     6. Notional >= per-symbol baseline (intraday_baselines_30m DB)
@@ -313,11 +313,25 @@ If PASSED → Submit buy order via Alpaca API → Write to paper_trades_log, act
 
 ### Database Tables Written by Live Trading
 
-| Table | Purpose |
-|-------|---------|
-| `active_signals` | Signals that passed all filters |
-| `paper_trades_log` | Executed trades |
-| `tracked_tickers_v2` | Symbols added for intraday TA updates |
+| Table | Purpose | Write Points |
+|-------|---------|--------------|
+| `active_signals` | Signals that passed all filters | INSERT on signal pass, UPDATE on trade placed + close |
+| `paper_trades_log` | Executed trades with full lifecycle | INSERT on entry (`log_trade_open`), UPDATE on exit (`log_trade_close`) |
+| `tracked_tickers_v2` | Symbols added for intraday TA updates | UPSERT on every UOA trigger |
+
+### Crash-Resilient Trade Persistence (v45+)
+
+On startup, `PositionManager.sync_on_startup()` performs 3-way reconciliation:
+
+| Case | Condition | Action |
+|------|-----------|--------|
+| A: DB + Alpaca | Trade in `paper_trades_log` AND Alpaca position exists | Restore TradeRecord with signal metadata from DB, live price from Alpaca |
+| B: DB only | Trade in DB but no Alpaca position | Mark closed as `crash_recovery` in DB |
+| C: Alpaca only | Alpaca position but no DB record | Create new DB record (signal metadata zeroed) |
+
+**Key files:**
+- `paper_trading/dashboard.py` — `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()`
+- `paper_trading/position_manager.py` — `sync_on_startup()`, wired DB writes in `open_position()` and `close_position()`
 
 ### What's NOT in the Live Path (Yet)
 

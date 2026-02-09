@@ -72,7 +72,7 @@ prd*.json
 # ROOT-LEVEL SCRIPTS (dev/analysis - not needed in production)
 # These are ad-hoc scripts that shouldn't be in the container.
 # Production code lives in: adapters/, analysis/, firehose/, paper_trading/,
-#                          phase_detectors/, scripts/, tracking/, uoa/, utils/
+#                          phase_detectors/, scripts/, sources/, tracking/, uoa/, utils/
 # =============================================================================
 
 # Analysis scripts (root-level only — leading / prevents matching in subdirs)

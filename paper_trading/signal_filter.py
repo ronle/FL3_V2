@@ -4,7 +4,7 @@ Signal Filter
 Applies entry rules to determine if a signal should trigger a trade:
 - Score >= 10
 - Uptrend (price > 20d SMA)
-- Prior-day RSI < 50
+- Prior-day RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
 - $50K+ notional
 """
 
@@ -166,6 +166,9 @@ class Signal:
     score_strikes: Optional[int] = None
     score_notional: Optional[int] = None
 
+    # Shadow metadata (GEX etc.) — not used in filtering
+    metadata: Optional[Dict] = None
+
 
 @dataclass
 class FilterResult:
@@ -219,6 +222,14 @@ class SignalFilter:
         # Sentiment cache to avoid repeated DB lookups
         self._sentiment_cache: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
 
+        # Adaptive RSI state (V29)
+        self._bounce_eligible = False
+        self._bounce_checked = False
+        self._is_bounce_day = False
+        self._red_streak = 0
+        self._spy_prior_close = None
+        self._effective_rsi_threshold = config.RSI_THRESHOLD  # default 50.0
+
         # Pre-load caches at startup
         self._preload_caches()
 
@@ -232,6 +243,10 @@ class SignalFilter:
 
         # Load earnings cache for all symbols with earnings in window
         self._load_earnings_cache()
+
+        # Check bounce-day eligibility (V29)
+        if self.config.USE_ADAPTIVE_RSI:
+            self._check_bounce_day_eligible()
 
     def _load_earnings_cache(self):
         """Load all earnings data within the proximity window at startup."""
@@ -280,6 +295,144 @@ class SignalFilter:
         except Exception as e:
             logger.warning(f"Failed to load earnings cache: {e}")
 
+    # ------------------------------------------------------------------
+    # Adaptive RSI — bounce-day detection (V29)
+    # ------------------------------------------------------------------
+
+    def _check_bounce_day_eligible(self):
+        """
+        Check if today is eligible for bounce-day RSI relaxation.
+
+        Queries SPY's last 5 daily closes from ta_daily_close.
+        Sets self._bounce_eligible if 2+ consecutive red closes detected.
+        Actual confirmation happens via _auto_confirm_bounce_day() when
+        we see SPY's opening price after market open.
+        """
+        if not self.database_url or not self.config.USE_ADAPTIVE_RSI:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT trade_date, close_price
+                FROM ta_daily_close
+                WHERE symbol = 'SPY'
+                ORDER BY trade_date DESC
+                LIMIT 5
+            """)
+
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+
+            if len(rows) < 3:
+                self._bounce_eligible = False
+                return
+
+            # rows are newest-first, reverse for chronological order
+            closes = [float(row[1]) for row in reversed(rows)]
+
+            # Store SPY prior close for confirmation step
+            self._spy_prior_close = closes[-1]
+
+            # Count consecutive red closes from most recent backwards
+            red_streak = 0
+            for i in range(len(closes) - 1, 0, -1):
+                if closes[i] < closes[i - 1]:
+                    red_streak += 1
+                else:
+                    break
+
+            self._bounce_eligible = red_streak >= self.config.ADAPTIVE_RSI_MIN_RED_DAYS
+            self._red_streak = red_streak
+
+            if self._bounce_eligible:
+                logger.info(
+                    f"BOUNCE DAY ELIGIBLE: SPY had {red_streak} consecutive red closes. "
+                    f"Waiting for green open to confirm. Prior close: {self._spy_prior_close:.2f}"
+                )
+            else:
+                logger.info(
+                    f"Normal day: SPY red streak = {red_streak} "
+                    f"(need >= {self.config.ADAPTIVE_RSI_MIN_RED_DAYS})"
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to check bounce day: {e}")
+            self._bounce_eligible = False
+
+    def _auto_confirm_bounce_day(self):
+        """
+        Auto-confirm bounce day by fetching SPY's current price from Alpaca.
+
+        Called once from apply() on first signal after 9:31 AM ET when
+        bounce_eligible is True. Sets _effective_rsi_threshold for the day.
+        """
+        if self._bounce_checked:
+            return
+        self._bounce_checked = True
+
+        if not self._bounce_eligible or self._spy_prior_close is None:
+            return
+
+        try:
+            import requests
+            api_key = os.environ.get("ALPACA_API_KEY")
+            secret_key = os.environ.get("ALPACA_SECRET_KEY")
+
+            if not api_key or not secret_key:
+                logger.warning("No Alpaca keys, cannot confirm bounce day")
+                return
+
+            resp = requests.get(
+                "https://data.alpaca.markets/v2/stocks/SPY/snapshot",
+                headers={
+                    "APCA-API-KEY-ID": api_key,
+                    "APCA-API-SECRET-KEY": secret_key,
+                },
+                timeout=3,
+            )
+
+            if resp.status_code != 200:
+                logger.warning(f"SPY snapshot failed ({resp.status_code}), bounce day not confirmed")
+                return
+
+            data = resp.json()
+            # Use daily bar open (today's open) or latest trade
+            daily_bar = data.get("dailyBar", {})
+            spy_open = float(daily_bar.get("o", 0)) if daily_bar.get("o") else None
+
+            if not spy_open:
+                latest = data.get("latestTrade", {})
+                spy_open = float(latest.get("p", 0)) if latest.get("p") else None
+
+            if not spy_open:
+                logger.warning("Could not get SPY open price, bounce day not confirmed")
+                return
+
+            if spy_open > self._spy_prior_close:
+                self._is_bounce_day = True
+                self._effective_rsi_threshold = self.config.ADAPTIVE_RSI_THRESHOLD
+                logger.info(
+                    f"BOUNCE DAY CONFIRMED: SPY opened {spy_open:.2f} vs prior close "
+                    f"{self._spy_prior_close:.2f}. RSI threshold relaxed to "
+                    f"{self._effective_rsi_threshold}"
+                )
+            else:
+                self._is_bounce_day = False
+                self._effective_rsi_threshold = self.config.RSI_THRESHOLD
+                logger.info(
+                    f"Bounce day NOT confirmed: SPY opened {spy_open:.2f} <= prior close "
+                    f"{self._spy_prior_close:.2f}. RSI threshold stays at "
+                    f"{self._effective_rsi_threshold}"
+                )
+
+        except Exception as e:
+            logger.warning(f"Failed to confirm bounce day: {e}")
+
     def _log_evaluation_sync(self, signal: Signal, passed: bool, rejection_reason: str):
         """Log signal evaluation to database for analysis."""
         if not self.database_url:
@@ -290,15 +443,19 @@ class SignalFilter:
             conn = psycopg2.connect(self.database_url)
             cur = conn.cursor()
 
+            import json as _json
+            metadata_json = _json.dumps(signal.metadata) if signal.metadata else None
+
             cur.execute("""
                 INSERT INTO signal_evaluations (
                     symbol, detected_at, notional, ratio, call_pct, sweep_pct,
                     num_strikes, contracts, rsi_14, macd_histogram, trend,
                     score_volume, score_call_pct, score_sweep, score_strikes,
-                    score_notional, score_total, passed_all_filters, rejection_reason
+                    score_notional, score_total, passed_all_filters, rejection_reason,
+                    metadata
                 ) VALUES (
                     %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    %s, %s, %s, %s, %s, %s, %s, %s
+                    %s, %s, %s, %s, %s, %s, %s, %s, %s
                 )
             """, (
                 signal.symbol,
@@ -320,6 +477,7 @@ class SignalFilter:
                 signal.score,
                 passed,
                 rejection_reason[:200] if rejection_reason else None,
+                metadata_json,
             ))
 
             conn.commit()
@@ -562,14 +720,22 @@ class SignalFilter:
                 reasons.append("not uptrend")
                 self.filter_reasons["trend"] += 1
 
-        # Check RSI
+        # Auto-confirm bounce day on first signal after market open (V29)
+        if (self.config.USE_ADAPTIVE_RSI
+                and self._bounce_eligible
+                and not self._bounce_checked):
+            et = pytz.timezone("America/New_York")
+            now_et = datetime.now(et)
+            if now_et.time() >= dt_time(9, 31):
+                self._auto_confirm_bounce_day()
+
+        # Check RSI — use effective threshold (50 normal, 60 bounce day)
+        rsi_threshold = self._effective_rsi_threshold
         if signal.rsi_14_prior is not None:
-            if signal.rsi_14_prior >= self.config.RSI_THRESHOLD:
-                reasons.append(f"RSI {signal.rsi_14_prior:.1f} >= {self.config.RSI_THRESHOLD}")
+            if signal.rsi_14_prior >= rsi_threshold:
+                reasons.append(f"RSI {signal.rsi_14_prior:.1f} >= {rsi_threshold}")
                 self.filter_reasons["rsi"] += 1
         else:
-            # No RSI data - skip this filter or fail?
-            # For safety, fail if no RSI
             reasons.append("no RSI data")
             self.filter_reasons["rsi"] += 1
 
@@ -604,15 +770,26 @@ class SignalFilter:
         passed = len(reasons) == 0
         rejection_reason = "; ".join(reasons) if reasons else None
 
+        # Tag signal metadata with bounce-day context (V29)
+        if self.config.USE_ADAPTIVE_RSI:
+            if signal.metadata is None:
+                signal.metadata = {}
+            signal.metadata["bounce_day"] = self._is_bounce_day
+            signal.metadata["rsi_threshold_used"] = self._effective_rsi_threshold
+
         # Log to database (every evaluation)
         self._log_evaluation(signal, passed, rejection_reason)
 
         if passed:
             self.passed_signals += 1
+            bounce_tag = ""
+            if (self._is_bounce_day and signal.rsi_14_prior is not None
+                    and signal.rsi_14_prior >= self.config.RSI_THRESHOLD):
+                bounce_tag = " [BOUNCE DAY: RSI<60]"
             logger.info(
                 f"Signal PASSED: {signal.symbol} "
                 f"score={signal.score} RSI={signal.rsi_14_prior:.1f} "
-                f"notional=${signal.notional:,.0f}"
+                f"notional=${signal.notional:,.0f}{bounce_tag}"
             )
 
             # Log to active_signals table
@@ -682,6 +859,18 @@ class SignalFilter:
         self._sentiment_cache.clear()  # Clear sentiment cache for new day
         self._earnings_cache.clear()  # Clear earnings cache for new day
 
+        # Reset bounce-day state for new day (V29)
+        self._bounce_eligible = False
+        self._bounce_checked = False
+        self._is_bounce_day = False
+        self._red_streak = 0
+        self._spy_prior_close = None
+        self._effective_rsi_threshold = self.config.RSI_THRESHOLD
+
+        # Re-check bounce eligibility for the new day
+        if self.config.USE_ADAPTIVE_RSI:
+            self._check_bounce_day_eligible()
+
 
 class SignalGenerator:
     """
@@ -716,6 +905,10 @@ class SignalGenerator:
         self._intraday_ta_cache: Dict[str, Dict] = {}
         self._intraday_cache_ts: Optional[datetime] = None
         self._intraday_cache_max_age_sec = 300  # Refresh every 5 minutes
+
+        # GEX cache (loaded once, refreshed daily — data changes nightly via ORATS ingest)
+        self._gex_cache: Dict[str, Dict] = {}
+        self._gex_cache_loaded = False
 
         # Timezone for market hours check
         self._et = pytz.timezone("America/New_York")
@@ -1081,13 +1274,67 @@ class SignalGenerator:
                 # Final fallback to TA cache's last_close
                 effective_price = ta.get("last_close", 0)
 
-        return self.create_signal(
+        signal = self.create_signal(
             symbol, score, notional, contracts, effective_price, trend,
             ratio=ratio, call_pct=call_pct, sweep_pct=sweep_pct,
             num_strikes=num_strikes, score_volume=score_volume,
             score_call_pct=score_call_pct, score_sweep=score_sweep,
             score_strikes=score_strikes, score_notional=score_notional,
         )
+
+        # Shadow: attach GEX metadata if available (not used in filtering)
+        if signal and self.database_url:
+            try:
+                gex = self._lookup_gex(signal.symbol)
+                if gex:
+                    signal.metadata = gex
+            except Exception as e:
+                logger.debug(f"GEX lookup failed for {signal.symbol}: {e}")
+
+        return signal
+
+    def _load_gex_cache(self):
+        """Bulk load latest GEX metrics for all symbols into cache.
+
+        Uses DISTINCT ON to get one row per symbol (latest snapshot_ts).
+        Called lazily on first GEX lookup. Data only changes nightly via ORATS ingest.
+        """
+        if self._gex_cache_loaded or not self.database_url:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT ON (symbol)
+                    symbol, net_gex, net_dex, call_wall_strike, put_wall_strike,
+                    gamma_flip_level, spot_price, contracts_analyzed
+                FROM gex_metrics_snapshot
+                ORDER BY symbol, snapshot_ts DESC
+            """)
+            for row in cur.fetchall():
+                self._gex_cache[row[0]] = {
+                    "net_gex": float(row[1]) if row[1] else None,
+                    "net_dex": float(row[2]) if row[2] else None,
+                    "call_wall": float(row[3]) if row[3] else None,
+                    "put_wall": float(row[4]) if row[4] else None,
+                    "gamma_flip": float(row[5]) if row[5] else None,
+                    "gex_spot": float(row[6]) if row[6] else None,
+                    "contracts_analyzed": int(row[7]) if row[7] else None,
+                }
+            cur.close()
+            conn.close()
+            self._gex_cache_loaded = True
+            logger.info(f"Loaded GEX cache: {len(self._gex_cache)} symbols")
+        except Exception as e:
+            logger.warning(f"Failed to load GEX cache: {e}")
+
+    def _lookup_gex(self, symbol: str) -> Optional[Dict]:
+        """Lookup latest GEX metrics for a symbol from cache."""
+        if not self._gex_cache_loaded:
+            self._load_gex_cache()
+        return self._gex_cache.get(symbol)
 
     def create_signal(
         self,

@@ -876,13 +876,14 @@ class PipelineHealthCheck:
         try:
             cur = conn.cursor()
             # Only check tracked symbols (not all 15K V1 rows)
+            # NOTE: spot_prices uses 'ticker' and 'inserted_at' columns (NOT 'symbol'/'updated_at')
             cur.execute("""
                 SELECT
-                    COUNT(*) as total,
-                    COUNT(*) FILTER (WHERE s.updated_at > NOW() - INTERVAL '5 minutes') as fresh,
-                    COUNT(*) FILTER (WHERE s.updated_at IS NULL) as missing
+                    COUNT(DISTINCT t.symbol) as total,
+                    COUNT(DISTINCT t.symbol) FILTER (WHERE sp.inserted_at > NOW() - INTERVAL '5 minutes') as fresh,
+                    COUNT(DISTINCT t.symbol) FILTER (WHERE sp.ticker IS NULL) as missing
                 FROM tracked_tickers_v2 t
-                LEFT JOIN spot_prices s ON t.symbol = s.symbol
+                LEFT JOIN spot_prices sp ON t.symbol = sp.ticker
                 WHERE t.ta_enabled = TRUE
             """)
             total, fresh, missing = cur.fetchone()
@@ -1181,6 +1182,45 @@ class PipelineHealthCheck:
                 name="ORATS daily (V1 dep)",
                 status=TestStatus.FAIL,
                 message=f"Query error: {e}"
+            )
+
+    def check_adaptive_rsi_config(self) -> TestResult:
+        """TEST-2.12: Verify adaptive RSI configuration is valid (V29)."""
+        try:
+            from paper_trading.config import TradingConfig
+            config = TradingConfig()
+
+            issues = []
+            if not config.USE_ADAPTIVE_RSI:
+                issues.append("USE_ADAPTIVE_RSI is disabled")
+            if config.ADAPTIVE_RSI_THRESHOLD <= config.RSI_THRESHOLD:
+                issues.append(f"ADAPTIVE_RSI_THRESHOLD ({config.ADAPTIVE_RSI_THRESHOLD}) must be > RSI_THRESHOLD ({config.RSI_THRESHOLD})")
+            if config.ADAPTIVE_RSI_THRESHOLD > 70.0:
+                issues.append(f"ADAPTIVE_RSI_THRESHOLD ({config.ADAPTIVE_RSI_THRESHOLD}) exceeds sanity cap of 70")
+            if config.ADAPTIVE_RSI_MIN_RED_DAYS < 2:
+                issues.append(f"ADAPTIVE_RSI_MIN_RED_DAYS ({config.ADAPTIVE_RSI_MIN_RED_DAYS}) must be >= 2")
+
+            if issues:
+                return TestResult(
+                    test_id="TEST-2.12",
+                    name="Adaptive RSI config (V29)",
+                    status=TestStatus.FAIL,
+                    message="; ".join(issues)
+                )
+
+            return TestResult(
+                test_id="TEST-2.12",
+                name="Adaptive RSI config (V29)",
+                status=TestStatus.PASS,
+                message=f"RSI {config.RSI_THRESHOLD} normal, {config.ADAPTIVE_RSI_THRESHOLD} bounce, min {config.ADAPTIVE_RSI_MIN_RED_DAYS} red days"
+            )
+
+        except Exception as e:
+            return TestResult(
+                test_id="TEST-2.12",
+                name="Adaptive RSI config (V29)",
+                status=TestStatus.FAIL,
+                message=f"Import error: {e}"
             )
 
     # =========================================================================
@@ -1857,6 +1897,7 @@ class PipelineHealthCheck:
                 self.check_orats_daily,
                 self.check_ta_sip_coverage,
                 self.check_live_baselines_today,
+                self.check_adaptive_rsi_config,
             ],
             "tracking": [
                 self.check_symbol_tracking,
@@ -1922,6 +1963,7 @@ class PipelineHealthCheck:
                 self.check_orats_daily,
                 self.check_ta_sip_coverage,
                 self.check_live_baselines_today,
+                self.check_adaptive_rsi_config,
             ]),
             # Section 3: Tracking
             ("TRACKING PIPELINE", [
