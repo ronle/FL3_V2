@@ -164,7 +164,8 @@ class Dashboard:
         symbol: str,
         entry_price: float,
         current_price: float,
-        status: str = "HOLDING"
+        status: str = "HOLDING",
+        score: int = 0,
     ):
         """
         Update or add a position to Positions tab.
@@ -176,6 +177,7 @@ class Dashboard:
             pnl = ((current_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
             row = [
                 symbol,
+                score,
                 f"${entry_price:.2f}",
                 f"${current_price:.2f}",
                 f"{pnl:+.2f}%",
@@ -185,7 +187,7 @@ class Dashboard:
             # Try to update existing row
             try:
                 cell = self._positions_tab.find(symbol)
-                self._positions_tab.update(f'A{cell.row}:E{cell.row}', [row])
+                self._positions_tab.update(f'A{cell.row}:F{cell.row}', [row])
             except Exception:
                 # Not found, append new row
                 self._positions_tab.append_row(row, value_input_option='USER_ENTERED')
@@ -199,7 +201,10 @@ class Dashboard:
         symbol: str,
         entry_price: float,
         exit_price: float,
-        exit_time: Optional[datetime] = None
+        exit_time: Optional[datetime] = None,
+        shares: int = 0,
+        pnl_dollars: Optional[float] = None,
+        score: int = 0,
     ):
         """
         Move position from Positions to Closed Today tab.
@@ -209,16 +214,21 @@ class Dashboard:
 
         try:
             ts = exit_time or datetime.now(ET)
-            pnl = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
-            result = "WIN" if pnl > 0 else "LOSS" if pnl < 0 else "FLAT"
+            pnl_pct = ((exit_price - entry_price) / entry_price) * 100 if entry_price > 0 else 0
+            if pnl_dollars is None:
+                pnl_dollars = (exit_price - entry_price) * shares
+            result = "WIN" if pnl_pct > 0 else "LOSS" if pnl_pct < 0 else "FLAT"
 
             # Add to Closed tab
             row = [
                 ts.strftime("%Y-%m-%d %H:%M:%S"),
                 symbol,
+                score,
+                shares,
                 f"${entry_price:.2f}",
                 f"${exit_price:.2f}",
-                f"{pnl:+.2f}%",
+                f"{pnl_pct:+.2f}%",
+                f"${pnl_dollars:+,.2f}",
                 result
             ]
             self._closed_tab.append_row(row, value_input_option='USER_ENTERED')
@@ -230,7 +240,7 @@ class Dashboard:
             except Exception:
                 pass  # Not found, already removed
 
-            logger.debug(f"Dashboard: closed position {symbol} @ ${exit_price:.2f} ({pnl:+.2f}%)")
+            logger.debug(f"Dashboard: closed position {symbol} @ ${exit_price:.2f} ({pnl_pct:+.2f}%)")
         except Exception as e:
             logger.warning(f"Dashboard close_position failed: {e}")
 
@@ -253,11 +263,11 @@ class Dashboard:
                 value_input_option='USER_ENTERED'
             )
             self._positions_tab.append_row(
-                ['Symbol', 'Entry', 'Current', 'P/L %', 'Status'],
+                ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status'],
                 value_input_option='USER_ENTERED'
             )
             self._closed_tab.append_row(
-                ['Date/Time', 'Symbol', 'Entry', 'Exit', 'P/L %', 'Result'],
+                ['Date/Time', 'Symbol', 'Score', 'Shares', 'Entry', 'Exit', 'P/L %', '$ P/L', 'Result'],
                 value_input_option='USER_ENTERED'
             )
 

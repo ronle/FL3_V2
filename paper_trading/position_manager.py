@@ -367,7 +367,7 @@ class PositionManager:
             # Update dashboard
             dashboard = get_dashboard()
             if dashboard.enabled:
-                dashboard.update_position(symbol, trade.entry_price, trade.entry_price, "HOLDING")
+                dashboard.update_position(symbol, trade.entry_price, trade.entry_price, "HOLDING", score=trade.signal_score)
 
             # Persist trade to DB
             db_url = os.environ.get("DATABASE_URL")
@@ -457,7 +457,11 @@ class PositionManager:
         # Update dashboard - move to closed
         dashboard = get_dashboard()
         if dashboard.enabled:
-            dashboard.close_position(symbol, trade.entry_price, exit_price, trade.exit_time)
+            dashboard.close_position(
+                symbol, trade.entry_price, exit_price, trade.exit_time,
+                shares=trade.shares, pnl_dollars=trade.pnl,
+                score=trade.signal_score,
+            )
 
         # Persist trade close to DB
         db_url = os.environ.get("DATABASE_URL")
@@ -553,6 +557,7 @@ class PositionManager:
                     entry_price=trade.entry_price,
                     current_price=pos.current_price,
                     status="HOLDING",
+                    score=trade.signal_score,
                 )
 
     def record_signal(self, passed_filter: bool):
