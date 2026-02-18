@@ -1,5 +1,58 @@
 # Claude Code Project Context — FL3_V2
 
+## SESSION CONTEXT FILE
+If `.claude_session_context.md` exists in the project root, read it immediately before anything else. It contains injected rules and recent changelog from the launcher script.
+
+---
+
+## COMPACTION RECOVERY
+If you have just been compacted or feel uncertain about your instructions:
+1. Re-read AGENT_RULES.md immediately — it is short (52 lines) and has all behavioral rules
+2. Re-read this file from the top
+3. Tell Ron: "Context was compacted — re-reading rules now" before continuing
+
+---
+
+## Session Continuity (MANDATORY)
+
+### On Startup — ALWAYS do this first:
+1. Read the last 50 lines of the active session log (check `logs/sessions.json` for path)
+2. Read `CHANGELOG.md` for recent milestones
+3. State what was last worked on and what the current task is before proceeding
+
+### Before Closing — ALWAYS do this last:
+Before ending ANY session (whether asked to or not), you MUST:
+1. Append a summary block to `CHANGELOG.md`:
+   ```
+   ## [YYYY-MM-DD HH:MM] — <one-line summary>
+   ### Done
+   - bullet list of completed work
+   ### State
+   - current status of any in-progress work
+   ### Next
+   - what to do next session
+   ### Files Changed
+   - list of files modified
+   ```
+2. Update the `## Current Status` section in this file (`CLAUDE.md`) to reflect the latest state
+3. Write final status to the session log if one is active
+
+**This is non-negotiable. If the user says "done", "close", "stop", or "end session" — document first, then close.**
+
+---
+
+## Current Status
+
+_Last updated: 2026-02-18_
+
+- Account B deployed to Cloud Run and actively trading (revision `paper-trading-live-00089-d86`)
+- Account A healthy with 10 positions, Account B filled 10 slots on first cycle
+- Dashboard tabs live: "Account B Signals", "Account B Positions", "Account B Closed"
+- Fixed: engulfing checker DB connection (`.strip()`), signal log format (string not float), Cloud Run traffic routing (`--to-latest`)
+- Options flat file download running for 2023-2024 data (PID 143320)
+
+---
+
 ## Session Startup (MANDATORY)
 
 **At the start of EVERY session, before any other work:**
@@ -18,6 +71,14 @@
 Current time: Tuesday, January 28, 2026 at 2:45 PM ET
 Market Status: OPEN (closes in 1h 15m)
 ```
+
+---
+
+## Temporary & Working Files
+
+All temporary files, scratch scripts, and work-support files (e.g. one-off analysis scripts, debug outputs, data exports, intermediate results) **MUST** be placed under the `temp/` directory in the project root. Never create throwaway files in the repo root or other project directories.
+
+The `temp/` folder is excluded from git, Docker builds, and Cloud Build uploads.
 
 ---
 
@@ -298,6 +359,11 @@ SignalFilter.apply() — 10 filter steps:
     ↓
 If PASSED → Submit buy order via Alpaca API → Write to paper_trades_log, active_signals
          → Add symbol to tracked_tickers_v2 for intraday TA updates
+
+Exit Rules:
+    - Hard stop: -2% (USE_HARD_STOP=True, checked every 30s via Alpaca positions API)
+    - EOD exit: 3:55 PM ET (all positions liquidated)
+    - Dashboard update: every 30s (1 bulk Alpaca call → Google Sheets)
 ```
 
 ### Database Tables Read by Live Trading
@@ -330,8 +396,34 @@ On startup, `PositionManager.sync_on_startup()` performs 3-way reconciliation:
 | C: Alpaca only | Alpaca position but no DB record | Create new DB record (signal metadata zeroed) |
 
 **Key files:**
-- `paper_trading/dashboard.py` — `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()`
+- `paper_trading/dashboard.py` — `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()`, `close_position()` (writes to Google Sheets "Closed Today" tab)
 - `paper_trading/position_manager.py` — `sync_on_startup()`, wired DB writes in `open_position()` and `close_position()`
+
+### Google Sheets Dashboard
+
+Six tabs updated in real-time via `gspread` — three per account:
+
+**Account A (default, no prefix):**
+
+| Tab | Columns | Written By |
+|-----|---------|------------|
+| Active Signals | Date/Time, Symbol, Score, RSI, Ratio, Notional, Price, Action | `dashboard.log_signal()` |
+| Positions | Symbol, Score, Entry, Current, P/L %, Status | `dashboard.update_position()` |
+| Closed Today | Date/Time, Symbol, Score, Shares, Entry, Exit, P/L %, $ P/L, Result | `dashboard.close_position()` |
+
+**Account B (prefixed tabs, engulfing-specific columns):**
+
+| Tab | Columns | Written By |
+|-----|---------|------------|
+| Account B Signals | Date/Time, Symbol, Score, Engulfing, Notional, Price, VolR, Action | `dashboard_b.log_signal()` |
+| Account B Positions | Symbol, Score, Entry, Current, P/L %, Status | `dashboard_b.update_position()` |
+| Account B Closed | Date/Time, Symbol, Score, Shares, Entry, Exit, P/L %, $ P/L, Result | `dashboard_b.close_position()` |
+
+- **Sheet ID**: `DASHBOARD_SHEET_ID` env var (set on Cloud Run service)
+- **Credentials**: `dashboard-credentials` secret in Secret Manager
+- **Daily reset**: `clear_daily()` clears all tabs and re-adds headers at market open
+- **Tab prefix**: Account B uses `Dashboard(tab_prefix="Account B ")` — creates/finds worksheets with prefix
+- **Backfill**: `scripts/backfill_closed_sheet.py` (Account A), `scripts/_backfill_signals.py` (Account B one-off)
 
 ### What's NOT in the Live Path (Yet)
 
@@ -343,6 +435,51 @@ On startup, `PositionManager.sync_on_startup()` performs 3-way reconciliation:
 | GEX calculations | **PLANNED** - code exists, to be added later |
 | Greeks (Black-Scholes) | Code exists - NOT used in live trading |
 | ORATS scanner | `identify_uoa_candidates.py` runs independently, does NOT feed live trader |
+
+### Account B — Engulfing-Primary, V2 Score as Confirmation (A/B Test)
+
+Parallel paper trading account where **engulfing pattern is the primary gate** and V2 score >= 10 is confirmation. Account B is **NOT a subset of Account A** — a symbol may fail Account A's RSI filter but still trade in Account B if it has engulfing + score >= 10.
+
+**Signal flow:**
+```
+Pre-market / startup:
+  Load daily bullish engulfing watchlist from engulfing_scores (timeframe='1D', last 20h)
+
+During market hours:
+  Aggregator fires UOA trigger for symbol
+    → b_eligible? (position limits, not already traded)
+    → score >= 10?
+    → On engulfing watchlist (daily, last 20h) OR 5-min pattern (last 30min)?
+      → YES → Account B trade (bypasses RSI, sentiment, earnings, etc.)
+      → NO  → Account B skip
+```
+
+**Environment variables:**
+| Variable | Purpose |
+|----------|---------|
+| `ALPACA_API_KEY_B` | Account B Alpaca API key |
+| `ALPACA_SECRET_KEY_B` | Account B Alpaca secret key |
+
+**Tables:**
+| Table | Purpose |
+|-------|---------|
+| `engulfing_scores` | Written by DayTrading scanner (both 1D and 5min timeframes). UNIQUE on symbol, pattern_date, timeframe |
+| `paper_trades_log_b` | Account B trade log (same schema as `paper_trades_log`) |
+
+**Config (`paper_trading/config.py`):**
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `USE_ACCOUNT_B` | `True` | Enable/disable Account B |
+| `ENGULFING_LOOKBACK_MINUTES` | `30` | How recent the 5-min pattern must be (fallback) |
+| `ENGULFING_DAILY_LOOKBACK_HOURS` | `20` | Daily patterns persist overnight |
+
+**Key files:**
+- `paper_trading/engulfing_checker.py` — Daily watchlist cache (O(1) lookup) + per-query 5-min fallback + `get_volume_ratio()`. `.strip()` on DB URL (critical for Cloud Run where secrets may have trailing `\r`)
+- `paper_trading/position_manager.py` — `trades_table` and `skip_dashboard` params for Account B isolation
+- `paper_trading/dashboard.py` — `tab_prefix` param creates prefixed worksheets. `log_signal()` uses Account B layout (Engulfing, VolR columns instead of RSI, Ratio). `table_name` param on `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()` with `ALLOWED_TABLES` whitelist
+- `paper_trading/main.py` — Account B evaluates BEFORE filter chain at aggregator level (score + engulfing only)
+
+**Rollback:** Set `USE_ACCOUNT_B = False` in config.py, redeploy. Account A continues unaffected.
 
 ---
 
@@ -579,6 +716,9 @@ ORDER BY staleness DESC;
 6. **Firehose Reconnects**: Websocket may disconnect — implement auto-reconnect with backoff
 7. **ORATS Timing**: `asof_date` is T-1 (yesterday's data arrives after close)
 8. **TA Storage**: 78K rows/day at 5-min intervals — plan for ~2.8 GB/year
+9. **GCP Secret trailing whitespace**: `DATABASE_URL` secret has trailing `\r\r`. Any `psycopg2.connect()` call MUST `.strip()` the URL. asyncpg is unaffected (trims internally). Check with `gcloud secrets versions access ... | cat -A`
+10. **Cloud Run traffic pinning**: If traffic was pinned to a specific revision name, `gcloud run deploy` creates new revisions but they're immediately retired. Fix: `gcloud run services update-traffic SERVICE --to-latest`
+11. **engulfing_strength is text, not numeric**: `engulfing_scores.pattern_strength` is a string enum (`strong`/`moderate`/`weak`). Don't use float format codes on it
 
 ---
 

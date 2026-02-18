@@ -17,6 +17,9 @@ import pytz
 logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
 
+# Safety: only allow known trade log tables in dynamic SQL
+ALLOWED_TABLES = {"paper_trades_log", "paper_trades_log_b"}
+
 # Google Sheets Configuration
 SHEET_ID = os.environ.get("DASHBOARD_SHEET_ID", "")
 CREDENTIALS_SECRET = "dashboard-credentials"  # Secret Manager key
@@ -32,8 +35,9 @@ class Dashboard:
     - Closed Today: Positions closed during the session
     """
 
-    def __init__(self, sheet_id: Optional[str] = None, credentials_json: Optional[str] = None):
+    def __init__(self, sheet_id: Optional[str] = None, credentials_json: Optional[str] = None, tab_prefix: str = ""):
         self.sheet_id = sheet_id or SHEET_ID
+        self.tab_prefix = tab_prefix
         self._client = None
         self._sheet = None
         self._signals_tab = None
@@ -48,7 +52,7 @@ class Dashboard:
         try:
             self._init_client(credentials_json)
             self._enabled = True
-            logger.info(f"Dashboard initialized: {self.sheet_id}")
+            logger.info(f"Dashboard initialized: {self.sheet_id} (prefix='{self.tab_prefix}')")
         except Exception as e:
             import traceback
             logger.warning(f"Dashboard initialization failed: {type(e).__name__}: {e}")
@@ -89,11 +93,16 @@ class Dashboard:
         self._sheet = self._client.open_by_key(self.sheet_id)
         logger.info(f"Sheet opened: {self._sheet.title}")
 
-        # Get or create tabs
+        # Get or create tabs (Account B uses prefixed tab names)
         logger.info("Getting/creating worksheets...")
-        self._signals_tab = self._get_or_create_worksheet("Active Signals")
-        self._positions_tab = self._get_or_create_worksheet("Positions")
-        self._closed_tab = self._get_or_create_worksheet("Closed Today")
+        if self.tab_prefix:
+            self._signals_tab = self._get_or_create_worksheet(f"{self.tab_prefix}Signals")
+            self._positions_tab = self._get_or_create_worksheet(f"{self.tab_prefix}Positions")
+            self._closed_tab = self._get_or_create_worksheet(f"{self.tab_prefix}Closed")
+        else:
+            self._signals_tab = self._get_or_create_worksheet("Active Signals")
+            self._positions_tab = self._get_or_create_worksheet("Positions")
+            self._closed_tab = self._get_or_create_worksheet("Closed Today")
         logger.info("All worksheets ready")
 
     def _get_credentials_from_secret(self) -> Optional[str]:
@@ -133,9 +142,13 @@ class Dashboard:
         notional: float,
         price: float,
         timestamp: Optional[datetime] = None,
+        volume_ratio: Optional[float] = None,
+        engulfing_strength: Optional[float] = None,
     ):
         """
         Log a signal that passed all filters to Active Signals tab.
+
+        Account B uses engulfing_strength + volume_ratio columns instead of RSI + Ratio.
         """
         if not self._enabled:
             return
@@ -144,16 +157,32 @@ class Dashboard:
             ts = timestamp or datetime.now(ET)
             time_str = ts.strftime("%Y-%m-%d %H:%M:%S")
 
-            row = [
-                time_str,
-                symbol,
-                score,
-                f"{rsi:.1f}",
-                f"{ratio:.1f}x",
-                f"${notional:,.0f}",
-                f"${price:.2f}",
-                "BUY"
-            ]
+            if self.tab_prefix:
+                # Account B layout: Date/Time, Symbol, Score, Engulfing, Notional, Price, VolR, Action
+                vol_str = f"{volume_ratio:.1f}x" if volume_ratio is not None else "—"
+                eng_str = str(engulfing_strength) if engulfing_strength is not None else "—"
+                row = [
+                    time_str,
+                    symbol,
+                    score,
+                    eng_str,
+                    f"${notional:,.0f}",
+                    f"${price:.2f}",
+                    vol_str,
+                    "BUY",
+                ]
+            else:
+                # Account A layout: Date/Time, Symbol, Score, RSI, Ratio, Notional, Price, Action
+                row = [
+                    time_str,
+                    symbol,
+                    score,
+                    f"{rsi:.1f}",
+                    f"{ratio:.1f}x",
+                    f"${notional:,.0f}",
+                    f"${price:.2f}",
+                    "BUY",
+                ]
             self._signals_tab.append_row(row, value_input_option='USER_ENTERED')
             logger.debug(f"Dashboard: logged signal {symbol}")
         except Exception as e:
@@ -195,6 +224,26 @@ class Dashboard:
             logger.debug(f"Dashboard: updated position {symbol} @ ${current_price:.2f}")
         except Exception as e:
             logger.warning(f"Dashboard update_position failed: {e}")
+
+    def rewrite_positions(self, positions_data: list):
+        """
+        Clear and rewrite the entire Positions tab.
+
+        Takes a list of [symbol, score, entry, current, pnl%, status] rows.
+        Self-healing: removes stale entries that shouldn't be there.
+        """
+        if not self._enabled:
+            return
+
+        try:
+            self._positions_tab.clear()
+            header = ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status']
+            if positions_data:
+                self._positions_tab.update('A1', [header] + positions_data, value_input_option='USER_ENTERED')
+            else:
+                self._positions_tab.update('A1', [header], value_input_option='USER_ENTERED')
+        except Exception as e:
+            logger.warning(f"Dashboard rewrite_positions failed: {e}")
 
     def close_position(
         self,
@@ -257,11 +306,17 @@ class Dashboard:
             self._positions_tab.clear()
             self._closed_tab.clear()
 
-            # Add headers
-            self._signals_tab.append_row(
-                ['Date/Time', 'Symbol', 'Score', 'RSI', 'Ratio', 'Notional', 'Price', 'Action'],
-                value_input_option='USER_ENTERED'
-            )
+            # Add headers (Account B uses different signal columns)
+            if self.tab_prefix:
+                self._signals_tab.append_row(
+                    ['Date/Time', 'Symbol', 'Score', 'Engulfing', 'Notional', 'Price', 'VolR', 'Action'],
+                    value_input_option='USER_ENTERED'
+                )
+            else:
+                self._signals_tab.append_row(
+                    ['Date/Time', 'Symbol', 'Score', 'RSI', 'Ratio', 'Notional', 'Price', 'Action'],
+                    value_input_option='USER_ENTERED'
+                )
             self._positions_tab.append_row(
                 ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status'],
                 value_input_option='USER_ENTERED'
@@ -271,7 +326,7 @@ class Dashboard:
                 value_input_option='USER_ENTERED'
             )
 
-            logger.info("Dashboard: cleared for new trading day")
+            logger.info(f"Dashboard: cleared for new trading day (prefix='{self.tab_prefix}')")
         except Exception as e:
             logger.warning(f"Dashboard clear_daily failed: {e}")
 
@@ -308,6 +363,7 @@ def log_active_signal_to_db(
     trend: int,
     price: float,
     score: int,
+    volume_ratio: Optional[float] = None,
 ):
     """
     Log a passed signal to the active_signals database table.
@@ -324,12 +380,12 @@ def log_active_signal_to_db(
             INSERT INTO active_signals (
                 detected_at, symbol, notional, ratio, call_pct, sweep_pct,
                 num_strikes, contracts, rsi_14, trend, price_at_signal,
-                score, action
-            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                score, action, volume_ratio
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (detected_at, symbol) DO NOTHING
         """, (
             detected_at, symbol, notional, ratio, call_pct, sweep_pct,
-            num_strikes, contracts, rsi, trend, price, score, 'BUY'
+            num_strikes, contracts, rsi, trend, price, score, 'BUY', volume_ratio
         ))
 
         conn.commit()
@@ -405,12 +461,15 @@ def log_trade_open(
     signal_score: int,
     signal_rsi: float,
     signal_notional: float,
+    table_name: str = "paper_trades_log",
+    volume_ratio: Optional[float] = None,
 ):
     """
-    Log a new trade to paper_trades_log when a position is opened.
+    Log a new trade to paper_trades_log (or paper_trades_log_b) when a position is opened.
 
     Returns the row id on success, None on failure.
     """
+    assert table_name in ALLOWED_TABLES, f"Invalid table: {table_name}"
     if not db_url:
         return None
 
@@ -419,19 +478,19 @@ def log_trade_open(
         conn = psycopg2.connect(db_url.strip())
         cur = conn.cursor()
 
-        cur.execute("""
-            INSERT INTO paper_trades_log
-            (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        cur.execute(f"""
+            INSERT INTO {table_name}
+            (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             RETURNING id
-        """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional))
+        """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio))
 
         row = cur.fetchone()
         trade_id = row[0] if row else None
         conn.commit()
         cur.close()
         conn.close()
-        logger.info(f"Logged trade open to paper_trades_log: {symbol} (id={trade_id})")
+        logger.info(f"Logged trade open to {table_name}: {symbol} (id={trade_id})")
         return trade_id
     except Exception as e:
         logger.warning(f"Failed to log trade open to DB: {e}")
@@ -447,13 +506,15 @@ def log_trade_close(
     pnl: float,
     pnl_pct: float,
     exit_reason: str,
+    table_name: str = "paper_trades_log",
 ):
     """
-    Update paper_trades_log when a position is closed.
+    Update paper_trades_log (or paper_trades_log_b) when a position is closed.
 
     Uses trade_db_id (primary key) for precise targeting.
     Falls back to symbol + exit_time IS NULL if id is not available.
     """
+    assert table_name in ALLOWED_TABLES, f"Invalid table: {table_name}"
     if not db_url:
         return
 
@@ -463,17 +524,17 @@ def log_trade_close(
         cur = conn.cursor()
 
         if trade_db_id:
-            cur.execute("""
-                UPDATE paper_trades_log
+            cur.execute(f"""
+                UPDATE {table_name}
                 SET exit_time = %s, exit_price = %s, pnl = %s, pnl_pct = %s, exit_reason = %s
                 WHERE id = %s
             """, (exit_time, exit_price, pnl, pnl_pct, exit_reason, trade_db_id))
         else:
-            cur.execute("""
-                UPDATE paper_trades_log
+            cur.execute(f"""
+                UPDATE {table_name}
                 SET exit_time = %s, exit_price = %s, pnl = %s, pnl_pct = %s, exit_reason = %s
                 WHERE id = (
-                    SELECT id FROM paper_trades_log
+                    SELECT id FROM {table_name}
                     WHERE symbol = %s AND exit_time IS NULL
                     ORDER BY entry_time DESC
                     LIMIT 1
@@ -483,18 +544,19 @@ def log_trade_close(
         conn.commit()
         cur.close()
         conn.close()
-        logger.info(f"Logged trade close to paper_trades_log: {symbol} (id={trade_db_id})")
+        logger.info(f"Logged trade close to {table_name}: {symbol} (id={trade_db_id})")
     except Exception as e:
         logger.warning(f"Failed to log trade close to DB: {e}")
 
 
-def load_open_trades_from_db(db_url: str) -> list:
+def load_open_trades_from_db(db_url: str, table_name: str = "paper_trades_log") -> list:
     """
-    Load open trades from paper_trades_log for startup recovery.
+    Load open trades from paper_trades_log (or paper_trades_log_b) for startup recovery.
 
     Returns list of dicts with trade data where exit_time IS NULL.
     Only looks at trades from the last 7 days to avoid stale data.
     """
+    assert table_name in ALLOWED_TABLES, f"Invalid table: {table_name}"
     if not db_url:
         return []
 
@@ -503,10 +565,10 @@ def load_open_trades_from_db(db_url: str) -> list:
         conn = psycopg2.connect(db_url.strip())
         cur = conn.cursor()
 
-        cur.execute("""
+        cur.execute(f"""
             SELECT id, symbol, entry_time, entry_price, shares,
                    signal_score, signal_rsi, signal_notional
-            FROM paper_trades_log
+            FROM {table_name}
             WHERE exit_time IS NULL
             AND created_at > CURRENT_DATE - 7
             ORDER BY entry_time DESC
@@ -527,7 +589,7 @@ def load_open_trades_from_db(db_url: str) -> list:
 
         cur.close()
         conn.close()
-        logger.info(f"Loaded {len(trades)} open trades from paper_trades_log")
+        logger.info(f"Loaded {len(trades)} open trades from {table_name}")
         return trades
     except Exception as e:
         logger.warning(f"Failed to load open trades from DB: {e}")

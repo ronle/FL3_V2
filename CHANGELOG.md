@@ -2,6 +2,239 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-18] - Account B Cloud Run Deploy + Critical Fixes (v52)
+
+### Summary
+First successful Cloud Run deployment of Account B with engulfing-primary architecture. Discovered and fixed three critical bugs that had been silently breaking Account B on Cloud Run since the v51c deploy on Feb 12.
+
+### Critical Fixes
+
+1. **`DATABASE_URL` secret trailing `\r\r`** — The GCP Secret Manager value for `DATABASE_URL` had two carriage return characters appended, corrupting the Cloud SQL Unix socket path for any code using `psycopg2.connect()` without `.strip()`. The main app (asyncpg) was unaffected. **Every engulfing check was failing** on Cloud Run — Account B could never pass its primary gate.
+   - **Fix**: Added `.strip()` in `EngulfingChecker.__init__()` to sanitize the URL
+   - **File**: `paper_trading/engulfing_checker.py`
+
+2. **`log_signal()` format error** — `engulfing_strength` is a string (`"strong"`, `"moderate"`, `"weak"`) from the DB, but dashboard code tried to format it as a float (`f"{engulfing_strength:.2f}"`). Every signal log silently failed with `Unknown format code 'f' for object of type 'str'`.
+   - **Fix**: Changed to `str(engulfing_strength)`
+   - **File**: `paper_trading/dashboard.py:163`
+
+3. **Cloud Run traffic pinned to old revision** — Traffic was hardcoded to revision `paper-trading-live-00084-cwr` by name instead of using `latestRevision: true`. New revisions were created but immediately retired because they'd never receive traffic.
+   - **Fix**: `gcloud run services update-traffic paper-trading-live --to-latest`
+   - Also fixed Cloud SQL annotation that had `\r` in instance name via `--set-cloudsql-instances`
+
+### Deployment
+- **Revision**: `paper-trading-live-00089-d86`
+- **Image**: `us-west1-docker.pkg.dev/fl3-v2-prod/fl3-v2-images/fl3-v2:v4b-signal-fix`
+- **Account A**: 10 positions restored via 3-way sync, healthy
+- **Account B**: Initialized with $100K, engulfing watchlist loaded (9,208 symbols), 10 trades executed on first cycle
+- **Dashboard tabs created**: "Account B Signals", "Account B Positions", "Account B Closed"
+
+### Account B First Trades (2026-02-18)
+| Symbol | Score | Engulfing | Vol Ratio | Entry |
+|--------|-------|-----------|-----------|-------|
+| MOD | 13 | strong | 0.5x | $219.33 |
+| DHT | 11 | moderate | 8.1x | $16.72 |
+| AMAT | 11 | strong | 0.8x | $368.87 |
+| APA | 12 | moderate | 0.7x | $28.75 |
+| MHK | 15 | weak | 0.4x | $132.54 |
+| YEXT | 11 | moderate | 0.0x | $5.55 |
+| STOK | 13 | weak | 0.3x | $31.21 |
+| GKOS | 11 | moderate | 1.5x | $119.37 |
+| TW | 13 | moderate | 0.0x | $116.68 |
+| HTGC | 10 | moderate | 2.9x | $15.94 |
+
+### New Files
+- **`scripts/_backfill_signals.py`**: One-off script to backfill 10 missing signals from trade logs to "Account B Signals" Google Sheet tab (signals were lost due to format bug on revision 00088)
+
+### Modified Files
+- **`paper_trading/engulfing_checker.py`**: `.strip()` on `database_url` in `__init__`
+- **`paper_trading/dashboard.py`**: `str(engulfing_strength)` instead of `f"{engulfing_strength:.2f}"` in `log_signal()`
+
+### Lessons Learned
+- **Always `.strip()` env vars** used for DB connections — secrets can have trailing whitespace/CR from copy-paste or Windows line endings
+- **`gcloud run deploy` does NOT auto-route traffic** if traffic was previously pinned to a specific revision name. Must use `--to-latest` or `update-traffic` to fix
+- **Test format strings with actual DB values** — engulfing_strength is a text enum in the DB, not a numeric score
+
+---
+
+## [2026-02-12] - Account B: Engulfing-Primary Architecture Flip (v51c)
+
+### Summary
+Flipped Account B architecture: engulfing pattern is now the **primary gate**, V2 score >= 10 is confirmation. Account B evaluates at the aggregator level (before signal creation/filter chain), so it no longer requires TA fetch, RSI, sentiment, or earnings filters. Daily engulfing patterns (timeframe='1D') are bulk-loaded into a watchlist at startup and daily reset for O(1) lookups; 5-min patterns remain as fallback.
+
+Account B is **no longer a strict subset** of Account A — a symbol may fail Account A's RSI filter but still trade in Account B.
+
+### Modified Files
+- **`paper_trading/engulfing_checker.py`**: Added `_daily_watchlist` dict, `load_daily_watchlist()` method (bulk-loads timeframe='1D' patterns from last 20h). `has_engulfing_confirmation()` now checks daily watchlist first (O(1)), falls back to per-query 5-min check. Added `timeframe = '5min'` filter to fallback query.
+- **`paper_trading/config.py`**: Added `ENGULFING_DAILY_LOOKBACK_HOURS: int = 20`
+- **`paper_trading/main.py`**: Account B check moved BEFORE `create_signal_async()` / `signal_filter.apply()`. Uses only `stats["score"] >= SCORE_THRESHOLD` + engulfing check. Added `load_daily_watchlist()` at startup (after Account B sync) and daily reset.
+- **`CLAUDE.md`**: Updated Account B section to reflect new architecture
+
+### Architecture Change
+```
+OLD: UOA trigger → TA fetch → 10-filter chain → Account A trade → engulfing check → Account B trade
+NEW: UOA trigger → score >= 10? → engulfing check → Account B trade (independent of Account A)
+                 → TA fetch → 10-filter chain → Account A trade (unchanged)
+```
+
+---
+
+## [2026-02-12] - Account B: V2 + Engulfing Pattern A/B Test (v51)
+
+### Summary
+Added a second parallel Alpaca paper trading account (Account B) that only trades signals with a confirming bullish engulfing candlestick pattern on the 5-minute chart. Account A behavior is completely unchanged. This enables an A/B comparison: Account A = all V2 signals, Account B = V2 signals + engulfing confirmation.
+
+### v51b Update — Spec Alignment
+Updated Account B implementation to match revised spec:
+- **Timeframe changed**: Daily engulfing (20h lookback) → 5-minute patterns (30min lookback)
+- **Score threshold removed**: Presence-only check (score column reserved for future use)
+- **Architecture changed**: Cache-based (bulk-load) → per-query (Option A) — simpler, runs only 5-20 times/day
+- **Table whitelist**: Added `ALLOWED_TABLES` safety check in `dashboard.py` for dynamic SQL
+- **Schema updated**: `target_1`/`target_2` columns, `score` nullable, new index
+
+### New Files
+- **`paper_trading/engulfing_checker.py`**: Per-query checker for `engulfing_scores` table. Simple `has_engulfing_confirmation(symbol, lookback_minutes)` function — one indexed query per signal, no caching.
+- **`sql/create_engulfing_scores.sql`**: DDL for shared scores table (written by DayTrading 5-min scanner, read by V2). Includes `target_1`, `target_2`, nullable `score`.
+- **`sql/create_paper_trades_b.sql`**: DDL for Account B trade log (cloned from `paper_trades_log`)
+
+### Modified Files
+- **`paper_trading/config.py`**: Added `USE_ACCOUNT_B` (True), `ENGULFING_LOOKBACK_MINUTES` (30)
+- **`paper_trading/dashboard.py`**: Added `ALLOWED_TABLES` whitelist + assertions in `log_trade_open()`, `log_trade_close()`, `load_open_trades_from_db()`. Added `table_name` parameter (backward-compatible default).
+- **`paper_trading/position_manager.py`**: Added `trades_table` and `skip_dashboard` constructor parameters. Dashboard/signal DB calls gated behind `skip_dashboard` flag. `update_dashboard_positions()` returns early when `skip_dashboard=True`.
+- **`paper_trading/main.py`**: Full Account B lifecycle — init (separate AlpacaTrader, PositionManager, EODCloser, EngulfingChecker), signal routing (after Account A trade, check engulfing confirmation), hard stop monitoring, EOD close, daily reset, shutdown cleanup.
+- **`CLAUDE.md`**: Updated "Account B — V2 + Engulfing Pattern" section
+
+### DDL
+- `engulfing_scores` table with `UNIQUE(symbol, pattern_date, timeframe)`, index on `(symbol, direction, scan_ts)`
+- `paper_trades_log_b` table (clone of `paper_trades_log INCLUDING ALL`)
+
+### Environment Variables (New)
+| Variable | Purpose |
+|----------|---------|
+| `ALPACA_API_KEY_B` | Account B Alpaca API key |
+| `ALPACA_SECRET_KEY_B` | Account B Alpaca secret key |
+
+### Architecture
+- Account B is a strict subset of Account A — every B trade is also an A trade
+- Independent position limits, independent Alpaca accounts, independent trade logs
+- No Google Sheets dashboard for Account B (DB logging only via `paper_trades_log_b`)
+- `engulfing_scores` table written by separate DayTrading 5-min scanner (every 5 min during market hours)
+- 30-minute lookback = last 6 scan cycles must overlap with UOA trigger
+
+### Rollback
+Set `USE_ACCOUNT_B = False` in config.py, redeploy. Account A continues unaffected.
+
+---
+
+## [2026-02-11] - Intraday 1-Min Bar Collection + Full Market Backfill (v50/v50a/v50b/v50c)
+
+### Summary
+New `spot_prices_1m` table stores full intraday 1-min OHLCV bars for all tracked symbols (~1,800), collected every 60 seconds by `IntradayBarCollector` running inside `paper-trading-live`. Replaces the lossy `spot_prices` table which only kept the last write per day due to `UNIQUE(ticker, trade_date)` UPSERT. Compatibility view `vw_spot_prices_latest` provides drop-in replacement for downstream consumers. Historical backfill loaded 7 trading days (~7M bars).
+
+### New Files
+- **`paper_trading/bar_collector.py`**: `IntradayBarCollector` class — fetches latest 1-min bars via Alpaca `/v2/stocks/bars/latest` (SIP feed), buffers in memory, flushes to DB via asyncpg UPSERT. 1,800+ symbols (20 batches of 100) per cycle. Includes 7-day retention cleanup.
+- **`scripts/backfill_bars_1m.py`**: One-off historical backfill script — fetches N trading days of 1-min bars via Alpaca `/v2/stocks/bars` (historical endpoint with pagination). Batches 100 symbols per API request, 5,000 rows per DB insert. Ran as dedicated Cloud Run Job.
+
+### Modified Files
+- **`paper_trading/config.py`**: Added `COLLECT_INTRADAY_BARS`, `INTRADAY_BARS_MAX_BATCHES` (20 — full market), `INTRADAY_BARS_INTERVAL_SEC` (60), `INTRADAY_BARS_RETENTION_DAYS` (7)
+- **`paper_trading/main.py`**: Wired `IntradayBarCollector` — init after BucketAggregator, periodic collect in main loop, retention on daily reset, flush+close on shutdown
+
+### DDL
+- `spot_prices_1m` table with `UNIQUE(symbol, bar_ts)`, indexes on `(symbol, bar_ts)` and `(bar_ts)`
+- `vw_spot_prices_latest` view — maps `spot_prices_1m` to old `spot_prices` schema (`ticker`, `trade_date`, `underlying`, etc.)
+
+### Version History
+| Version | Change | Result |
+|---------|--------|--------|
+| v50 | Initial deploy with SIP feed | 403 — free plan blocks real-time SIP on `/bars/latest` |
+| v50a | Switched to IEX feed | Working — 200 bars/cycle |
+| v50b | Switched back to SIP feed | Working — user upgraded Alpaca plan, SIP now allowed |
+| v50c | Scaled `MAX_BATCHES` from 2 → 20 | Full market — 1,785 bars/cycle for all tracked symbols |
+
+### Historical Backfill (v50c-backfill)
+- **Dedicated Cloud Run Job**: `backfill-bars-1m` (created, executed, deleted after completion)
+- **Results**: 6,949,208 bars fetched and inserted across 1,804 symbols, 9 full trading days (Jan 29 – Feb 11)
+- **DB totals**: 6,966,680 rows (includes live-collected bars), ~700K bars per full trading day
+- **Runtime**: ~11 minutes (19 batches of 100 symbols each)
+- **Lesson**: Don't repurpose existing jobs (e.g., `orats-daily-ingest`) for one-off tasks — create dedicated jobs and delete after use.
+
+### API Budget (updated)
+- 20 requests/min added (20 batches × 1 req/batch), total ~32.6 of unlimited (upgraded plan)
+
+### Deployed
+- Image: `paper-trading:v50c`
+- Revision: `paper-trading-live-00077-xwt`
+- Verified: 1,785 bars/cycle flowing, 7M+ rows in `spot_prices_1m`
+
+### Future Migration Steps
+1. ~~Scale `INTRADAY_BARS_MAX_BATCHES` to cover all tracked symbols~~ DONE (v50c)
+2. Verify `vw_spot_prices_latest` covers all symbols in `spot_prices`
+3. Update MBS Arena code to read `vw_spot_prices_latest`
+4. Disable `update-spot-prices` Cloud Scheduler trigger
+5. Delete `update-spot-prices` job after 1 week
+
+---
+
+## [2026-02-10] - Score Column + Hard Stop Tightened (v49)
+
+### Summary
+Added `Score` column to both the "Positions" and "Closed Today" Google Sheets tabs so signal strength is visible at a glance. Backfilled all 25 historical closed trades with scores recovered from `active_signals` for crash-recovery entries. Tightened hard stop from -5% to -2% to dump losers faster and free slots for winners.
+
+### Hard Stop Change
+- **`paper_trading/config.py`**: `HARD_STOP_PCT` changed from `-0.05` (-5%) to `-0.02` (-2%)
+- **Rationale**: Feb 10 saw 7/10 trades lose (day total -$561), with biggest losers at -3.1% and -2.6% bleeding out to EOD. Tighter stop frees position slots for new winners.
+
+### Modified Files
+- **`paper_trading/dashboard.py`**:
+  - `update_position()` — Added `score: int` parameter, inserted at column B. Update range changed from `A-E` to `A-F`.
+  - `close_position()` — Added `score: int` parameter, inserted at column C.
+  - `clear_daily()` — Updated headers for both tabs:
+    - Positions: `Symbol | Score | Entry | Current | P/L % | Status`
+    - Closed Today: `Date/Time | Symbol | Score | Shares | Entry | Exit | P/L % | $ P/L | Result`
+- **`paper_trading/position_manager.py`**:
+  - `open_position()` — Passes `score=trade.signal_score` to `dashboard.update_position()`
+  - `close_position()` — Passes `score=trade.signal_score` to `dashboard.close_position()`
+  - `update_dashboard_positions()` — Passes `score=trade.signal_score` to `dashboard.update_position()`
+
+### Modified Files (Backfill)
+- **`scripts/backfill_closed_sheet.py`**:
+  - Query now uses `LEFT JOIN LATERAL active_signals` with `COALESCE(NULLIF(p.signal_score, 0), a.score, 0)` to recover scores for crash-recovery trades
+  - Header and rows updated to 9 columns (A-I)
+
+### Backfill Results
+- 25 closed trades written with scores
+- 5 crash-recovery trades (Feb 6) recovered from `active_signals`: SSYS=13, SYNA=13, TGT=14, CSX=10, FLEX=13
+
+### Deployed
+- Image: `paper-trading:v49` (`sha256:04bf8d8f...`)
+- Revision: `paper-trading-live-00071-79g`
+
+---
+
+## [2026-02-09] - Dashboard: Add Shares & Dollar P/L to Closed Today
+
+### Summary
+Added `Shares` and `$ P/L` columns to the Google Sheets "Closed Today" tab so overall profit/loss is visible at a glance without mental math. Backfilled all 25 historical closed trades from `paper_trades_log`.
+
+### Modified Files
+- **`paper_trading/dashboard.py`**:
+  - `close_position()` — Added `shares: int` and `pnl_dollars: float` parameters (backward-compatible defaults)
+  - Row format changed from 6 → 8 columns: `Date/Time | Symbol | Shares | Entry | Exit | P/L % | $ P/L | Result`
+  - `clear_daily()` — Updated "Closed Today" header row to match new columns
+  - Fixed stale `pnl` reference in debug log (was NameError, now uses `pnl_pct`)
+- **`paper_trading/position_manager.py`**:
+  - `close_position()` call at line 460 now passes `shares=trade.shares, pnl_dollars=trade.pnl`
+
+### New Files
+- **`scripts/backfill_closed_sheet.py`** — One-off script to backfill "Closed Today" tab from `paper_trades_log`
+  - Fetches DB credentials from Secret Manager, converts Cloud SQL socket URL to local TCP
+  - Batch-writes all rows in one `update()` call
+
+### Backfill Results
+- 25 closed trades written (Feb 4 → Feb 9)
+- Includes crash_recovery entries (5 trades from Feb 5 v38 crash)
+
+---
+
 ## [2026-02-08] - Adaptive RSI: Bounce-Day Relaxation (v48)
 
 ### Summary
@@ -532,6 +765,7 @@ The signal filter applies these **8 active** checks in `apply()`:
 - `tracked_tickers_v2` - Symbols added for intraday TA updates
 - `signal_evaluations` - All signal evaluations with pass/fail + `metadata` JSONB (shadow GEX)
 - `intraday_baselines_30m` - Live bucket aggregation from firehose
+- `spot_prices_1m` - 1-min OHLCV bars for ~1,800 symbols (SIP feed, 60s cycle, 7-day retention)
 
 ### Written by ORATS Ingest (nightly)
 - `orats_daily` - Symbol-level options activity (~5,831 rows/day)
