@@ -68,9 +68,15 @@ class PositionManager:
         self,
         trader: AlpacaTrader,
         config: TradingConfig = DEFAULT_CONFIG,
+        trades_table: str = "paper_trades_log",
+        skip_dashboard: bool = False,
+        dashboard=None,
     ):
         self.trader = trader
         self.config = config
+        self.trades_table = trades_table
+        self.skip_dashboard = skip_dashboard
+        self._dashboard_override = dashboard
 
         # Active trades (symbol -> TradeRecord)
         self.active_trades: Dict[str, TradeRecord] = {}
@@ -86,6 +92,12 @@ class PositionManager:
 
         # Symbols with pending buy orders (prevents duplicate orders)
         self._pending_buys: set = set()
+
+    def _get_dashboard(self):
+        """Get the dashboard instance (override or singleton)."""
+        if self._dashboard_override is not None:
+            return self._dashboard_override
+        return get_dashboard()
 
     def reset_daily(self):
         """Reset for new trading day."""
@@ -159,11 +171,11 @@ class PositionManager:
         """
         logger.info("Syncing positions at startup (3-way reconciliation)...")
 
-        # 1. Load open trades from paper_trades_log
+        # 1. Load open trades from paper_trades_log (or paper_trades_log_b)
         db_url = os.environ.get("DATABASE_URL")
         db_trades = {}
         if db_url:
-            raw = load_open_trades_from_db(db_url)
+            raw = load_open_trades_from_db(db_url, table_name=self.trades_table)
             for t in raw:
                 db_trades[t["symbol"]] = t
             logger.info(f"Loaded {len(db_trades)} open trades from paper_trades_log")
@@ -206,6 +218,7 @@ class PositionManager:
                     pnl=0.0,
                     pnl_pct=0.0,
                     exit_reason="crash_recovery",
+                    table_name=self.trades_table,
                 )
             logger.warning(f"DB-only (no Alpaca position): {symbol} — marked closed as crash_recovery")
 
@@ -232,6 +245,7 @@ class PositionManager:
                     signal_score=0,
                     signal_rsi=0,
                     signal_notional=0,
+                    table_name=self.trades_table,
                 )
             self.active_trades[symbol] = trade
             logger.warning(f"Alpaca-only (no DB record): {symbol} "
@@ -283,6 +297,7 @@ class PositionManager:
         signal_score: int,
         signal_rsi: float,
         signal_notional: float,
+        volume_ratio: Optional[float] = None,
     ) -> Optional[TradeRecord]:
         """
         Open a new position.
@@ -365,9 +380,10 @@ class PositionManager:
             )
 
             # Update dashboard
-            dashboard = get_dashboard()
-            if dashboard.enabled:
-                dashboard.update_position(symbol, trade.entry_price, trade.entry_price, "HOLDING", score=trade.signal_score)
+            if not self.skip_dashboard:
+                dashboard = self._get_dashboard()
+                if dashboard.enabled:
+                    dashboard.update_position(symbol, trade.entry_price, trade.entry_price, "HOLDING", score=trade.signal_score)
 
             # Persist trade to DB
             db_url = os.environ.get("DATABASE_URL")
@@ -381,8 +397,11 @@ class PositionManager:
                     signal_score=trade.signal_score,
                     signal_rsi=trade.signal_rsi,
                     signal_notional=trade.signal_notional,
+                    table_name=self.trades_table,
+                    volume_ratio=volume_ratio,
                 )
-                update_signal_trade_placed(db_url, symbol, trade.entry_price)
+                if not self.skip_dashboard:
+                    update_signal_trade_placed(db_url, symbol, trade.entry_price)
 
             return trade
 
@@ -455,13 +474,14 @@ class PositionManager:
         )
 
         # Update dashboard - move to closed
-        dashboard = get_dashboard()
-        if dashboard.enabled:
-            dashboard.close_position(
-                symbol, trade.entry_price, exit_price, trade.exit_time,
-                shares=trade.shares, pnl_dollars=trade.pnl,
-                score=trade.signal_score,
-            )
+        if not self.skip_dashboard:
+            dashboard = self._get_dashboard()
+            if dashboard.enabled:
+                dashboard.close_position(
+                    symbol, trade.entry_price, exit_price, trade.exit_time,
+                    shares=trade.shares, pnl_dollars=trade.pnl,
+                    score=trade.signal_score,
+                )
 
         # Persist trade close to DB
         db_url = os.environ.get("DATABASE_URL")
@@ -475,8 +495,10 @@ class PositionManager:
                 pnl=trade.pnl,
                 pnl_pct=trade.pnl_pct,
                 exit_reason=trade.exit_reason,
+                table_name=self.trades_table,
             )
-            close_signal_in_db(db_url, symbol, exit_price, trade.pnl_pct)
+            if not self.skip_dashboard:
+                close_signal_in_db(db_url, symbol, exit_price, trade.pnl_pct)
 
         return trade
 
@@ -543,22 +565,31 @@ class PositionManager:
         }
 
     async def update_dashboard_positions(self):
-        """Update dashboard with current position prices and PnL."""
-        dashboard = get_dashboard()
+        """Update dashboard with current position prices and PnL.
+
+        Uses clear-and-rewrite to prevent stale entries (self-healing).
+        """
+        if self.skip_dashboard:
+            return
+        dashboard = self._get_dashboard()
         if not dashboard.enabled:
             return
 
         positions = await self.trader.get_positions()
+        rows = []
         for pos in positions:
             if pos.symbol in self.active_trades:
                 trade = self.active_trades[pos.symbol]
-                dashboard.update_position(
-                    symbol=pos.symbol,
-                    entry_price=trade.entry_price,
-                    current_price=pos.current_price,
-                    status="HOLDING",
-                    score=trade.signal_score,
-                )
+                pnl = ((pos.current_price - trade.entry_price) / trade.entry_price) * 100 if trade.entry_price > 0 else 0
+                rows.append([
+                    pos.symbol,
+                    trade.signal_score,
+                    f"${trade.entry_price:.2f}",
+                    f"${pos.current_price:.2f}",
+                    f"{pnl:+.2f}%",
+                    "HOLDING",
+                ])
+        dashboard.rewrite_positions(rows)
 
     def record_signal(self, passed_filter: bool):
         """Record a signal for stats."""

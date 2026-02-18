@@ -1,0 +1,248 @@
+{
+  "project": "FL3_V2",
+  "version": "1.4",
+  "created": "2026-01-28",
+  "updated": "2026-01-30",
+  "total_effort_hours": "125-185",
+  "backtest_findings": {
+    "summary": "6-month E2E backtest (Jul 2025 - Jan 2026) with production logic shows volume-only detection has NO EDGE",
+    "key_metrics": {
+      "total_signals": 455991,
+      "valid_after_filters": 400137,
+      "win_rate": "51.4%",
+      "avg_return": "+0.08%",
+      "conclusion": "Essentially random - need additional signal factors"
+    },
+    "best_performing_subset": {
+      "filter": "Large trades + Bullish + Early (4-7 AM) + >=15x ratio",
+      "count": 1250,
+      "win_rate": "54.0%",
+      "avg_return": "+0.36%",
+      "big_winners": "5.8%"
+    },
+    "key_insight": {
+      "observation": "Big winners and big losers have IDENTICAL profiles on volume metrics alone",
+      "implication": "Volume detection finds activity but cannot distinguish direction or quality",
+      "solution": "Need strike clustering, trade classification, and price context to differentiate"
+    },
+    "gap_analysis": {
+      "gapped_up_2pct": {"count": 12094, "avg_return": "+4.12%", "win_rate": "92.3%"},
+      "gapped_down_2pct": {"count": 11193, "avg_return": "-3.84%", "win_rate": "9.0%"},
+      "no_gap_yet": {"count": 105231, "avg_return": "+0.04%", "win_rate": "50.5%"},
+      "insight": "Pre-market signals predict activity but not direction - need more factors"
+    }
+  },
+  "signal_enhancement_components": [
+    {
+      "component_id": "6.2",
+      "component": "Signal Enhancement - Strike Analysis",
+      "description": "Add strike clustering and OTM concentration analysis to improve signal quality",
+      "effort_hours": "4-6",
+      "status": "PENDING",
+      "priority": "HIGH",
+      "projected_value": "+2-4% win rate improvement",
+      "data_available": true,
+      "steps": [
+        {
+          "step_id": "6.2.1",
+          "description": "Parse strike price from OCC symbol (already have underlying, expiry, call/put)",
+          "implementation": "Extend parse_option_symbol() to return strike as integer (divide by 1000)"
+        },
+        {
+          "step_id": "6.2.2",
+          "description": "Calculate moneyness: (strike - stock_price) / stock_price",
+          "implementation": "Need stock price at trade time from minute bars; classify as OTM/ATM/ITM"
+        },
+        {
+          "step_id": "6.2.3",
+          "description": "Track unique strikes per bucket and calculate strike entropy/concentration",
+          "implementation": "Low unique_strikes + high volume = concentrated bet; use entropy = -sum(p*log(p))"
+        },
+        {
+          "step_id": "6.2.4",
+          "description": "Classify flow as OTM-heavy (>70% OTM), ATM-heavy, or ITM-heavy",
+          "implementation": "OTM calls = lottery tickets (speculative); ITM = serious directional bet"
+        },
+        {
+          "step_id": "6.2.5",
+          "description": "Add metrics to backtest output: strike_concentration, otm_pct, avg_moneyness",
+          "implementation": "Extend BucketStats dataclass"
+        },
+        {
+          "step_id": "6.2.6",
+          "description": "Analyze outcomes by strike concentration and OTM percentage",
+          "implementation": "Slice analysis script"
+        }
+      ]
+    },
+    {
+      "component_id": "6.3",
+      "component": "Signal Enhancement - Trade Classification",
+      "description": "Classify trades by condition codes (sweeps vs blocks) to identify urgency",
+      "effort_hours": "3-4",
+      "status": "PENDING",
+      "priority": "HIGH",
+      "projected_value": "+2-4% win rate improvement",
+      "data_available": true,
+      "steps": [
+        {
+          "step_id": "6.3.1",
+          "description": "Parse trade condition codes from flat file (column: conditions)",
+          "implementation": "Flat file has 'conditions' column with comma-separated codes"
+        },
+        {
+          "step_id": "6.3.2",
+          "description": "Identify intermarket sweeps (condition 209) and other key conditions",
+          "implementation": "Key codes: 209=intermarket sweep, 227=qualified contingent trade"
+        },
+        {
+          "step_id": "6.3.3",
+          "description": "Track sweep count and sweep_notional per bucket",
+          "implementation": "Extend BucketStats with sweep_count, sweep_notional"
+        },
+        {
+          "step_id": "6.3.4",
+          "description": "Calculate sweep_pct = sweep_notional / total_notional",
+          "implementation": "High sweep_pct = urgency = potentially informed"
+        },
+        {
+          "step_id": "6.3.5",
+          "description": "Add metrics to backtest: sweep_count, sweep_pct, avg_trade_size",
+          "implementation": "Extend Signal dataclass"
+        },
+        {
+          "step_id": "6.3.6",
+          "description": "Analyze outcomes by sweep percentage",
+          "implementation": "Slice analysis script"
+        }
+      ]
+    },
+    {
+      "component_id": "6.4",
+      "component": "Signal Enhancement - Price Context",
+      "description": "Add basic price TA context (trend, distance from support) using stock minute bars",
+      "effort_hours": "4-6",
+      "status": "PENDING",
+      "priority": "MEDIUM",
+      "projected_value": "+3-5% win rate improvement",
+      "data_available": true,
+      "steps": [
+        {
+          "step_id": "6.4.1",
+          "description": "Load 20-day price history per symbol at signal time",
+          "implementation": "Use stock flat files; cache daily OHLC per symbol"
+        },
+        {
+          "step_id": "6.4.2",
+          "description": "Calculate 20-day high, 20-day low, 20-day SMA",
+          "implementation": "Rolling window of daily closes"
+        },
+        {
+          "step_id": "6.4.3",
+          "description": "Calculate distance_from_low = (price - 20d_low) / 20d_low",
+          "implementation": "Low value = near support = bounce potential"
+        },
+        {
+          "step_id": "6.4.4",
+          "description": "Calculate trend = 1 if price > 20d_SMA else -1",
+          "implementation": "Simple trend filter"
+        },
+        {
+          "step_id": "6.4.5",
+          "description": "Add metrics to backtest: dist_from_low, dist_from_high, trend, price_vs_sma",
+          "implementation": "Extend Signal dataclass"
+        },
+        {
+          "step_id": "6.4.6",
+          "description": "Analyze outcomes by price context buckets",
+          "implementation": "Slice analysis script"
+        }
+      ]
+    },
+    {
+      "component_id": "6.5",
+      "component": "Multi-Factor Scoring System",
+      "description": "Combine all enhanced signals into unified scoring system",
+      "effort_hours": "3-4",
+      "status": "PENDING",
+      "priority": "HIGH",
+      "depends_on": ["6.2", "6.3", "6.4"],
+      "steps": [
+        {
+          "step_id": "6.5.1",
+          "description": "Define scoring weights based on backtest analysis",
+          "implementation": "Example: early=+2, bullish=+2, high_ratio=+2, concentrated=+1, sweep=+1, uptrend=+1"
+        },
+        {
+          "step_id": "6.5.2",
+          "description": "Implement score calculation: time + direction + ratio + strike + sweep + price",
+          "implementation": "Score function in backtest engine"
+        },
+        {
+          "step_id": "6.5.3",
+          "description": "Analyze outcomes by score bucket (0-2, 3-4, 5-6, 7+)",
+          "implementation": "Validate projected win rates"
+        },
+        {
+          "step_id": "6.5.4",
+          "description": "Determine optimal score threshold for production (target: 55%+ win rate)",
+          "implementation": "May need score >= 5 or score >= 7"
+        },
+        {
+          "step_id": "6.5.5",
+          "description": "Document final scoring weights and thresholds",
+          "implementation": "config/signal_scoring.json"
+        }
+      ],
+      "target_outcomes": {
+        "score_5plus": {
+          "signals_per_day": "~400",
+          "win_rate": "55%",
+          "avg_return": "0.3%"
+        },
+        "score_7plus": {
+          "signals_per_day": "~80",
+          "win_rate": "58%",
+          "avg_return": "0.6%"
+        }
+      }
+    }
+  ],
+  "implementation_priority": [
+    {
+      "rank": 1,
+      "feature": "Strike Clustering + OTM Concentration (6.2)",
+      "effort": "4-6 hrs",
+      "data_ready": true,
+      "reason": "Easy win - OCC symbol already parsed, just need strike extraction"
+    },
+    {
+      "rank": 2,
+      "feature": "Trade Condition Classification (6.3)",
+      "effort": "3-4 hrs",
+      "data_ready": true,
+      "reason": "Condition codes in flat file, just need to parse"
+    },
+    {
+      "rank": 3,
+      "feature": "Basic Price TA (6.4)",
+      "effort": "4-6 hrs",
+      "data_ready": true,
+      "reason": "Stock minute bars already downloaded"
+    },
+    {
+      "rank": 4,
+      "feature": "Multi-Factor Scoring (6.5)",
+      "effort": "3-4 hrs",
+      "depends_on": ["6.2", "6.3", "6.4"],
+      "reason": "Combine all factors into score"
+    }
+  ],
+  "cli_commands": {
+    "build_strike_analysis": "python e2e_backtest_v2.py --enhance=strikes",
+    "build_sweep_analysis": "python e2e_backtest_v2.py --enhance=sweeps",
+    "build_price_context": "python e2e_backtest_v2.py --enhance=price",
+    "build_all_enhancements": "python e2e_backtest_v2.py --enhance=all",
+    "run_scoring": "python e2e_backtest_v2.py --score --threshold=5"
+  }
+}

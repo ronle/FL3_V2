@@ -41,6 +41,11 @@ class TradingConfig:
     ADAPTIVE_RSI_THRESHOLD: float = 60.0  # RSI threshold on bounce days (normal = RSI_THRESHOLD)
     ADAPTIVE_RSI_MIN_RED_DAYS: int = 2    # Minimum consecutive red SPY closes for bounce day
 
+    # Account B — Engulfing-Primary, V2 Score as Confirmation (A/B test)
+    USE_ACCOUNT_B: bool = True
+    ENGULFING_LOOKBACK_MINUTES: int = 30       # 5-min pattern fallback window
+    ENGULFING_DAILY_LOOKBACK_HOURS: int = 20   # Daily patterns persist overnight
+
     # Market regime filter (V28)
     USE_MARKET_REGIME_FILTER: bool = True
     MARKET_REGIME_SYMBOL: str = "SPY"  # Benchmark to check
@@ -61,7 +66,7 @@ class TradingConfig:
     # Exit rules
     EXIT_TIME: dt_time = dt_time(15, 55)  # 3:55 PM ET
     LAST_ENTRY_TIME: dt_time = dt_time(15, 50)  # No new positions after 3:50 PM
-    HARD_STOP_PCT: float = -0.05  # -5% hard stop (optional)
+    HARD_STOP_PCT: float = -0.02  # -2% hard stop — dump losers fast, free slots for winners
     USE_HARD_STOP: bool = True
 
     # Market hours (ET)
@@ -76,6 +81,12 @@ class TradingConfig:
     # Alpaca
     ALPACA_PAPER_URL: str = "https://paper-api.alpaca.markets"
     ALPACA_DATA_URL: str = "https://data.alpaca.markets/v2"
+
+    # Intraday bar collection
+    COLLECT_INTRADAY_BARS: bool = True
+    INTRADAY_BARS_MAX_BATCHES: int = 20      # 20 × 100 = 2,000 symbols (full market)
+    INTRADAY_BARS_INTERVAL_SEC: int = 60     # collect every 60 seconds
+    INTRADAY_BARS_RETENTION_DAYS: int = 21   # 21 calendar days ≈ 14 trading days
 
     # Logging
     LOG_FILE: str = "paper_trading.log"

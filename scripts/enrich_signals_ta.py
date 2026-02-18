@@ -145,6 +145,28 @@ def load_sentiment(conn, from_date: str, to_date: str) -> Dict[Tuple[str, date],
     return sentiment
 
 
+def load_orats_volume(conn, from_date: str, to_date: str) -> Dict[Tuple[str, date], dict]:
+    """Load orats_daily volume data into {(symbol, asof_date): {total_volume, volume_ema_7d, volume_ema_30d}}."""
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT symbol, asof_date, total_volume, volume_ema_7d, volume_ema_30d
+        FROM orats_daily
+        WHERE asof_date >= %s AND asof_date <= %s
+          AND total_volume IS NOT NULL
+    """, (from_date, to_date))
+
+    orats = {}
+    for row in cur.fetchall():
+        orats[(row[0], row[1])] = {
+            "total_volume": int(row[2]) if row[2] is not None else None,
+            "volume_ema_7d": int(row[3]) if row[3] is not None else None,
+            "volume_ema_30d": int(row[4]) if row[4] is not None else None,
+        }
+    cur.close()
+    print(f"  Loaded {len(orats)} orats_daily volume rows")
+    return orats
+
+
 # ---------------------------------------------------------------------------
 # TA lookup helpers
 # ---------------------------------------------------------------------------
@@ -261,25 +283,28 @@ def enrich_signals(signals: List[dict], conn, stats_only: bool = False) -> Tuple
     ta_from = (date.fromisoformat(min_date) - timedelta(days=10)).isoformat()
     ta_to = max_date
 
-    print(f"\n[1/5] Loading ta_daily_close ({ta_from} to {ta_to})...")
+    print(f"\n[1/6] Loading ta_daily_close ({ta_from} to {ta_to})...")
     ta_data = load_ta_daily(conn, ta_from, ta_to)
     trading_days = build_trading_days_index(ta_data)
 
-    print(f"\n[2/5] Loading sector mappings...")
+    print(f"\n[2/6] Loading sector mappings...")
     sectors = load_sector_map(conn)
 
-    print(f"\n[3/5] Loading earnings calendar ({min_date} to {max_date})...")
+    print(f"\n[3/6] Loading earnings calendar ({min_date} to {max_date})...")
     # Buffer earnings by ±7 days
     earn_from = (date.fromisoformat(min_date) - timedelta(days=7)).isoformat()
     earn_to = (date.fromisoformat(max_date) + timedelta(days=7)).isoformat()
     earnings = load_earnings(conn, earn_from, earn_to)
 
-    print(f"\n[4/5] Loading sentiment data ({min_date} to {max_date})...")
+    print(f"\n[4/6] Loading sentiment data ({min_date} to {max_date})...")
     # Buffer sentiment for prior-day lookups
     sent_from = (date.fromisoformat(min_date) - timedelta(days=5)).isoformat()
     sentiment = load_sentiment(conn, sent_from, max_date)
 
-    print(f"\n[5/5] Enriching {len(signals)} signals...")
+    print(f"\n[5/6] Loading orats volume data ({min_date} to {max_date})...")
+    orats_volume = load_orats_volume(conn, min_date, max_date)
+
+    print(f"\n[6/6] Enriching {len(signals)} signals...")
 
     # Stats tracking
     stats = {
@@ -290,6 +315,7 @@ def enrich_signals(signals: List[dict], conn, stats_only: bool = False) -> Tuple
         "with_sentiment": 0,
         "with_earnings": 0,
         "passing_v28": 0,
+        "with_orats_volume": 0,
         "rsi_only_rejections": 0,
         "rsi_50_60_only": 0,
         "rejection_counts": defaultdict(int),
@@ -334,6 +360,19 @@ def enrich_signals(signals: List[dict], conn, stats_only: bool = False) -> Tuple
         sig["sentiment_score"] = sent[1] if sent else None
         if sent:
             stats["with_sentiment"] += 1
+
+        # Orats volume ratios (same-day lookup)
+        orats = orats_volume.get((symbol, signal_date), {})
+        sig["total_volume"] = orats.get("total_volume")
+        sig["volume_ema_7d"] = orats.get("volume_ema_7d")
+        sig["volume_ema_30d"] = orats.get("volume_ema_30d")
+        ema7 = orats.get("volume_ema_7d")
+        ema30 = orats.get("volume_ema_30d")
+        vol = orats.get("total_volume")
+        sig["volume_vs_ema7"] = (vol / ema7) if (vol is not None and ema7 and ema7 > 0) else None
+        sig["volume_vs_ema30"] = (vol / ema30) if (vol is not None and ema30 and ema30 > 0) else None
+        if orats:
+            stats["with_orats_volume"] += 1
 
         # ETF flag
         sig["is_etf"] = symbol in ETF_EXCLUSIONS
@@ -381,6 +420,7 @@ def print_stats(stats: dict):
     print(f"Signals missing TA:      {stats['missing_ta']:,}")
     print(f"Signals with sector:     {stats['with_sector']:,}")
     print(f"Signals with sentiment:  {stats['with_sentiment']:,}")
+    print(f"Signals with orats vol:  {stats['with_orats_volume']:,} ({stats['with_orats_volume']/stats['total']*100:.1f}%)")
     print(f"Near earnings:           {stats['with_earnings']:,}")
     print()
     print("FILTER RECONSTRUCTION")

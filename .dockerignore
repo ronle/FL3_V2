@@ -41,6 +41,8 @@ htmlcov/
 # =============================================================================
 polygon_data/
 backups/
+archive/
+temp/
 context/
 .claude/
 

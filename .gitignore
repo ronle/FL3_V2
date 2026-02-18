@@ -20,6 +20,7 @@ secrets/
 # Temp files
 .tmp_*
 *.tmp
+temp/
 
 # Build artifacts
 dist/

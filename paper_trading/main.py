@@ -37,11 +37,13 @@ from paper_trading.position_manager import PositionManager
 from paper_trading.signal_filter import SignalFilter, Signal, SignalGenerator
 from paper_trading.eod_closer import EODCloser, time_until_close
 from paper_trading.trade_aggregator import TradeAggregator
-from paper_trading.dashboard import get_dashboard
+from paper_trading.dashboard import get_dashboard, Dashboard
+from paper_trading.engulfing_checker import EngulfingChecker
 
 from firehose.client import FirehoseClient, Trade
 from firehose.stock_price_monitor import StockPriceMonitor
 from firehose.bucket_aggregator import BucketAggregator
+from paper_trading.bar_collector import IntradayBarCollector
 
 ET = pytz.timezone("America/New_York")
 
@@ -76,6 +78,8 @@ class PaperTradingEngine:
         self.config = config
         self.dry_run = dry_run
         self.polygon_api_key = polygon_api_key
+        self._alpaca_api_key = alpaca_api_key
+        self._alpaca_secret_key = alpaca_secret_key
 
         # Initialize components
         self.firehose = FirehoseClient(polygon_api_key)
@@ -104,6 +108,32 @@ class PaperTradingEngine:
             on_close_complete=self._on_eod_complete,
         )
 
+        # Account B — V2 + Engulfing Pattern
+        self._account_b_enabled = False
+        self.dashboard_b = None
+        if config.USE_ACCOUNT_B:
+            alpaca_key_b = os.environ.get("ALPACA_API_KEY_B")
+            alpaca_secret_b = os.environ.get("ALPACA_SECRET_KEY_B")
+            if alpaca_key_b and alpaca_secret_b:
+                db_url = os.environ.get("DATABASE_URL")
+                self.trader_b = AlpacaTrader(alpaca_key_b, alpaca_secret_b, config)
+                self.dashboard_b = Dashboard(tab_prefix="Account B ")
+                self.position_manager_b = PositionManager(
+                    self.trader_b, config,
+                    trades_table="paper_trades_log_b",
+                    skip_dashboard=False,
+                    dashboard=self.dashboard_b,
+                )
+                self.engulfing_checker = EngulfingChecker(database_url=db_url)
+                self.eod_closer_b = EODCloser(
+                    self.position_manager_b, config,
+                    on_close_complete=self._on_eod_complete_b,
+                )
+                self._account_b_enabled = True
+                logger.info("Account B (V2 + Engulfing) initialized with dashboard")
+            else:
+                logger.warning("Account B: ALPACA keys not found, disabled")
+
         # State
         self._running = False
         self._graceful_shutdown = False
@@ -119,6 +149,10 @@ class PaperTradingEngine:
         # BucketAggregator for baseline generation (initialized in run())
         self.bucket_aggregator = None
         self._db_pool = None
+
+        # Intraday bar collector (initialized in run())
+        self.bar_collector: Optional[IntradayBarCollector] = None
+        self._bar_retention_pending = False
 
         # WebSocket health tracking (PROD-1 graceful degradation)
         self._websocket_healthy = False
@@ -231,7 +265,16 @@ class PaperTradingEngine:
             self.signal_filter.reset_stats()
             self.eod_closer.reset_daily()
             self._eod_complete = False  # Re-enable signal processing for new day
+            self._bar_retention_pending = True  # Schedule old bar cleanup
             self._last_daily_reset = today
+
+            # Account B daily reset
+            if self._account_b_enabled:
+                self.position_manager_b.reset_daily()
+                self.eod_closer_b.reset_daily()
+                self.engulfing_checker.load_daily_watchlist(
+                    lookback_hours=self.config.ENGULFING_DAILY_LOOKBACK_HOURS
+                )
 
             # Only clear dashboard if we're in pre-market (before 9:30 AM)
             # This prevents wiping data on mid-day restarts
@@ -240,6 +283,9 @@ class PaperTradingEngine:
                 if dashboard.enabled:
                     logger.info("Pre-market: clearing dashboard for new day")
                     dashboard.clear_daily()
+                if self.dashboard_b and self.dashboard_b.enabled:
+                    logger.info("Pre-market: clearing Account B dashboard for new day")
+                    self.dashboard_b.clear_daily()
             else:
                 logger.info("Mid-day restart: preserving dashboard data")
 
@@ -423,14 +469,73 @@ class PaperTradingEngine:
             await self.stock_monitor.subscribe(triggered_symbols)
 
         for symbol, stats in triggered.items():
-            # Skip if already traded or have position
-            if self.position_manager.already_traded(symbol):
+            # Check per-symbol eligibility for each account
+            a_eligible = (self.position_manager.can_open_position
+                          and not self.position_manager.already_traded(symbol)
+                          and not self.position_manager.has_position(symbol))
+            b_eligible = (self._account_b_enabled
+                          and self.position_manager_b.can_open_position
+                          and not self.position_manager_b.already_traded(symbol)
+                          and not self.position_manager_b.has_position(symbol))
+
+            # Skip if neither account can trade this symbol
+            if not a_eligible and not b_eligible:
+                # Break only if BOTH accounts are at max capacity
+                a_full = not self.position_manager.can_open_position
+                b_full = not self._account_b_enabled or not self.position_manager_b.can_open_position
+                if a_full and b_full:
+                    logger.info("All accounts at max positions, skipping signal check")
+                    break
                 continue
-            if self.position_manager.has_position(symbol):
+
+            # ── Account B: engulfing-primary, score as confirmation ──
+            # Evaluates at aggregator level — no Signal object or filter chain needed.
+            # Account B is NOT a subset of Account A (may trade symbols that fail A's RSI filter).
+            if b_eligible and stats.get("score", 0) >= self.config.SCORE_THRESHOLD:
+                has_eng, engulfing_data = self.engulfing_checker.has_engulfing_confirmation(
+                    symbol=symbol,
+                    lookback_minutes=self.config.ENGULFING_LOOKBACK_MINUTES,
+                )
+                if has_eng:
+                    vol_ratio = self.engulfing_checker.get_volume_ratio(symbol)
+                    vol_str = f"vol_ema30={vol_ratio:.1f}x" if vol_ratio else "vol_ema30=N/A"
+                    logger.info(
+                        f"ACCOUNT B TRADE: {symbol} score={stats['score']} "
+                        f"engulfing_strength={engulfing_data['pattern_strength']} "
+                        f"{vol_str}"
+                    )
+                    # Log to Account B dashboard
+                    if self.dashboard_b and self.dashboard_b.enabled:
+                        price = await self.trader_b.get_latest_price(symbol) or 0
+                        self.dashboard_b.log_signal(
+                            symbol=symbol,
+                            score=stats.get("score", 0),
+                            rsi=0,
+                            ratio=0,
+                            notional=stats.get("notional", 0),
+                            price=price,
+                            volume_ratio=vol_ratio,
+                            engulfing_strength=engulfing_data.get("pattern_strength"),
+                        )
+                    if not self.dry_run:
+                        await self.position_manager_b.open_position(
+                            symbol=symbol,
+                            signal_score=stats.get("score", 0),
+                            signal_rsi=0,  # metadata only — not used for trading
+                            signal_notional=stats.get("notional", 0),
+                            volume_ratio=vol_ratio,
+                        )
+                    else:
+                        logger.info(f"[DRY RUN] Would open Account B position: {symbol}")
+                else:
+                    logger.info(
+                        f"ACCOUNT B SKIP: {symbol} score={stats['score']} — "
+                        f"no bullish engulfing (daily or 5min)"
+                    )
+
+            # ── Account A: full filter chain (unchanged) ──
+            if not a_eligible:
                 continue
-            if not self.position_manager.can_open_position:
-                logger.info("Max positions reached, skipping signal check")
-                break
 
             # Create signal from aggregated stats (with dynamic TA fetch if needed)
             # Note: price/trend are None from aggregator - signal_filter fetches from Alpaca
@@ -465,10 +570,7 @@ class PaperTradingEngine:
             if result.passed:
                 logger.info(f"Signal passed filter: {symbol}")
 
-                if self.dry_run:
-                    logger.info(f"[DRY RUN] Would open position: {symbol}")
-                else:
-                    # Open position
+                if not self.dry_run:
                     trade = await self.position_manager.open_position(
                         symbol=signal.symbol,
                         signal_score=signal.score,
@@ -481,6 +583,8 @@ class PaperTradingEngine:
                             f"Position opened: {trade.symbol} "
                             f"{trade.shares} shares @ ${trade.entry_price:.2f}"
                         )
+                else:
+                    logger.info(f"[DRY RUN] Would open position: {symbol}")
 
     async def _check_hard_stops(self):
         """
@@ -503,6 +607,12 @@ class PaperTradingEngine:
         stopped = await self.position_manager.check_hard_stops()
         for symbol in stopped:
             logger.warning(f"Hard stop triggered (REST check): {symbol}")
+
+    def _on_eod_complete_b(self, closed_trades):
+        """Callback when Account B EOD close completes."""
+        logger.info(f"Account B EOD: closed {len(closed_trades)} positions")
+        for t in closed_trades:
+            logger.info(f"  Account B: {t.symbol} P&L: ${t.pnl:+.2f} ({t.pnl_pct:+.2f}%)")
 
     def _on_eod_complete(self, closed_trades):
         """Callback when EOD close completes."""
@@ -586,6 +696,20 @@ class PaperTradingEngine:
                 )
                 self.bucket_aggregator = BucketAggregator(db_pool=self._db_pool)
                 logger.info("BucketAggregator initialized with asyncpg pool")
+
+                # Initialize intraday bar collector
+                if self.config.COLLECT_INTRADAY_BARS:
+                    self.bar_collector = IntradayBarCollector(
+                        api_key=self._alpaca_api_key,
+                        secret_key=self._alpaca_secret_key,
+                        db_pool=self._db_pool,
+                        max_batches=self.config.INTRADAY_BARS_MAX_BATCHES,
+                    )
+                    logger.info(
+                        f"IntradayBarCollector initialized: "
+                        f"max_batches={self.config.INTRADAY_BARS_MAX_BATCHES} "
+                        f"({self.config.INTRADAY_BARS_MAX_BATCHES * 100} symbols)"
+                    )
             except Exception as e:
                 logger.warning(f"Failed to create asyncpg pool for BucketAggregator: {e}")
 
@@ -605,6 +729,18 @@ class PaperTradingEngine:
 
         # Start EOD closer
         self.eod_closer.start()
+
+        # Account B: sync positions and start EOD closer
+        if self._account_b_enabled and not self.dry_run:
+            account_b = await self.trader_b.get_account()
+            if account_b:
+                logger.info(f"Account B: ${account_b.portfolio_value:,.2f} "
+                           f"(${account_b.buying_power:,.2f} buying power)")
+            await self.position_manager_b.sync_on_startup()
+            self.eod_closer_b.start()
+            self.engulfing_checker.load_daily_watchlist(
+                lookback_hours=self.config.ENGULFING_DAILY_LOOKBACK_HOURS
+            )
 
         # Start stock price WebSocket monitor (PROD-1)
         if self.config.USE_STOCK_WEBSOCKET:
@@ -628,11 +764,13 @@ class PaperTradingEngine:
         stop_check_interval = self.config.POSITION_CHECK_INTERVAL_SEC
         subscription_update_interval = 5  # Update subscriptions every 5 seconds
         dashboard_update_interval = 30  # Update dashboard positions every 30 seconds
+        bar_collect_interval = self.config.INTRADAY_BARS_INTERVAL_SEC
 
         last_signal_check = 0
         last_stop_check = 0
         last_subscription_update = 0
         last_dashboard_update = 0
+        last_bar_collect = 0
 
         try:
             async for trade in self.firehose.stream():
@@ -658,6 +796,8 @@ class PaperTradingEngine:
                 # Periodic stop check (fallback if WebSocket missed something)
                 if now - last_stop_check >= stop_check_interval:
                     await self._check_hard_stops()
+                    if self._account_b_enabled:
+                        await self.position_manager_b.check_hard_stops()
                     last_stop_check = now
 
                 # Periodic subscription update for stock monitor
@@ -671,7 +811,40 @@ class PaperTradingEngine:
                         await self.position_manager.update_dashboard_positions()
                     except Exception as e:
                         logger.warning(f"Dashboard position update failed: {e}")
+                    if self._account_b_enabled:
+                        try:
+                            await self.position_manager_b.update_dashboard_positions()
+                        except Exception as e:
+                            logger.warning(f"Account B dashboard position update failed: {e}")
                     last_dashboard_update = now
+
+                # Periodic intraday bar collection
+                if self.bar_collector and now - last_bar_collect >= bar_collect_interval:
+                    try:
+                        if self._db_pool:
+                            async with self._db_pool.acquire() as conn:
+                                rows = await conn.fetch(
+                                    "SELECT symbol FROM tracked_tickers_v2 "
+                                    "WHERE ta_enabled = TRUE ORDER BY symbol"
+                                )
+                                symbols = [r['symbol'] for r in rows]
+                            if symbols:
+                                bars = await self.bar_collector.collect(symbols)
+                                if bars:
+                                    logger.debug(f"Collected {bars} intraday bars")
+                    except Exception as e:
+                        logger.warning(f"Intraday bar collection failed: {e}")
+                    last_bar_collect = now
+
+                # Run bar retention if flagged by daily reset
+                if self._bar_retention_pending and self.bar_collector:
+                    try:
+                        await self.bar_collector.run_retention(
+                            self.config.INTRADAY_BARS_RETENTION_DAYS
+                        )
+                    except Exception as e:
+                        logger.warning(f"Bar retention failed: {e}")
+                    self._bar_retention_pending = False
 
         except KeyboardInterrupt:
             logger.info("Shutdown requested...")
@@ -690,11 +863,18 @@ class PaperTradingEngine:
         self._running = False
         self.eod_closer.stop()
 
+        # Account B shutdown
+        if self._account_b_enabled:
+            if hasattr(self, 'eod_closer_b'):
+                self.eod_closer_b.stop()
+
         # Only close positions on intentional shutdown (KeyboardInterrupt / EOD)
         # Do NOT close on code crashes — positions are safer left open
         if self._graceful_shutdown and self._is_trading_hours() and not self.dry_run:
             logger.warning("Closing positions on graceful shutdown...")
             await self.position_manager.close_all_positions(reason="shutdown")
+            if self._account_b_enabled:
+                await self.position_manager_b.close_all_positions(reason="shutdown")
         elif not self._graceful_shutdown:
             logger.warning("Crash shutdown — preserving positions (not closing)")
 
@@ -711,12 +891,25 @@ class PaperTradingEngine:
             except Exception:
                 pass
 
+        # Flush remaining bar data and close session
+        if self.bar_collector:
+            try:
+                rows = await self.bar_collector.flush()
+                if rows:
+                    logger.info(f"Shutdown: flushed {rows} remaining bar records")
+                await self.bar_collector.close()
+                logger.info(f"Bar collector metrics: {self.bar_collector.get_metrics()}")
+            except Exception:
+                pass
+
         if self._db_pool:
             await self._db_pool.close()
             logger.info("Asyncpg pool closed")
 
         await self.firehose.disconnect()
         await self.trader.close()
+        if self._account_b_enabled and hasattr(self, 'trader_b'):
+            await self.trader_b.close()
 
         # Log final stats
         logger.info(f"Signal filter stats: {self.signal_filter.get_stats()}")
