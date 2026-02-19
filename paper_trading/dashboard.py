@@ -216,10 +216,10 @@ class Dashboard:
             # Try to update existing row
             try:
                 cell = self._positions_tab.find(symbol)
-                self._positions_tab.update(f'A{cell.row}:F{cell.row}', [row])
+                self._positions_tab.update(f'A{cell.row}:F{cell.row}', [row], value_input_option='RAW')
             except Exception:
                 # Not found, append new row
-                self._positions_tab.append_row(row, value_input_option='USER_ENTERED')
+                self._positions_tab.append_row(row, value_input_option='RAW')
 
             logger.debug(f"Dashboard: updated position {symbol} @ ${current_price:.2f}")
         except Exception as e:
@@ -239,9 +239,9 @@ class Dashboard:
             self._positions_tab.clear()
             header = ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status']
             if positions_data:
-                self._positions_tab.update('A1', [header] + positions_data, value_input_option='USER_ENTERED')
+                self._positions_tab.update('A1', [header] + positions_data, value_input_option='RAW')
             else:
-                self._positions_tab.update('A1', [header], value_input_option='USER_ENTERED')
+                self._positions_tab.update('A1', [header], value_input_option='RAW')
         except Exception as e:
             logger.warning(f"Dashboard rewrite_positions failed: {e}")
 
@@ -280,7 +280,7 @@ class Dashboard:
                 f"${pnl_dollars:+,.2f}",
                 result
             ]
-            self._closed_tab.append_row(row, value_input_option='USER_ENTERED')
+            self._closed_tab.append_row(row, value_input_option='RAW')
 
             # Remove from Positions tab
             try:

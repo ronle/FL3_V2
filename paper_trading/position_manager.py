@@ -222,36 +222,51 @@ class PositionManager:
                 )
             logger.warning(f"DB-only (no Alpaca position): {symbol} — marked closed as crash_recovery")
 
-        # Case C: Alpaca only — external trade, no DB record
-        for symbol in set(alpaca_map) - set(db_trades):
-            pos = alpaca_map[symbol]
-            self.traded_today.add(symbol)
-            trade = TradeRecord(
-                symbol=symbol,
-                entry_time=datetime.now(),
-                entry_price=pos.avg_entry_price,
-                shares=int(pos.qty),
-                signal_score=0,
-                signal_rsi=0,
-                signal_notional=0,
-            )
-            if db_url:
-                trade.trade_db_id = log_trade_open(
-                    db_url=db_url,
-                    symbol=symbol,
-                    entry_time=trade.entry_time,
-                    entry_price=trade.entry_price,
-                    shares=trade.shares,
-                    signal_score=0,
-                    signal_rsi=0,
-                    signal_notional=0,
-                    table_name=self.trades_table,
-                )
-            self.active_trades[symbol] = trade
-            logger.warning(f"Alpaca-only (no DB record): {symbol} "
-                          f"({pos.qty} shares @ ${pos.avg_entry_price:.2f}) — created DB record")
+        # Case C: Alpaca only — orphaned position, no DB record.
+        # These are positions the system lost track of (e.g., missed EOD close,
+        # DB write failure). Close them on Alpaca to prevent accumulation.
+        orphaned = set(alpaca_map) - set(db_trades)
+        if orphaned:
+            logger.warning(f"Found {len(orphaned)} orphaned Alpaca positions (no DB record): "
+                          f"{sorted(orphaned)}")
+            for symbol in orphaned:
+                pos = alpaca_map[symbol]
+                self.traded_today.add(symbol)
+                logger.warning(f"Closing orphaned position: {symbol} "
+                              f"({pos.qty} shares @ ${pos.avg_entry_price:.2f})")
+                try:
+                    order = await self.trader.close_position(symbol)
+                    if order:
+                        await asyncio.sleep(2)
+                        exit_price = order.filled_avg_price or pos.avg_entry_price
+                        pnl = (exit_price - pos.avg_entry_price) * int(pos.qty)
+                        pnl_pct = ((exit_price - pos.avg_entry_price)
+                                   / pos.avg_entry_price * 100) if pos.avg_entry_price else 0
+                        # Log to DB as crash_recovery
+                        if db_url:
+                            db_id = log_trade_open(
+                                db_url=db_url, symbol=symbol,
+                                entry_time=datetime.now(), entry_price=pos.avg_entry_price,
+                                shares=int(pos.qty), signal_score=0,
+                                signal_rsi=0, signal_notional=0,
+                                table_name=self.trades_table,
+                            )
+                            log_trade_close(
+                                db_url=db_url, trade_db_id=db_id, symbol=symbol,
+                                exit_time=datetime.now(), exit_price=exit_price,
+                                pnl=pnl, pnl_pct=pnl_pct,
+                                exit_reason="orphan_cleanup",
+                                table_name=self.trades_table,
+                            )
+                        logger.info(f"Orphaned position closed: {symbol} "
+                                   f"P&L: ${pnl:+.2f} ({pnl_pct:+.2f}%)")
+                    else:
+                        logger.error(f"Failed to close orphaned position: {symbol}")
+                except Exception as e:
+                    logger.error(f"Error closing orphaned position {symbol}: {e}")
 
         logger.info(f"Startup sync complete: {len(self.active_trades)} positions, "
+                   f"{len(orphaned)} orphaned closed, "
                    f"can_open={self.can_open_position} "
                    f"(max {self.config.MAX_CONCURRENT_POSITIONS})")
 

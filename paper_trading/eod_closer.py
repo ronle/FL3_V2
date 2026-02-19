@@ -61,8 +61,11 @@ class EODCloser:
 
         now = self._get_et_time()
 
-        # Close at or after exit time, but before market close
-        return now >= self.config.EXIT_TIME and now < self.config.MARKET_CLOSE
+        # Close at or after exit time (3:55 PM ET through end of day).
+        # Previously required now < MARKET_CLOSE, but that missed the
+        # window if the service started after 4 PM ET, leaving orphaned
+        # positions on Alpaca overnight.
+        return now >= self.config.EXIT_TIME
 
     def reset_daily(self):
         """Reset for new trading day."""

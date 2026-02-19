@@ -38,10 +38,10 @@ if not DATABASE_URL or "/cloudsql/" in DATABASE_URL:
 BASE_DIR = os.path.dirname(os.path.dirname(__file__))
 POLYGON_DIR = os.path.join(BASE_DIR, "polygon_data", "stocks")
 RESULTS_DIR = os.path.join(BASE_DIR, "backtest_results")
-SIGNAL_FILE = os.path.join(
+SIGNAL_FILE = os.environ.get("SIGNAL_FILE", os.path.join(
     BASE_DIR, "polygon_data", "backtest_results",
     "e2e_backtest_v2_strikes_sweeps_price_scored.json",
-)
+))
 
 ACCOUNT_SIZE = 100_000
 POSITION_PCT = 0.10        # 10% of account per trade

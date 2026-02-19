@@ -32,7 +32,7 @@ import re
 BASE_DIR = "C:\\Users\\levir\\Documents\\FL3_V2\\polygon_data"
 OPTIONS_DIR = os.path.join(BASE_DIR, "options")
 STOCKS_DIR = os.path.join(BASE_DIR, "stocks")
-OUTPUT_DIR = os.path.join(BASE_DIR, "backtest_results")
+OUTPUT_DIR = os.environ.get("BACKTEST_OUTPUT_DIR", os.path.join(BASE_DIR, "backtest_results"))
 
 BUCKET_MINUTES = 30
 BASELINE_LOOKBACK_DAYS = 20
