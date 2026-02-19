@@ -51,11 +51,10 @@ class TradingConfig:
     MARKET_REGIME_SYMBOL: str = "SPY"  # Benchmark to check
     MARKET_REGIME_MAX_DECLINE: float = -0.005  # -0.5% from open = pause entries
 
-    # Stock WebSocket (PROD-1)
-    # NOTE: Polygon stocks WebSocket provides 15-min delayed data on Stocks Starter plan.
-    # Options Advanced plan provides real-time data (used for T.* firehose).
-    # Stock WebSocket disabled - using Alpaca REST API for real-time position monitoring instead.
-    USE_STOCK_WEBSOCKET: bool = False  # Disabled due to 15-min delay on Starter plan
+    # Stock WebSocket (PROD-1) — Alpaca SIP real-time stream
+    # Upgraded to Algo Trader Plus plan: real-time SIP trades+quotes via wss://stream.data.alpaca.markets/v2/sip
+    # Currently disabled — enable after live testing to replace 30s REST polling for hard stop detection.
+    USE_STOCK_WEBSOCKET: bool = True  # Real-time SIP trades+quotes for event-driven hard stop detection
     WEBSOCKET_FALLBACK_TO_REST: bool = True  # Fall back to REST if WebSocket fails
     WEBSOCKET_MAX_RECONNECT_ATTEMPTS: int = 3  # Max reconnect attempts before fallback
 

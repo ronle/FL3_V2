@@ -43,13 +43,12 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-02-18_
+_Last updated: 2026-02-19 14:59 PST_
 
-- Account B deployed to Cloud Run and actively trading (revision `paper-trading-live-00089-d86`)
-- Account A healthy with 10 positions, Account B filled 10 slots on first cycle
-- Dashboard tabs live: "Account B Signals", "Account B Positions", "Account B Closed"
-- Fixed: engulfing checker DB connection (`.strip()`), signal log format (string not float), Cloud Run traffic routing (`--to-latest`)
-- Options flat file download running for 2023-2024 data (PID 143320)
+- **v53a deployed** — Alpaca SIP WebSocket enabled for real-time hard stop detection (revision `paper-trading-live-00093-tlf`)
+- Hard stops now event-driven (sub-second latency) via `wss://stream.data.alpaca.markets/v2/sip`, 30s REST polling as backup
+- Account B deployed and actively trading
+- **3-year backtest validated**: 559 trades, +17.1%, Sharpe 2.26, PF 1.47, max DD 2.5%
 
 ---
 

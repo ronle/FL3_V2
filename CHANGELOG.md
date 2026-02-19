@@ -2,6 +2,141 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-19 14:59 PST] — v53a: Alpaca SIP WebSocket for Real-Time Hard Stops
+
+### Done
+- Rewrote `firehose/stock_price_monitor.py` from Polygon stocks WS (15-min delayed) to Alpaca SIP WS (real-time)
+  - URL: `wss://socket.polygon.io/stocks` → `wss://stream.data.alpaca.markets/v2/sip`
+  - Auth: Polygon API key → Alpaca key+secret pair
+  - Subscriptions: channel-prefix format (`T.AAPL`) → array format (`{"trades":["AAPL"]}`)
+  - Message parsing: `ev` field → `T` field, `sym` → `S`, unix-ms timestamps → RFC-3339 parsing
+  - Added `_parse_timestamp()` for RFC-3339 → unix ms conversion
+  - Added handling for `subscription` confirmation and `error` messages
+- Enabled `USE_STOCK_WEBSOCKET = True` in config.py
+- Updated `main.py` constructor to pass Alpaca creds instead of Polygon key
+- Fixed standalone test at bottom of `main.py` (was still using `StockPriceMonitor(polygon_key)`)
+- Made `start()` always launch retry loop — initial connection failure is no longer permanent
+- Removed premature `_websocket_enabled = False` on initial failure (retry loop handles it)
+- Updated `scripts/test_stock_websocket.py` with dynamic subscribe/unsubscribe test
+- Local test passed: 33 trades, 4 quotes, dynamic sub/unsub all working (after hours)
+
+### Deployment
+- **v53** (revision 00092-v2v): Auth failed with `{"T":"error","code":500}` — concurrent connection conflict during revision handoff (old revision still alive)
+- **v53a** (revision 00093-tlf): Connected + authenticated + real-time prices enabled. Fix: `start()` now always launches retry loop so transient failures self-heal
+
+### State
+- Alpaca SIP WebSocket connected and healthy on prod (revision `paper-trading-live-00093-tlf`)
+- Hard stops now event-driven (sub-second) via WebSocket, with 30s REST polling as backup safety net
+- Image: `paper-trading:v53a`
+
+### Next
+- Monitor during next market session to confirm trades/quotes flow and hard stops fire via WS path
+- Consider subscribing Account B positions to the same WebSocket monitor
+
+### Files Changed
+- `firehose/stock_price_monitor.py` — full rewrite (Polygon → Alpaca SIP)
+- `paper_trading/main.py` — Alpaca creds to monitor, removed permanent WS disable on failure
+- `paper_trading/config.py` — `USE_STOCK_WEBSOCKET = True`, updated comments
+- `scripts/test_stock_websocket.py` — rewritten for Alpaca + dynamic sub/unsub test
+
+## [2026-02-19 14:15 PST] — Account B 3-Year Backtest Validation
+
+### Done
+- Backfilled `orats_daily_returns` for 2023 (1,460,104 rows computed from stock_price via LEAD() window function)
+- Ran close-to-close backtest (r_p1) across 11 scenarios — all profitable, best Sharpe 6.89 (score >= 0.65)
+- Ran intraday backtest with 1-min Polygon bars on engulfing-only signals — catastrophic (-$273K, 4% WR), proving engulfing alone is not tradable without UOA timing
+- Replayed full UOA pipeline on 770 options files (Jan 2023 - Jan 2026, ~4.5 hours) → 2.3M signals, 9,746 score >= 10
+- Ran 3-year realistic Account B sim (UOA + engulfing + 1-min bars): 559 trades, +17.1%, Sharpe 2.26, PF 1.47, max DD 2.5%
+
+### Key Findings
+- Close-to-close returns are misleading for intraday strategies (overnight gap + invisible stop-outs)
+- Engulfing alone at market open = catastrophic (34.7% hard stop rate, 4% WR)
+- UOA + Engulfing + intraday sim = consistent edge across all 3 years (50.1% WR, +0.29%/trade avg)
+- Strategy degrades gracefully — worst month was -$1,395 (Sep 2023), no blowups
+
+### State
+- 3-year backtest complete and validated
+- Live Account B architecture confirmed correct
+
+### Next
+- Consider replaying with different score thresholds (score >= 8) for more volume
+- Investigate 2023 weakness vs 2025 strength — market regime or data quality?
+- Update ACCOUNT_B_BACKTEST_STATUS.md with full 3-year results
+
+### Files Changed
+- `scripts/backfill_returns_2023.py` (new — backfill 2023 forward returns)
+- `scripts/backtest_account_b_historical.py` (new — close-to-close multi-scenario backtest)
+- `scripts/backtest_account_b_intraday.py` (new — intraday 1-min bar backtest)
+- `scripts/backtest_account_b_sim.py` (modified — SIGNAL_FILE env var override)
+- `archive/scripts/e2e_backtest_v2.py` (modified — BACKTEST_OUTPUT_DIR env var)
+- `D:\backtest_results\e2e_backtest_v2_strikes_sweeps_price_scored.json` (new — 1.6GB, 3-year signals)
+- `backtest_results/account_b_trades.csv` (updated — 559 trades, 3-year)
+- `backtest_results/account_b_equity.csv` (updated — 3-year equity curve)
+- `backtest_results/account_b_historical_hardstop.json` (new — close-to-close results)
+- `backtest_results/account_b_intraday_score0.65.json` (new — intraday engulfing-only results)
+
+---
+
+## [2026-02-19 12:05 PST] — v53b: Dashboard P/L formatting fix
+
+### Done
+- **Root cause:** Google Sheets `clear()` clears cell values but NOT formatting. When `rewrite_positions` writes `"+8.78%"` with `USER_ENTERED` mode, Sheets interprets it as numeric 0.0878. If the cell retains "Number" format from a prior write, it displays `0.0878` instead of `8.78%`.
+- **Fix (dashboard.py):** Switched from `USER_ENTERED` to `RAW` value_input_option for all data writes in `rewrite_positions`, `update_position`, and `close_position`. Headers and signals left as `USER_ENTERED` (no percentage values).
+- **Deploy:** Revision `paper-trading-live-00091-snb`, image `paper-trading:v53b-sheet-format`
+- **Verified:** Startup clean — Account A: 10 positions/0 orphans, Account B: 10 positions/0 orphans, zero errors
+
+### State
+- Service healthy on revision 00091-snb
+- EOD close at 3:55 PM ET (~50 min)
+
+### Next
+- Monitor today's EOD close to verify both accounts liquidate properly
+
+### Files Changed
+- `paper_trading/dashboard.py` — RAW mode for P/L sheet writes
+
+---
+
+## [2026-02-19 11:48 PST] — v53: Orphan position cleanup + EOD closer fix
+
+### Done
+- **Root cause:** Account B had 25 positions on Alpaca (15 orphaned from missed EOD closes + 10 today). The EOD closer's `should_close()` required `now < MARKET_CLOSE` (4 PM ET), so if the service started after 4 PM, the close window was permanently missed. Orphaned Alpaca positions accumulated across days while the in-memory `active_trades` dict had no idea they existed.
+- **Fix 1 (eod_closer.py):** Removed `now < MARKET_CLOSE` constraint from `should_close()`. Now triggers at EXIT_TIME (3:55 PM ET) or any time after, until `_closed_today` is set. Prevents missed windows.
+- **Fix 2 (position_manager.py):** `sync_on_startup()` Case C (Alpaca-only positions with no DB record) now **closes orphaned positions** on Alpaca instead of adopting them. Logs each as `orphan_cleanup` in DB.
+- **Deploy:** Revision `paper-trading-live-00090-hmz`, image `paper-trading:v53-orphan-fix`
+- **Result:** Account B sync closed 15 orphaned positions (OMER, CACC, MDGL, TDW, WH, RDY, SDY, BITI, RELY, IJH, LCII, OXY, TRMD, FAS, UUP). Account A had 0 orphans. Both accounts now at 10 positions each.
+
+### State
+- Service healthy on revision 00091-snb (updated to v53b)
+
+### Next
+- Monitor EOD close
+
+### Files Changed
+- `paper_trading/eod_closer.py` — expanded `should_close()` window
+- `paper_trading/position_manager.py` — orphan cleanup in `sync_on_startup()`
+
+---
+
+## [2026-02-18 13:10 PST] — Account B dashboard headers fix
+
+### Done
+- Inserted missing header rows into Account B Google Sheets tabs (Signals + Closed)
+- Positions tab already had headers (self-healing via `rewrite_positions()`)
+- One-off script: `temp/fix_account_b_headers.py`
+
+### State
+- All three Account B tabs now have correct headers
+- Headers will auto-refresh tomorrow via `clear_daily()` at market open
+
+### Next
+- Monitor Account B EOD close (~3:55 PM ET)
+
+### Files Changed
+- `temp/fix_account_b_headers.py` (new, one-off)
+
+---
+
 ## [2026-02-18] - Account B Cloud Run Deploy + Critical Fixes (v52)
 
 ### Summary

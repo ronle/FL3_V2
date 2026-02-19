@@ -1,7 +1,7 @@
 """
 Stock Price WebSocket Monitor (PROD-1)
 
-Real-time stock price monitoring via Polygon WebSocket for:
+Real-time stock price monitoring via Alpaca SIP WebSocket for:
 - Pre-entry price validation
 - Hard stop monitoring
 - Intraday signal triggers
@@ -18,7 +18,7 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Callable, Dict, List, Optional, Set
 
 import websockets
@@ -26,7 +26,7 @@ from websockets.exceptions import ConnectionClosed
 
 logger = logging.getLogger(__name__)
 
-POLYGON_STOCKS_WS_URL = "wss://socket.polygon.io/stocks"
+ALPACA_SIP_WS_URL = "wss://stream.data.alpaca.markets/v2/sip"
 RECONNECT_DELAYS = [1, 2, 5, 10, 30, 60]
 
 
@@ -120,13 +120,13 @@ QuoteCallback = Callable[[StockQuote], None]
 
 class StockPriceMonitor:
     """
-    Real-time stock price monitor using Polygon WebSocket.
+    Real-time stock price monitor using Alpaca SIP WebSocket.
 
     Supports dynamic subscription management for monitoring
     active positions and signal candidates.
 
     Usage:
-        monitor = StockPriceMonitor(api_key)
+        monitor = StockPriceMonitor(api_key, secret_key)
         monitor.on_price_update = lambda sym, price, ts: print(f"{sym}: ${price}")
 
         await monitor.start()
@@ -142,18 +142,12 @@ class StockPriceMonitor:
     def __init__(
         self,
         api_key: str,
+        secret_key: str,
         subscribe_trades: bool = True,
         subscribe_quotes: bool = True,
     ):
-        """
-        Initialize stock price monitor.
-
-        Args:
-            api_key: Polygon API key
-            subscribe_trades: Subscribe to trade updates (T.*)
-            subscribe_quotes: Subscribe to quote updates (Q.*)
-        """
         self.api_key = api_key
+        self.secret_key = secret_key
         self.subscribe_trades = subscribe_trades
         self.subscribe_quotes = subscribe_quotes
 
@@ -209,8 +203,9 @@ class StockPriceMonitor:
         """
         Start the monitor and connect to WebSocket.
 
-        Returns:
-            True if connected successfully
+        Always starts the receive loop (which handles reconnection).
+        Returns True if the initial connection succeeded, False if it will
+        keep retrying in the background.
         """
         if self._running:
             logger.warning("Monitor already running")
@@ -219,12 +214,13 @@ class StockPriceMonitor:
         self._running = True
         success = await self._connect()
 
+        # Always start receive loop — it handles reconnection on transient failures
+        self._receive_task = asyncio.create_task(self._receive_loop())
+
         if success:
-            # Start receive loop
-            self._receive_task = asyncio.create_task(self._receive_loop())
             logger.info("Stock price monitor started")
         else:
-            self._running = False
+            logger.warning("Initial connection failed — receive loop will retry")
 
         return success
 
@@ -279,31 +275,29 @@ class StockPriceMonitor:
                 logger.info(f"Queued subscription for {len(new_symbols)} symbols (not connected)")
                 return True
 
-            # Build subscription message
-            channels = []
-            for sym in new_symbols:
-                if self.subscribe_trades:
-                    channels.append(f"T.{sym}")
-                if self.subscribe_quotes:
-                    channels.append(f"Q.{sym}")
+            # Build Alpaca subscription message
+            msg = {"action": "subscribe"}
+            sym_list = sorted(new_symbols)
+            if self.subscribe_trades:
+                msg["trades"] = sym_list
+            if self.subscribe_quotes:
+                msg["quotes"] = sym_list
 
-            if channels:
-                msg = {"action": "subscribe", "params": ",".join(channels)}
-                try:
-                    await self._ws.send(json.dumps(msg))
-                    self._subscribed_symbols.update(new_symbols)
-                    self.metrics.symbols_subscribed = len(self._subscribed_symbols)
+            try:
+                await self._ws.send(json.dumps(msg))
+                self._subscribed_symbols.update(new_symbols)
+                self.metrics.symbols_subscribed = len(self._subscribed_symbols)
 
-                    # Initialize price state
-                    for sym in new_symbols:
-                        if sym not in self._prices:
-                            self._prices[sym] = StockPrice(symbol=sym)
+                # Initialize price state
+                for sym in new_symbols:
+                    if sym not in self._prices:
+                        self._prices[sym] = StockPrice(symbol=sym)
 
-                    logger.info(f"Subscribed to {len(new_symbols)} symbols: {new_symbols}")
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to subscribe: {e}")
-                    return False
+                logger.info(f"Subscribed to {len(new_symbols)} symbols: {new_symbols}")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to subscribe: {e}")
+                return False
 
         return True
 
@@ -331,30 +325,28 @@ class StockPriceMonitor:
                 self._subscribed_symbols -= to_remove
                 return True
 
-            # Build unsubscription message
-            channels = []
-            for sym in to_remove:
-                if self.subscribe_trades:
-                    channels.append(f"T.{sym}")
-                if self.subscribe_quotes:
-                    channels.append(f"Q.{sym}")
+            # Build Alpaca unsubscription message
+            msg = {"action": "unsubscribe"}
+            sym_list = sorted(to_remove)
+            if self.subscribe_trades:
+                msg["trades"] = sym_list
+            if self.subscribe_quotes:
+                msg["quotes"] = sym_list
 
-            if channels:
-                msg = {"action": "unsubscribe", "params": ",".join(channels)}
-                try:
-                    await self._ws.send(json.dumps(msg))
-                    self._subscribed_symbols -= to_remove
-                    self.metrics.symbols_subscribed = len(self._subscribed_symbols)
+            try:
+                await self._ws.send(json.dumps(msg))
+                self._subscribed_symbols -= to_remove
+                self.metrics.symbols_subscribed = len(self._subscribed_symbols)
 
-                    # Optionally clear price state
-                    for sym in to_remove:
-                        self._prices.pop(sym, None)
+                # Optionally clear price state
+                for sym in to_remove:
+                    self._prices.pop(sym, None)
 
-                    logger.info(f"Unsubscribed from {len(to_remove)} symbols")
-                    return True
-                except Exception as e:
-                    logger.error(f"Failed to unsubscribe: {e}")
-                    return False
+                logger.info(f"Unsubscribed from {len(to_remove)} symbols")
+                return True
+            except Exception as e:
+                logger.error(f"Failed to unsubscribe: {e}")
+                return False
 
         return True
 
@@ -384,39 +376,46 @@ class StockPriceMonitor:
         return success
 
     async def _connect(self) -> bool:
-        """Connect and authenticate to WebSocket."""
+        """Connect and authenticate to Alpaca SIP WebSocket."""
         try:
             self._ws = await websockets.connect(
-                POLYGON_STOCKS_WS_URL,
+                ALPACA_SIP_WS_URL,
                 ping_interval=30,
                 ping_timeout=10,
                 close_timeout=5,
             )
 
             # Receive connected message
+            # Alpaca sends: [{"T":"success","msg":"connected"}]
             response = await self._ws.recv()
             data = json.loads(response)
 
-            if isinstance(data, list) and data[0].get("status") == "connected":
-                logger.info("Connected to Polygon stocks WebSocket")
-                self._connected = True
+            if isinstance(data, list) and len(data) > 0:
+                first = data[0]
+                if first.get("T") == "success" and first.get("msg") == "connected":
+                    logger.info("Connected to Alpaca SIP WebSocket")
+                    self._connected = True
+                else:
+                    logger.warning(f"Unexpected connection response: {response[:200]}")
+                    return False
             else:
-                logger.warning(f"Unexpected connection response: {response[:100]}")
+                logger.warning(f"Unexpected connection response: {response[:200]}")
                 return False
 
             # Authenticate
-            auth_msg = {"action": "auth", "params": self.api_key}
+            # Alpaca expects: {"action":"auth","key":"...","secret":"..."}
+            auth_msg = {"action": "auth", "key": self.api_key, "secret": self.secret_key}
             await self._ws.send(json.dumps(auth_msg))
 
             # Wait for auth response
+            # Alpaca sends: [{"T":"success","msg":"authenticated"}]
             response = await self._ws.recv()
             data = json.loads(response)
 
             auth_success = False
             if isinstance(data, list):
                 for msg in data:
-                    status = (msg.get("status") or msg.get("message") or "").lower()
-                    if "auth_success" in status or "authenticated" in status:
+                    if msg.get("T") == "success" and msg.get("msg") == "authenticated":
                         auth_success = True
                         break
 
@@ -497,9 +496,9 @@ class StockPriceMonitor:
                 return
 
             for item in data:
-                ev = item.get("ev")
+                msg_type = item.get("T")
 
-                if ev == "T":  # Trade
+                if msg_type == "t":  # Trade
                     trade = self._parse_trade(item)
                     if trade:
                         self._update_price_from_trade(trade)
@@ -508,7 +507,7 @@ class StockPriceMonitor:
                         if self.on_trade:
                             self.on_trade(trade)
 
-                elif ev == "Q":  # Quote
+                elif msg_type == "q":  # Quote
                     quote = self._parse_quote(item)
                     if quote:
                         self._update_price_from_quote(quote)
@@ -517,22 +516,40 @@ class StockPriceMonitor:
                         if self.on_quote:
                             self.on_quote(quote)
 
-                elif ev == "status":
-                    logger.debug(f"Status message: {item.get('message')}")
+                elif msg_type == "success":
+                    logger.debug(f"Success message: {item.get('msg')}")
+
+                elif msg_type == "subscription":
+                    trades = item.get("trades", [])
+                    quotes = item.get("quotes", [])
+                    logger.info(f"Subscription confirmed — trades: {len(trades)}, quotes: {len(quotes)}")
+
+                elif msg_type == "error":
+                    logger.error(f"Alpaca WS error: code={item.get('code')} msg={item.get('msg')}")
 
         except json.JSONDecodeError:
             logger.warning(f"Invalid JSON: {message[:100]}")
         except Exception as e:
             logger.error(f"Error processing message: {e}")
 
+    def _parse_timestamp(self, ts_str: str) -> int:
+        """Parse Alpaca RFC-3339 timestamp to unix ms."""
+        # Alpaca sends e.g. "2026-02-19T14:30:00.123456Z"
+        # Python 3.11+ handles fromisoformat with Z
+        try:
+            dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return 0
+
     def _parse_trade(self, data: dict) -> Optional[StockTrade]:
-        """Parse a trade message."""
+        """Parse an Alpaca trade message."""
         try:
             return StockTrade(
-                symbol=data.get("sym", ""),
+                symbol=data.get("S", ""),
                 price=float(data.get("p", 0)),
                 size=int(data.get("s", 0)),
-                timestamp=int(data.get("t", 0)),
+                timestamp=self._parse_timestamp(data.get("t", "")),
                 conditions=data.get("c", []),
                 exchange=data.get("x", 0),
             )
@@ -541,15 +558,15 @@ class StockPriceMonitor:
             return None
 
     def _parse_quote(self, data: dict) -> Optional[StockQuote]:
-        """Parse a quote message."""
+        """Parse an Alpaca quote message."""
         try:
             return StockQuote(
-                symbol=data.get("sym", ""),
+                symbol=data.get("S", ""),
                 bid=float(data.get("bp", 0)),
                 bid_size=int(data.get("bs", 0)),
                 ask=float(data.get("ap", 0)),
                 ask_size=int(data.get("as", 0)),
-                timestamp=int(data.get("t", 0)),
+                timestamp=self._parse_timestamp(data.get("t", "")),
             )
         except Exception as e:
             logger.warning(f"Failed to parse quote: {e}")

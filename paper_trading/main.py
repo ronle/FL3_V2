@@ -87,7 +87,8 @@ class PaperTradingEngine:
 
         # Stock price monitor for real-time prices (PROD-1)
         self.stock_monitor = StockPriceMonitor(
-            api_key=polygon_api_key,
+            api_key=alpaca_api_key,
+            secret_key=alpaca_secret_key,
             subscribe_trades=True,
             subscribe_quotes=True,
         )
@@ -743,19 +744,16 @@ class PaperTradingEngine:
             )
 
         # Start stock price WebSocket monitor (PROD-1)
+        # Always starts receive loop with retry — initial failure is non-fatal
         if self.config.USE_STOCK_WEBSOCKET:
-            logger.info("Starting stock price WebSocket monitor...")
+            logger.info("Starting stock price WebSocket monitor (Alpaca SIP)...")
             stock_monitor_started = await self.stock_monitor.start()
             if stock_monitor_started:
                 self._websocket_healthy = True
                 logger.info("Stock price WebSocket connected - real-time prices enabled")
             else:
                 self._websocket_healthy = False
-                if self.config.WEBSOCKET_FALLBACK_TO_REST:
-                    logger.warning("Stock WebSocket failed to connect - using REST fallback")
-                    self._websocket_enabled = False
-                else:
-                    logger.error("Stock WebSocket failed and fallback is disabled!")
+                logger.warning("Stock WebSocket initial connect failed - retry loop active, REST fallback until connected")
         else:
             logger.info("Stock WebSocket disabled by config - using REST polling")
 
@@ -1023,9 +1021,9 @@ async def main():
         finally:
             await firehose.disconnect()
 
-        # Test stock price WebSocket
-        logger.info("\n3. Testing Stock Price WebSocket...")
-        stock_monitor = StockPriceMonitor(polygon_key)
+        # Test stock price WebSocket (Alpaca SIP)
+        logger.info("\n3. Testing Stock Price WebSocket (Alpaca SIP)...")
+        stock_monitor = StockPriceMonitor(alpaca_key, alpaca_secret)
 
         try:
             started = await stock_monitor.start()
