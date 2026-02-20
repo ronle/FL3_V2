@@ -160,6 +160,10 @@ class PaperTradingEngine:
         self._websocket_enabled = config.USE_STOCK_WEBSOCKET
         self._websocket_reconnect_failures = 0
 
+        # Hard stop debounce — prevent duplicate close tasks for same symbol
+        self._closing_symbols: set = set()
+        self._closing_symbols_b: set = set()
+
     def _get_et_now(self) -> datetime:
         """Get current time in ET."""
         return datetime.now(ET)
@@ -184,12 +188,12 @@ class PaperTradingEngine:
             trade = self.position_manager.active_trades[symbol]
             pnl_pct = (price - trade.entry_price) / trade.entry_price
 
-            if pnl_pct <= self.config.HARD_STOP_PCT:
+            if pnl_pct <= self.config.HARD_STOP_PCT and symbol not in self._closing_symbols:
                 logger.warning(
                     f"HARD STOP triggered via WebSocket: {symbol} "
                     f"@ ${price:.2f} ({pnl_pct*100:.1f}%)"
                 )
-                # Schedule async close
+                self._closing_symbols.add(symbol)
                 asyncio.create_task(self._async_hard_stop(symbol))
 
         # Check hard stop for Account B
@@ -199,16 +203,18 @@ class PaperTradingEngine:
             trade_b = self.position_manager_b.active_trades[symbol]
             pnl_pct_b = (price - trade_b.entry_price) / trade_b.entry_price
 
-            if pnl_pct_b <= self.config.HARD_STOP_PCT:
+            if pnl_pct_b <= self.config.HARD_STOP_PCT and symbol not in self._closing_symbols_b:
                 logger.warning(
                     f"ACCOUNT B HARD STOP triggered via WebSocket: {symbol} "
                     f"@ ${price:.2f} ({pnl_pct_b*100:.1f}%)"
                 )
+                self._closing_symbols_b.add(symbol)
                 asyncio.create_task(self._async_hard_stop_b(symbol))
 
     async def _async_hard_stop(self, symbol: str):
         """Execute hard stop asynchronously."""
         if self.dry_run:
+            self._closing_symbols.discard(symbol)
             logger.info(f"[DRY RUN] Would close {symbol} for hard stop")
             return
 
@@ -218,10 +224,13 @@ class PaperTradingEngine:
                 logger.info(f"Hard stop executed: {symbol} P&L: ${trade.pnl:+.2f}")
         except Exception as e:
             logger.error(f"Hard stop execution failed for {symbol}: {e}")
+        finally:
+            self._closing_symbols.discard(symbol)
 
     async def _async_hard_stop_b(self, symbol: str):
         """Execute hard stop for Account B asynchronously."""
         if self.dry_run:
+            self._closing_symbols_b.discard(symbol)
             logger.info(f"[DRY RUN] Would close Account B {symbol} for hard stop")
             return
 
@@ -231,6 +240,8 @@ class PaperTradingEngine:
                 logger.info(f"Account B hard stop executed: {symbol} P&L: ${trade.pnl:+.2f}")
         except Exception as e:
             logger.error(f"Account B hard stop execution failed for {symbol}: {e}")
+        finally:
+            self._closing_symbols_b.discard(symbol)
 
     def get_realtime_price(self, symbol: str) -> Optional[float]:
         """Get real-time price from WebSocket cache."""

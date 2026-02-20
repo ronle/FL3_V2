@@ -43,10 +43,12 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-02-19 14:59 PST_
+_Last updated: 2026-02-20 11:10 PST_
 
-- **v53a deployed** — Alpaca SIP WebSocket enabled for real-time hard stop detection (revision `paper-trading-live-00093-tlf`)
-- Hard stops now event-driven (sub-second latency) via `wss://stream.data.alpaca.markets/v2/sip`, 30s REST polling as backup
+- **v54d deployed** — Race condition bulletproofed, dashboard formatting fixed, GEX cache restored (revision `paper-trading-live-00098-twj`)
+- Three-layer hard stop race defense: main.py debounce → position_manager guard → safe pop
+- All dashboard writes use `USER_ENTERED` mode for consistent formatting
+- GEX cache loading successfully (6,797 symbols) after DATABASE_URL `.strip()` fix
 - Account B deployed and actively trading
 - **3-year backtest validated**: 559 trades, +17.1%, Sharpe 2.26, PF 1.47, max DD 2.5%
 

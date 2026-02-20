@@ -93,6 +93,9 @@ class PositionManager:
         # Symbols with pending buy orders (prevents duplicate orders)
         self._pending_buys: set = set()
 
+        # Symbols with close in progress (prevents WS + REST race)
+        self._closing_in_progress: set = set()
+
     def _get_dashboard(self):
         """Get the dashboard instance (override or singleton)."""
         if self._dashboard_override is not None:
@@ -105,6 +108,7 @@ class PositionManager:
         self.daily_stats = DailyStats(date=date.today())
         self.traded_today = set()
         self._pending_buys = set()
+        self._closing_in_progress = set()
         logger.info("Position manager reset for new day")
 
     @property
@@ -433,89 +437,100 @@ class PositionManager:
         Close a position.
 
         Returns completed TradeRecord if successful.
+        Guards against concurrent close attempts (WS + REST race).
         """
         if symbol not in self.active_trades:
             logger.warning(f"No active trade for {symbol}")
             return None
 
-        trade = self.active_trades[symbol]
+        # Prevent concurrent close for the same symbol
+        if symbol in self._closing_in_progress:
+            logger.info(f"Close already in progress for {symbol}, skipping duplicate")
+            return None
+        self._closing_in_progress.add(symbol)
 
-        # Get current position to verify
-        position = await self.trader.get_position(symbol)
-        if not position:
-            # Position already closed
-            logger.warning(f"Position {symbol} already closed")
+        try:
+            trade = self.active_trades[symbol]
+
+            # Get current position to verify
+            position = await self.trader.get_position(symbol)
+            if not position:
+                # Position already closed
+                logger.warning(f"Position {symbol} already closed")
+                self.active_trades.pop(symbol, None)
+                return None
+
+            # Close position
+            order = await self.trader.close_position(symbol)
+            if not order:
+                logger.error(f"Failed to close position {symbol}")
+                return None
+
+            # Wait for fill
+            await asyncio.sleep(2)
+
+            # Get exit price
+            exit_price = order.filled_avg_price
+            if not exit_price:
+                # Try to get from latest trade
+                latest = await self.trader.get_latest_price(symbol)
+                exit_price = latest or trade.entry_price
+
+            # Update trade record
+            trade.exit_time = datetime.now()
+            trade.exit_price = exit_price
+            trade.exit_reason = reason
+            trade.pnl = (trade.exit_price - trade.entry_price) * trade.shares
+            trade.pnl_pct = (trade.exit_price - trade.entry_price) / trade.entry_price * 100
+
+            # Move to completed
             self.active_trades.pop(symbol, None)
-            return None
+            self.completed_trades.append(trade)
 
-        # Close position
-        order = await self.trader.close_position(symbol)
-        if not order:
-            logger.error(f"Failed to close position {symbol}")
-            return None
+            # Update stats
+            self.daily_stats.trades_exited += 1
+            self.daily_stats.total_pnl += trade.pnl
+            if trade.pnl > 0:
+                self.daily_stats.winning_trades += 1
+            else:
+                self.daily_stats.losing_trades += 1
 
-        # Wait for fill
-        await asyncio.sleep(2)
-
-        # Get exit price
-        exit_price = order.filled_avg_price
-        if not exit_price:
-            # Try to get from latest trade
-            latest = await self.trader.get_latest_price(symbol)
-            exit_price = latest or trade.entry_price
-
-        # Update trade record
-        trade.exit_time = datetime.now()
-        trade.exit_price = exit_price
-        trade.exit_reason = reason
-        trade.pnl = (trade.exit_price - trade.entry_price) * trade.shares
-        trade.pnl_pct = (trade.exit_price - trade.entry_price) / trade.entry_price * 100
-
-        # Move to completed
-        self.active_trades.pop(symbol)
-        self.completed_trades.append(trade)
-
-        # Update stats
-        self.daily_stats.trades_exited += 1
-        self.daily_stats.total_pnl += trade.pnl
-        if trade.pnl > 0:
-            self.daily_stats.winning_trades += 1
-        else:
-            self.daily_stats.losing_trades += 1
-
-        logger.info(
-            f"Closed position: {symbol} @ ${exit_price:.2f} "
-            f"P&L: ${trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%) [{reason}]"
-        )
-
-        # Update dashboard - move to closed
-        if not self.skip_dashboard:
-            dashboard = self._get_dashboard()
-            if dashboard.enabled:
-                dashboard.close_position(
-                    symbol, trade.entry_price, exit_price, trade.exit_time,
-                    shares=trade.shares, pnl_dollars=trade.pnl,
-                    score=trade.signal_score,
-                )
-
-        # Persist trade close to DB
-        db_url = os.environ.get("DATABASE_URL")
-        if db_url:
-            log_trade_close(
-                db_url=db_url,
-                trade_db_id=trade.trade_db_id,
-                symbol=trade.symbol,
-                exit_time=trade.exit_time,
-                exit_price=trade.exit_price,
-                pnl=trade.pnl,
-                pnl_pct=trade.pnl_pct,
-                exit_reason=trade.exit_reason,
-                table_name=self.trades_table,
+            logger.info(
+                f"Closed position: {symbol} @ ${exit_price:.2f} "
+                f"P&L: ${trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%) [{reason}]"
             )
-            if not self.skip_dashboard:
-                close_signal_in_db(db_url, symbol, exit_price, trade.pnl_pct)
 
-        return trade
+            # Update dashboard - move to closed
+            if not self.skip_dashboard:
+                dashboard = self._get_dashboard()
+                if dashboard.enabled:
+                    dashboard.close_position(
+                        symbol, trade.entry_price, exit_price, trade.exit_time,
+                        shares=trade.shares, pnl_dollars=trade.pnl,
+                        score=trade.signal_score,
+                    )
+
+            # Persist trade close to DB
+            db_url = os.environ.get("DATABASE_URL")
+            if db_url:
+                log_trade_close(
+                    db_url=db_url,
+                    trade_db_id=trade.trade_db_id,
+                    symbol=trade.symbol,
+                    exit_time=trade.exit_time,
+                    exit_price=trade.exit_price,
+                    pnl=trade.pnl,
+                    pnl_pct=trade.pnl_pct,
+                    exit_reason=trade.exit_reason,
+                    table_name=self.trades_table,
+                )
+                if not self.skip_dashboard:
+                    close_signal_in_db(db_url, symbol, exit_price, trade.pnl_pct)
+
+            return trade
+
+        finally:
+            self._closing_in_progress.discard(symbol)
 
     async def close_all_positions(self, reason: str = "eod") -> List[TradeRecord]:
         """Close all open positions."""
@@ -601,7 +616,7 @@ class PositionManager:
                     trade.signal_score,
                     f"${trade.entry_price:.2f}",
                     f"${pos.current_price:.2f}",
-                    f"{pnl:+.2f}%",
+                    f"{pnl:.2f}%",
                     "HOLDING",
                 ])
         dashboard.rewrite_positions(rows)

@@ -2,6 +2,34 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-20 11:10 PST] — v54/v54a/v54b/v54c/v54d: Race Condition Fix + Dashboard Formatting
+
+### Done
+- **Bulletproof race condition fix (v54→v54a):** WebSocket hard stop firing multiple trade messages caused concurrent `asyncio.create_task` calls closing the same position twice
+  - Layer 1: `_closing_symbols` / `_closing_symbols_b` debounce sets in `main.py` — prevents duplicate task creation
+  - Layer 2: `_closing_in_progress` guard in `PositionManager.close_position()` — protects ALL callers (WS + REST polling)
+  - Layer 3: `active_trades.pop(symbol, None)` — safe pop prevents KeyError on second close attempt
+- **Dashboard Positions formatting (v54a→v54b):** Switched `rewrite_positions()` from `value_input_option='RAW'` to `'USER_ENTERED'` for consistent formatting. Removed `+` from P/L format specifier (`+2.38%` was parsed as formula by Google Sheets → stored as `0.0238`)
+- **Dashboard Closed tab formatting (v54c):** Switched `close_position()` from `'RAW'` to `'USER_ENTERED'`. Removed `+` from P/L% and $P/L format specifiers (`$-149.80` → `-$149.80`)
+- **GEX cache Cloud SQL fix (v54d):** `SignalGenerator.__init__` wasn't calling `.strip()` on DATABASE_URL — trailing `\r` from Secret Manager corrupted Cloud SQL socket path. GEX cache now loads 6,797 symbols successfully.
+- **Backfilled** DOW and ARDX to Account B Closed tab (hard stop race condition had prevented DB/gsheet writes)
+
+### Deployment
+- **v54d** (revision `paper-trading-live-00098-twj`): All fixes live. GEX cache healthy, WebSocket connected, dashboards consistent.
+
+### State
+- All dashboard writes now use `USER_ENTERED` mode for consistent formatting
+- Three-layer race condition defense active
+- GEX cache loading successfully (6,797 symbols)
+
+### Files Changed
+- `paper_trading/main.py` — debounce sets for hard stop close tasks
+- `paper_trading/position_manager.py` — `_closing_in_progress` guard, safe pop, P/L format fix
+- `paper_trading/dashboard.py` — `USER_ENTERED` mode for Positions and Closed tabs, format fixes
+- `paper_trading/signal_filter.py` — `.strip()` on DATABASE_URL in SignalGenerator
+
+---
+
 ## [2026-02-19 14:59 PST] — v53a: Alpaca SIP WebSocket for Real-Time Hard Stops
 
 ### Done

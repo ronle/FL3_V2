@@ -209,7 +209,7 @@ class Dashboard:
                 score,
                 f"${entry_price:.2f}",
                 f"${current_price:.2f}",
-                f"{pnl:+.2f}%",
+                f"{pnl:.2f}%",
                 status
             ]
 
@@ -231,6 +231,8 @@ class Dashboard:
 
         Takes a list of [symbol, score, entry, current, pnl%, status] rows.
         Self-healing: removes stale entries that shouldn't be there.
+        Uses USER_ENTERED so Google Sheets applies consistent formatting
+        to all rows regardless of prior cell formatting.
         """
         if not self._enabled:
             return
@@ -239,9 +241,9 @@ class Dashboard:
             self._positions_tab.clear()
             header = ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status']
             if positions_data:
-                self._positions_tab.update('A1', [header] + positions_data, value_input_option='RAW')
+                self._positions_tab.update('A1', [header] + positions_data, value_input_option='USER_ENTERED')
             else:
-                self._positions_tab.update('A1', [header], value_input_option='RAW')
+                self._positions_tab.update('A1', [header], value_input_option='USER_ENTERED')
         except Exception as e:
             logger.warning(f"Dashboard rewrite_positions failed: {e}")
 
@@ -276,11 +278,11 @@ class Dashboard:
                 shares,
                 f"${entry_price:.2f}",
                 f"${exit_price:.2f}",
-                f"{pnl_pct:+.2f}%",
-                f"${pnl_dollars:+,.2f}",
+                f"{pnl_pct:.2f}%",
+                f"${pnl_dollars:,.2f}",
                 result
             ]
-            self._closed_tab.append_row(row, value_input_option='RAW')
+            self._closed_tab.append_row(row, value_input_option='USER_ENTERED')
 
             # Remove from Positions tab
             try:

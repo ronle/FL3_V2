@@ -896,7 +896,8 @@ class SignalGenerator:
             database_url: Database URL for fetching intraday TA from ta_snapshots_v2
         """
         self.ta_cache = ta_cache or {}  # Daily TA cache (prior day close)
-        self.database_url = database_url or os.environ.get("DATABASE_URL")
+        _raw = database_url or os.environ.get("DATABASE_URL")
+        self.database_url = _raw.strip() if _raw else None
         self._alpaca_fetcher = None
         self._fetch_lock = asyncio.Lock()
         self._fetched_symbols: set = set()  # Track symbols we've already tried to fetch
