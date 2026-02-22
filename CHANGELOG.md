@@ -2,6 +2,23 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-22] — S4: RSI Hard Cap + Call% Gate
+
+### Done
+- **Disabled adaptive RSI** (`USE_ADAPTIVE_RSI = False`): RSI threshold now hard-capped at 50.0 permanently. Bounce-day relaxation (V29) removed from active filtering. Historical analysis showed RSI 55-60 band (bounce-day relaxation zone) had -1.44% avg P&L, 23.5% WR, PF 0.14 across 122 Account A trades (Feb 4-20).
+- **Added call_pct filter** (`USE_CALL_PCT_FILTER = True`, `CALL_PCT_MAX = 0.95`): Rejects signals where call_pct > 95%. Pure-call triggers showed -0.38% avg P&L, 38.2% WR, PF 0.58.
+- **Combined S4 backtest**: Applying both filters on historical trades flips portfolio from -$511 to +$507, cuts stop-hit rate from 25% to 11.5%, reduces max losing streak from 16 to 5.
+- Account B unaffected (bypasses filter chain entirely at aggregator level).
+
+### State
+- Ready for deploy. Verification: `python -c "from paper_trading.config import DEFAULT_CONFIG; print(DEFAULT_CONFIG.USE_ADAPTIVE_RSI, DEFAULT_CONFIG.CALL_PCT_MAX)"` should print `False 0.95`
+
+### Files Changed
+- `paper_trading/config.py` — `USE_ADAPTIVE_RSI = False`, added `USE_CALL_PCT_FILTER` + `CALL_PCT_MAX`
+- `paper_trading/signal_filter.py` — Added `call_pct` to filter_reasons dict, added call_pct gate in `apply()` after notional check
+
+---
+
 ## [2026-02-20 11:10 PST] — v54/v54a/v54b/v54c/v54d: Race Condition Fix + Dashboard Formatting
 
 ### Done

@@ -4,7 +4,8 @@ Signal Filter
 Applies entry rules to determine if a signal should trigger a trade:
 - Score >= 10
 - Uptrend (price > 20d SMA)
-- Prior-day RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
+- Prior-day RSI < 50 (hard cap, adaptive relaxation disabled as of S4)
+- call_pct <= 95% (reject pure-call triggers -- S4)
 - $50K+ notional
 """
 
@@ -209,6 +210,7 @@ class SignalFilter:
             "trend": 0,
             "rsi": 0,
             "notional": 0,
+            "call_pct": 0,
             "sma50": 0,
             "sentiment_mentions": 0,
             "sentiment_negative": 0,
@@ -749,6 +751,12 @@ class SignalFilter:
         if signal.notional < self.config.MIN_NOTIONAL:
             reasons.append(f"notional ${signal.notional:,.0f} < ${self.config.MIN_NOTIONAL:,.0f}")
             self.filter_reasons["notional"] += 1
+
+        # Check call_pct (S4) — reject pure-call triggers
+        if self.config.USE_CALL_PCT_FILTER:
+            if signal.call_pct is not None and signal.call_pct > self.config.CALL_PCT_MAX:
+                reasons.append(f"call_pct {signal.call_pct:.2%} > {self.config.CALL_PCT_MAX:.0%}")
+                self.filter_reasons["call_pct"] += 1
 
         # Check sentiment (TEST-8)
         sentiment_passed, sentiment_reason = self.passes_sentiment_filter(

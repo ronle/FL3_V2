@@ -4,7 +4,8 @@ Paper Trading Configuration
 Entry Rules:
 - Uptrend (price > 20d SMA at signal time)
 - Score >= 10
-- Prior-day RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
+- Prior-day RSI < 50 (hard cap, adaptive relaxation disabled as of S4)
+- call_pct <= 95% (reject pure-call triggers -- S4)
 - $50K+ notional
 - Max 10 concurrent positions
 
@@ -36,8 +37,12 @@ class TradingConfig:
     USE_EARNINGS_FILTER: bool = True
     EARNINGS_PROXIMITY_DAYS: int = 2  # Reject if earnings within +/- this many days
 
-    # Adaptive RSI — bounce-day relaxation (V29)
-    USE_ADAPTIVE_RSI: bool = True
+    # Call% filter (S4) — reject pure-call triggers
+    USE_CALL_PCT_FILTER: bool = True
+    CALL_PCT_MAX: float = 0.95  # Reject if call_pct > 95%
+
+    # Adaptive RSI — bounce-day relaxation (V29) — DISABLED by S4
+    USE_ADAPTIVE_RSI: bool = False
     ADAPTIVE_RSI_THRESHOLD: float = 60.0  # RSI threshold on bounce days (normal = RSI_THRESHOLD)
     ADAPTIVE_RSI_MIN_RED_DAYS: int = 2    # Minimum consecutive red SPY closes for bounce day
 
