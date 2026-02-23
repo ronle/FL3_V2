@@ -4,8 +4,8 @@ Signal Filter
 Applies entry rules to determine if a signal should trigger a trade:
 - Score >= 10
 - Uptrend (price > 20d SMA)
-- Prior-day RSI < 50 (hard cap, adaptive relaxation disabled as of S4)
-- call_pct <= 95% (reject pure-call triggers -- S4)
+- Prior-day RSI < 55 (S5: raised from 50 — RSI<55 shows improving Sharpe YoY across 3-year backtest)
+- call_pct gate DISABLED (S5: removed — gate passed only 0.4% of score>=10 signals over 3 years)
 - $50K+ notional
 """
 

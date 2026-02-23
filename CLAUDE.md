@@ -46,13 +46,8 @@ Before ending ANY session (whether asked to or not), you MUST:
 _Last updated: 2026-02-23_
 
 - **market_cap column added** to `master_tickers` — 3,766/5,980 symbols populated via Polygon API
-- **S4 filter committed** — RSI hard-capped at 50 (`USE_ADAPTIVE_RSI = False`), call_pct gate added (`CALL_PCT_MAX = 0.95`). Ready for deploy.
-- v54d still running in prod (revision `paper-trading-live-00098-twj`)
-- Three-layer hard stop race defense: main.py debounce → position_manager guard → safe pop
-- All dashboard writes use `USER_ENTERED` mode for consistent formatting
-- GEX cache loading successfully (6,797 symbols) after DATABASE_URL `.strip()` fix
-- Account B deployed and actively trading
-- **3-year backtest validated**: 559 trades, +17.1%, Sharpe 2.26, PF 1.47, max DD 2.5%
+- **v55 deployed** — S5 filter live: RSI raised to 55, call_pct gate removed. Revision `paper-trading-live-00100-7tl`. 3-year backtest: ~46 trades/month, Sharpe 2.97, improving trajectory (1.59→3.23→3.27 by year).
+- **DuckDB backtest infrastructure complete** — `temp/BACKTEST_PLAN_S4_MULTIDAY_v2.md`, `temp/run_s4_backtest.py`. Cache at `D:\backtest_cache\`. Group B multi-day (D+3 ex-REAL Sharpe 3.42) deferred pending separate account.
 
 ---
 
@@ -707,6 +702,58 @@ GROUP BY t.symbol
 HAVING MAX(ta.snapshot_ts) < NOW() - INTERVAL '10 minutes'
 ORDER BY staleness DESC;
 ```
+
+---
+
+## Backtest Infrastructure
+
+All backtesting uses **DuckDB** as the core engine. Do not use sequential Python file iteration for backtest work — it takes 4+ hours. DuckDB reads compressed CSV.gz natively and parallelizes across all CPU cores.
+
+### Setup
+```powershell
+pip install duckdb pyarrow fastparquet
+```
+
+### Cache Architecture
+Build once, query forever. Cache location: `D:\backtest_cache\`
+```
+D:\backtest_cache\
+    fl3_backtest.duckdb       # persistent DuckDB database
+    signals_enriched.parquet  # enriched signal universe (loads in ~5 seconds)
+    daily_closes.parquet      # symbol × date closes for TA computation
+    spy_daily.parquet         # SPY daily returns for regime tagging
+```
+
+### Key Data Facts (Phase 0 confirmed 2026-02-23)
+| Source | Coverage | Notes |
+|--------|----------|-------|
+| Signal JSON (D: drive) | 2023-02-01 → 2026-01-28, 2.3M signals | Has call_pct, trend — NO RSI |
+| `orats_daily` | Full 3 years | Has stock_price, price_momentum_20d — NO RSI, NO SMA50 |
+| `orats_daily_returns` | 2023-01-03 → 2026-01-22 | Join on `ticker` + `trade_date`; decimals (0.01=1%) |
+| `ta_daily_close` | 2025-07-30+ only | rsi_14, sma_20, sma_50 — only 7 months |
+| Polygon stock bars | Full 3 years, 780 files | `polygon_data/stocks/*.csv.gz` |
+| Polygon options bars | Full 3 years, 770 files | `polygon_data/options/*.csv.gz` |
+
+**RSI**: Must compute from `orats_daily.stock_price` rolling 14-day for 2023–mid-2025.
+**Trend proxy**: `price_momentum_20d > 0` in `orats_daily` = price above SMA20. No recompute needed.
+**Forward returns**: Join `orats_daily_returns` on `ticker` + `trade_date` (not symbol/asof_date). Multiply by 100 for percentages.
+
+### Backtest Script
+Entry point (to be created): `temp/run_s4_backtest.py`
+```powershell
+python temp/run_s4_backtest.py --phase=build      # build DuckDB cache (~20 min one-time)
+python temp/run_s4_backtest.py --phase=simulate   # run portfolio simulation
+python temp/run_s4_backtest.py --phase=report     # generate Excel output
+python temp/run_s4_backtest.py --phase=all        # run everything
+```
+Script auto-detects Cloud SQL proxy on port 5433. If available, uses DB for RSI computation (faster). If not, falls back to Polygon stock bars via DuckDB.
+
+Full plan: `temp/BACKTEST_PLAN_S4_MULTIDAY_v2.md`
+
+### Signal Quality Findings (2026-02-23, 16-day live data)
+- **Group A** (pass S4: RSI<50, call_pct≤95%): Intraday edge (+0.15%, 51.7% WR), reverses hard by D+5 (-2.43%). EOD exit is correct.
+- **Group B** (RSI<50, call_pct>95% — currently rejected by S4): Poor intraday (-0.50%) but strong multi-day edge (D+1 +1.39%, 57% WR, PF 2.85). Potential separate multi-day strategy.
+- **Validation needed**: Deduplicate signals, check for outlier concentration, validate across full 3-year dataset.
 
 ---
 

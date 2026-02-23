@@ -983,3 +983,130 @@ The signal filter applies these **9 active** checks in `apply()`:
 - `earnings_calendar` - Earnings proximity filter
 - `intraday_baselines_30m` - Per-symbol notional baselines
 - `gex_metrics_snapshot` - Shadow GEX lookup for signal metadata
+
+## [2026-02-23 11:30 PST] — DuckDB Backtest Infrastructure + S4 Signal Quality Analysis
+
+### Done
+- **Signal quality analysis** on 16-day live data (6,079 signals, Jan 30 – Feb 23):
+  - Group A (pass S4: RSI<50, call_pct≤95%): Intraday +0.15%, 51.7% WR, Sharpe +0.97. Reverses hard by D+5 (-2.43%). EOD exit confirmed correct.
+  - Group B (RSI<50, call_pct>95% — currently rejected by S4 call_pct gate): Intraday -0.50% but D+1 +1.39% mean, 57.0% WR, PF 2.85, Sharpe +2.64. Appears to be institutional accumulation via pure-call sweeps with multi-day follow-through.
+  - RSI 50-55 band (just above S4 cutoff) has best sustained multi-day returns across all horizons — current RSI cutoff is wrong if extending to multi-day holds.
+  - Group A is correctly configured for intraday. Group B is a buried multi-day opportunity requiring separate account + exit rules.
+  - Validation concerns noted: need deduplication, outlier check (Group B max D+1 gain = +71.58%), sector concentration analysis, 3-year confirmation.
+- **Phase 0 data exploration** for 3-year backtest:
+  - Signal JSON (D: drive): 2.3M signals, 9,746 score≥10, has call_pct + trend — confirmed NO RSI
+  - `orats_daily`: full 3-year coverage, has stock_price + price_momentum_20d — confirmed NO RSI, NO SMA50
+  - `orats_daily_returns`: full 3-year coverage, join on ticker+trade_date (not symbol/asof_date), returns are decimals
+  - `ta_daily_close`: only Jul 2025+ — only 7 months, not 3 years
+  - RSI must be computed from `orats_daily.stock_price` rolling 14-day for 2023–mid-2025
+  - Trend proxy: `price_momentum_20d > 0` already exists in orats_daily — no recompute needed
+  - Polygon stock bars: 780 files, 15 GB, full 3 years available locally
+- **DuckDB adopted as core backtest engine**:
+  - Reads CSV.gz flat files natively (no unzip), parallelizes across all CPU cores
+  - Estimated 20-40 min for full 3-year scan vs 4+ hours sequential Python
+  - Persistent cache at `D:\backtest_cache\` (DuckDB + Parquet) — build once, query in seconds
+  - Auto-detects Cloud SQL proxy on port 5433; falls back to Polygon stock bars if unavailable
+  - All future backtest hypotheses = WHERE clause changes, not re-processing
+- **Backtest plan v2** written: `temp/BACKTEST_PLAN_S4_MULTIDAY_v2.md`
+  - Full CLI implementation instructions with `--phase` argument
+  - Phase 1: Build DuckDB cache (RSI/SMA computation, signal enrichment, deduplication, Parquet export)
+  - Phase 2: Intraday return computation (fast proxy or full 1-min bars via DuckDB)
+  - Phase 3: Portfolio simulation (Strategy A intraday + Strategy B multi-day Group B hypothesis)
+  - Phase 4: Analysis queries (6 DuckDB SQL queries covering group comparison, RSI sensitivity, year-by-year, outlier check, regime breakdown, sector concentration)
+  - Phase 5: 11-tab Excel output
+- **Bible and CLAUDE.md updated** with DuckDB infrastructure, Phase 0 findings, signal quality results
+
+### State
+- DuckDB not yet installed. Plan ready for CLI execution.
+- Next step: `pip install duckdb pyarrow fastparquet` then `python temp/run_s4_backtest.py --phase=build`
+- Group B multi-day hypothesis requires 3-year validation before any live strategy changes
+
+### Next
+- Install DuckDB and run `--phase=build` to create enriched signal cache (~20 min)
+- Run Phase 4 analysis queries to validate Group B edge over 3 years
+- Check for outlier concentration in Group B (top-5 trades as % of total return)
+- Confirm year-by-year consistency (2023/2024/2025 separately)
+- If validated: design Group B multi-day account (separate Alpaca account, D+1 to D+5 exits, -5% stop)
+
+### Files Changed
+- `temp/BACKTEST_PLAN_S4_MULTIDAY_v2.md` (new)
+- `temp/analyze_signal_quality.py` (new — 16-day signal quality analysis)
+- `temp/signal_quality_report.xlsx` (new — 6-tab Excel output)
+- `CLAUDE.md` (updated — DuckDB backtest section, Current Status)
+- `C:\Users\levir\Documents\FL3_ECOSYSTEM_BIBLE.md` (updated — v2.6, backtest infrastructure section)
+
+
+## [2026-02-23 11:45 PST] — S5: RSI<55 + Remove call_pct Gate
+
+### Done
+- **Raised RSI_THRESHOLD from 50 → 55** (`paper_trading/config.py`):
+  - 3-year year-by-year comparison (with -2% hard stop, SPY filter, sector cap):
+    - RSI<50: Sharpe 3.68→1.79→1.55→-5.50 — degrading YoY, weak in recent periods
+    - RSI<55: Sharpe 1.59→3.23→3.27→5.38 — improving YoY, strengthening trajectory
+    - RSI<60: Sharpe 2.39→2.41→2.60→3.66 — flat/consistent, less sharp
+  - RSI<55 selected: improving edge means the signal type is becoming more relevant, not less
+- **Disabled call_pct gate** (`USE_CALL_PCT_FILTER = False`):
+  - S4's `CALL_PCT_MAX = 0.95` passed only 34/7,985 score>=10 signals (0.4%) over 3 years
+  - Not a discriminating filter — a near-total block
+  - Root cause of S4 underperformance identified: gate was correct that call_pct>95% signals
+    are poor intraday, but wrong conclusion — they're a different signal type (Group B multi-day),
+    not inherently bad signals
+- **No signal_filter.py code changes needed** — RSI check already uses `RSI_THRESHOLD` from
+  config; call_pct gate already gated on `USE_CALL_PCT_FILTER` flag (both wired correctly in S4)
+- **Updated signal_filter.py docstring** to reflect S5 filter rules
+- **Smoke test passed**: `RSI_THRESHOLD=55.0, USE_CALL_PCT_FILTER=False` confirmed
+- **Decisions documented**: `temp/S5_DEPLOY_DECISIONS.md`
+- **Full simulation report**: `D:\backtest_cache\S5_Full_Sim_Report.xlsx` (10 tabs)
+
+### Expected Live Performance (S5)
+| Metric | Value |
+|--------|-------|
+| Trades/month | ~46 |
+| Annual trades | ~350-400 |
+| 3yr Sharpe | 2.97 |
+| 3yr Win Rate | 51.0% |
+| Mean return/trade | +0.55% |
+| 2023 Sharpe | 1.59 (weakest year — choppy macro) |
+| 2024 Sharpe | 3.23 |
+| 2025 Sharpe | 3.27 |
+
+### State
+- Config changes committed, ready for Docker build + Cloud Run deploy
+- v54d still running in prod (`paper-trading-live-00098-twj`) — S4 config
+- Group B multi-day strategy (D+3, RSI<50, call_pct>0.95, Sharpe 3.42 ex-REAL) validated
+  but deferred — requires separate Alpaca account
+
+### Next
+- Docker build → push → deploy to Cloud Run (new revision)
+- Monitor first live session: target WR >49%, mean >+0.35%, ~8-12 trades/day
+- If 2023-like regime returns (choppy, SPY downtrend), consider tightening to RSI<50
+- Group B multi-day: set up separate Alpaca account, D+3 exit, -5% stop, max 5 positions
+
+### Files Changed
+- `paper_trading/config.py` — RSI_THRESHOLD 50→55, USE_CALL_PCT_FILTER True→False, updated comments
+- `paper_trading/signal_filter.py` — docstring updated to reflect S5 rules
+- `temp/S5_DEPLOY_DECISIONS.md` (new — full decision rationale + deploy checklist)
+- `temp/run_s5_full_sim.py` (new — targeted simulation script)
+- `D:\backtest_cache\S5_Full_Sim_Report.xlsx` (new — 10-tab simulation report)
+- `CLAUDE.md` — Current Status updated
+
+---
+
+## [2026-02-23 14:44 PST] — v55 Deployed: S5 Filter Live
+
+### Done
+- **Docker build + push + deploy** of `paper-trading:v55` to Cloud Run
+  - Revision: `paper-trading-live-00100-7tl`, serving 100% traffic
+  - Docker context: 547 KB (well under 1 MB limit)
+- **S5 filter now live**: RSI threshold 55 (up from 50), call_pct gate disabled
+- **Startup verified**: 10/10 positions restored (ARE, NRIX, BHF, BBBY, NTAP, DNA, BUG, CTRI, BJ, EQH)
+- **All subsystems healthy**: Polygon firehose, Alpaca SIP WebSocket, bar collector (1,984 bars/cycle), TA cache (2,671 symbols), engulfing watchlist (50 symbols)
+- **No errors**: One normal Polygon WS ping timeout, auto-reconnected in 400ms
+
+### State
+- v55 live in prod, S5 filter active
+- Replaces v54d (`paper-trading-live-00098-twj`)
+
+### Files Changed
+- `paper_trading/config.py` — RSI_THRESHOLD 50->55, USE_CALL_PCT_FILTER True->False
+- `paper_trading/signal_filter.py` — docstring updated

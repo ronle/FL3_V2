@@ -24,7 +24,7 @@ class TradingConfig:
 
     # Entry filters
     SCORE_THRESHOLD: int = 10
-    RSI_THRESHOLD: float = 50.0
+    RSI_THRESHOLD: float = 55.0  # S5: raised from 50 — RSI<55 shows improving Sharpe YoY (1.59→3.23→3.27), RSI<50 degrading
     MIN_NOTIONAL: float = 50_000
     REQUIRE_UPTREND: bool = True
 
@@ -37,9 +37,9 @@ class TradingConfig:
     USE_EARNINGS_FILTER: bool = True
     EARNINGS_PROXIMITY_DAYS: int = 2  # Reject if earnings within +/- this many days
 
-    # Call% filter (S4) — reject pure-call triggers
-    USE_CALL_PCT_FILTER: bool = True
-    CALL_PCT_MAX: float = 0.95  # Reject if call_pct > 95%
+    # Call% filter (S4) — DISABLED by S5: gate blocked 99.6% of score>=10 signals (34/7,985 passed)
+    USE_CALL_PCT_FILTER: bool = False
+    CALL_PCT_MAX: float = 0.95  # value retained for reference; inactive while USE_CALL_PCT_FILTER=False
 
     # Adaptive RSI — bounce-day relaxation (V29) — DISABLED by S4
     USE_ADAPTIVE_RSI: bool = False
