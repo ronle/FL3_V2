@@ -2,6 +2,29 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-02-23 09:10 PST] — Add market_cap column to master_tickers
+
+### Done
+- **DDL:** Added `market_cap BIGINT` and `market_cap_updated_at TIMESTAMPTZ` columns to `master_tickers` (ALTER run as `fr3_app` via Cloud SQL Auth Proxy)
+- **Population script:** `scripts/refresh_market_cap.py` — fetches market_cap from Polygon `/v3/reference/tickers/{ticker}` API
+  - Delta refresh by default (only NULL rows), `--all` to re-fetch everything
+  - 200ms spacing (5 req/sec Polygon free tier), rate limit detection with 12s backoff
+  - Connects as `fr3_app` (table owner), Polygon key from env or Secret Manager
+  - Flags: `--stats`, `--dry-run`, `--limit N`, `--all`
+- **Full population run:** 5,976 symbols processed in ~34 min, zero failures
+  - 3,766 symbols with market_cap (63%)
+  - 2,214 checked but NULL (ETFs, warrants, funds — stamped so they won't be retried)
+  - Top: NVDA $4.6T, AAPL $3.9T, GOOGL $3.8T, MSFT $2.9T, AMZN $2.3T
+
+### State
+- Column populated and queryable. No deploy needed (DB-only change + offline script).
+- Re-run monthly: `python -m scripts.refresh_market_cap --all`
+
+### Files Changed
+- `scripts/refresh_market_cap.py` (new)
+
+---
+
 ## [2026-02-22] — S4: RSI Hard Cap + Call% Gate
 
 ### Done
@@ -918,18 +941,19 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
 
 ---
 
-## Filter Chain Reference (as of v43)
+## Filter Chain Reference (as of S4)
 
-The signal filter applies these **8 active** checks in `apply()`:
+The signal filter applies these **9 active** checks in `apply()`:
 
 1. **ETF exclusion** - Hardcoded list (SPY, QQQ, IWM, etc.)
 2. **Score threshold** - score >= 10
 3. **Uptrend SMA20** - price > 20-day SMA (includes trend check)
-4. **RSI filter** - RSI < 50 (oversold)
+4. **RSI filter** - RSI < 50 (hard cap, adaptive relaxation disabled by S4)
 5. **SMA50 momentum** - price > 50-day SMA
 6. **Notional baseline** - >= per-symbol baseline from `intraday_baselines_30m`
-7. **Crowded trade + sentiment** - mentions < 5, sentiment >= 0 (from `vw_media_daily_features`)
-8. **Earnings proximity** - no earnings within 2 days (from `earnings_calendar`)
+7. **Call% gate** - call_pct <= 95% (S4, rejects pure-call triggers)
+8. **Crowded trade + sentiment** - mentions < 5, sentiment >= 0 (from `vw_media_daily_features`)
+9. **Earnings proximity** - no earnings within 2 days (from `earnings_calendar`)
 
 **Configured but NOT called in `apply()` (as of v43):**
 - Sector concentration (max 2 per sector) — code exists, not wired

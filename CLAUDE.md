@@ -43,9 +43,11 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-02-20 11:10 PST_
+_Last updated: 2026-02-23_
 
-- **v54d deployed** — Race condition bulletproofed, dashboard formatting fixed, GEX cache restored (revision `paper-trading-live-00098-twj`)
+- **market_cap column added** to `master_tickers` — 3,766/5,980 symbols populated via Polygon API
+- **S4 filter committed** — RSI hard-capped at 50 (`USE_ADAPTIVE_RSI = False`), call_pct gate added (`CALL_PCT_MAX = 0.95`). Ready for deploy.
+- v54d still running in prod (revision `paper-trading-live-00098-twj`)
 - Three-layer hard stop race defense: main.py debounce → position_manager guard → safe pop
 - All dashboard writes use `USER_ENTERED` mode for consistent formatting
 - GEX cache loading successfully (6,797 symbols) after DATABASE_URL `.strip()` fix
@@ -346,17 +348,18 @@ SignalGenerator.create_signal_async()
     ├── Fetch current price from Alpaca snapshot API (2s timeout)
     └── Assemble Signal object
     ↓
-SignalFilter.apply() — 10 filter steps:
+SignalFilter.apply() — 11 filter steps:
     1. ETF exclusion (hardcoded list)
     2. Score threshold (>= 10)
-    3. RSI < 50 (adaptive: RSI < 60 on bounce-back days -- V29)
+    3. RSI < 50 (hard cap — adaptive relaxation disabled by S4)
     4. Uptrend SMA20 (from TA cache)
     5. SMA50 momentum (from TA cache)
     6. Notional >= per-symbol baseline (intraday_baselines_30m DB)
-    7. Crowded trade filter (vw_media_daily_features VIEW — mentions < 5, sentiment >= 0)
-    8. Sector limit max 2 (master_tickers DB)
-    9. Market regime (Alpaca API — SPY snapshot)
-   10. Earnings proximity (earnings_calendar DB — reject if earnings within 2 days)
+    7. Call% <= 95% (reject pure-call triggers — S4)
+    8. Crowded trade filter (vw_media_daily_features VIEW — mentions < 5, sentiment >= 0)
+    9. Sector limit max 2 (master_tickers DB)
+   10. Market regime (Alpaca API — SPY snapshot)
+   11. Earnings proximity (earnings_calendar DB — reject if earnings within 2 days)
     ↓
 If PASSED → Submit buy order via Alpaca API → Write to paper_trades_log, active_signals
          → Add symbol to tracked_tickers_v2 for intraday TA updates
