@@ -4,14 +4,15 @@ Paper Trading Configuration
 Entry Rules:
 - Uptrend (price > 20d SMA at signal time)
 - Score >= 10
-- Prior-day RSI < 50 (hard cap, adaptive relaxation disabled as of S4)
-- call_pct <= 95% (reject pure-call triggers -- S4)
+- Prior-day RSI < 55 (S5)
+- ADV >= 1,000 contracts/day (v57 — D-1 from orats_daily)
+- GEX dead zone filter (skip 2-5% above gamma flip)
 - $50K+ notional
 - Max 10 concurrent positions
 
 Exit Rules:
 - Hold to market close (3:55 PM ET)
-- Optional: -5% hard stop (disaster protection)
+- -5% hard stop (v57 — widened from -2%; 3yr backtest Sharpe 1.25 vs 1.06)
 """
 
 from dataclasses import dataclass
@@ -58,6 +59,11 @@ class TradingConfig:
     ENGULFING_LOOKBACK_MINUTES: int = 30       # 5-min pattern fallback window
     ENGULFING_DAILY_LOOKBACK_HOURS: int = 20   # Daily patterns persist overnight
 
+    # ADV filter (v57) — reject illiquid names (avg_daily_volume from orats_daily, D-1)
+    # 3yr backtest: ADV>=1K Sharpe 1.25, WR 56.7%, PF 1.52 vs no-filter Sharpe 0.78
+    USE_ADV_FILTER: bool = True
+    MIN_ADV: int = 1000  # minimum avg_daily_volume (options contracts/day)
+
     # Market regime filter (V28)
     USE_MARKET_REGIME_FILTER: bool = True
     MARKET_REGIME_SYMBOL: str = "SPY"  # Benchmark to check
@@ -77,7 +83,7 @@ class TradingConfig:
     # Exit rules
     EXIT_TIME: dt_time = dt_time(15, 55)  # 3:55 PM ET
     LAST_ENTRY_TIME: dt_time = dt_time(15, 50)  # No new positions after 3:50 PM
-    HARD_STOP_PCT: float = -0.02  # -2% hard stop — dump losers fast, free slots for winners
+    HARD_STOP_PCT: float = -0.05  # -5% hard stop — 3yr backtest: -5% Sharpe 1.25 vs -2% Sharpe 1.06 at ADV>=1K
     USE_HARD_STOP: bool = True
 
     # Market hours (ET)

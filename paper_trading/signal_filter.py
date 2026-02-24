@@ -4,10 +4,9 @@ Signal Filter
 Applies entry rules to determine if a signal should trigger a trade:
 - Score >= 10
 - Uptrend (price > 20d SMA)
-- Prior-day RSI < 55 (S5: raised from 50 — RSI<55 shows improving Sharpe YoY across 3-year backtest)
-- call_pct gate DISABLED (S5: removed — gate passed only 0.4% of score>=10 signals over 3 years)
+- Prior-day RSI < 55 (S5)
+- ADV >= 1,000 contracts/day (v57: D-1 from orats_daily)
 - GEX dead zone filter (S5+GEX): skip signals where spot is 2-5% above gamma flip level
-  (Sharpe 0.91 in that band vs 2.54 baseline; removing it: Sharpe 3.30->3.50, -17% volume)
 - $50K+ notional
 """
 
@@ -214,6 +213,7 @@ class SignalFilter:
             "notional": 0,
             "call_pct": 0,
             "sma50": 0,
+            "adv": 0,
             "sentiment_mentions": 0,
             "sentiment_negative": 0,
             "earnings": 0,
@@ -227,6 +227,10 @@ class SignalFilter:
         # Sentiment cache to avoid repeated DB lookups
         self._sentiment_cache: Dict[str, Tuple[Optional[int], Optional[float]]] = {}
 
+        # ADV cache (v57) — loaded once from orats_daily, D-1 convention
+        self._adv_cache: Dict[str, int] = {}
+        self._adv_cache_loaded = False
+
         # Adaptive RSI state (V29)
         self._bounce_eligible = False
         self._bounce_checked = False
@@ -239,7 +243,7 @@ class SignalFilter:
         self._preload_caches()
 
     def _preload_caches(self):
-        """Pre-load earnings and sector data to avoid blocking during signal processing."""
+        """Pre-load earnings, sector, and ADV data to avoid blocking during signal processing."""
         if not self.database_url:
             return
 
@@ -248,6 +252,10 @@ class SignalFilter:
 
         # Load earnings cache for all symbols with earnings in window
         self._load_earnings_cache()
+
+        # Load ADV cache from orats_daily (D-1 convention)
+        if self.config.USE_ADV_FILTER:
+            self._load_adv_cache()
 
         # Check bounce-day eligibility (V29)
         if self.config.USE_ADAPTIVE_RSI:
@@ -299,6 +307,41 @@ class SignalFilter:
             logger.info(f"Loaded earnings cache: {len(self._earnings_cache)} symbols with upcoming earnings")
         except Exception as e:
             logger.warning(f"Failed to load earnings cache: {e}")
+
+    def _load_adv_cache(self):
+        """
+        Load latest ADV (avg_daily_volume) per symbol from orats_daily.
+
+        Uses D-1 convention: loads the most recent asof_date's data, which is
+        always yesterday or earlier (ORATS data arrives after market close).
+        Bulk-loaded once at startup for O(1) lookups during filtering.
+        """
+        if self._adv_cache_loaded or not self.database_url:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+
+            # Get most recent asof_date (should be yesterday or last trading day)
+            cur.execute("""
+                SELECT DISTINCT ON (symbol) symbol, avg_daily_volume
+                FROM orats_daily
+                WHERE avg_daily_volume IS NOT NULL
+                ORDER BY symbol, asof_date DESC
+            """)
+
+            for row in cur.fetchall():
+                if row[1] is not None:
+                    self._adv_cache[row[0]] = int(row[1])
+
+            cur.close()
+            conn.close()
+            self._adv_cache_loaded = True
+            logger.info(f"Loaded ADV cache: {len(self._adv_cache)} symbols")
+        except Exception as e:
+            logger.warning(f"Failed to load ADV cache: {e}")
 
     # ------------------------------------------------------------------
     # Adaptive RSI — bounce-day detection (V29)
@@ -755,6 +798,16 @@ class SignalFilter:
             reasons.append(f"notional ${signal.notional:,.0f} < ${self.config.MIN_NOTIONAL:,.0f}")
             self.filter_reasons["notional"] += 1
 
+        # Check ADV (v57) — reject illiquid names
+        if self.config.USE_ADV_FILTER:
+            if not self._adv_cache_loaded:
+                self._load_adv_cache()
+            adv = self._adv_cache.get(signal.symbol)
+            if adv is None or adv < self.config.MIN_ADV:
+                adv_str = f"{adv:,}" if adv is not None else "unknown"
+                reasons.append(f"adv_below_{self.config.MIN_ADV} ({adv_str})")
+                self.filter_reasons["adv"] += 1
+
         # Check call_pct (S4) — reject pure-call triggers
         if self.config.USE_CALL_PCT_FILTER:
             if signal.call_pct is not None and signal.call_pct > self.config.CALL_PCT_MAX:
@@ -885,6 +938,8 @@ class SignalFilter:
         self.filter_reasons = {k: 0 for k in self.filter_reasons}
         self._sentiment_cache.clear()  # Clear sentiment cache for new day
         self._earnings_cache.clear()  # Clear earnings cache for new day
+        self._adv_cache.clear()  # Refresh ADV cache for new day (D-1 data changes nightly)
+        self._adv_cache_loaded = False
 
         # Reset bounce-day state for new day (V29)
         self._bounce_eligible = False
