@@ -6,6 +6,8 @@ Applies entry rules to determine if a signal should trigger a trade:
 - Uptrend (price > 20d SMA)
 - Prior-day RSI < 55 (S5: raised from 50 — RSI<55 shows improving Sharpe YoY across 3-year backtest)
 - call_pct gate DISABLED (S5: removed — gate passed only 0.4% of score>=10 signals over 3 years)
+- GEX dead zone filter (S5+GEX): skip signals where spot is 2-5% above gamma flip level
+  (Sharpe 0.91 in that band vs 2.54 baseline; removing it: Sharpe 3.30->3.50, -17% volume)
 - $50K+ notional
 """
 
@@ -215,6 +217,7 @@ class SignalFilter:
             "sentiment_mentions": 0,
             "sentiment_negative": 0,
             "earnings": 0,
+            "gex_dead_zone": 0,
         }
 
         # Earnings cache to avoid repeated DB lookups
@@ -757,6 +760,22 @@ class SignalFilter:
             if signal.call_pct is not None and signal.call_pct > self.config.CALL_PCT_MAX:
                 reasons.append(f"call_pct {signal.call_pct:.2%} > {self.config.CALL_PCT_MAX:.0%}")
                 self.filter_reasons["call_pct"] += 1
+
+        # Check GEX dead zone (S5+GEX) — skip 2-5% above gamma flip level
+        if self.config.USE_GEX_DEAD_ZONE_FILTER:
+            gex = self._lookup_gex(signal.symbol)
+            if gex and gex.get("gamma_flip") and signal.price_at_signal:
+                flip = gex["gamma_flip"]
+                if flip > 0:
+                    flip_dist_pct = (signal.price_at_signal - flip) / signal.price_at_signal * 100
+                    lo = self.config.GEX_DEAD_ZONE_MIN_PCT
+                    hi = self.config.GEX_DEAD_ZONE_MAX_PCT
+                    if lo < flip_dist_pct <= hi:
+                        reasons.append(
+                            f"GEX dead zone: spot {flip_dist_pct:.1f}% above flip "
+                            f"({lo:.0f}-{hi:.0f}% band)"
+                        )
+                        self.filter_reasons["gex_dead_zone"] += 1
 
         # Check sentiment (TEST-8)
         sentiment_passed, sentiment_reason = self.passes_sentiment_filter(

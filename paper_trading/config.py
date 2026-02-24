@@ -41,6 +41,13 @@ class TradingConfig:
     USE_CALL_PCT_FILTER: bool = False
     CALL_PCT_MAX: float = 0.95  # value retained for reference; inactive while USE_CALL_PCT_FILTER=False
 
+    # GEX dead-zone filter (S5+GEX) — skip signals where spot is 2-5% above gamma flip
+    # Rationale: 3-year backtest shows Sharpe 0.91 in this band vs 2.54 baseline
+    # Removing dead zone: Sharpe 3.30 -> 3.50, mean +0.655% -> +0.737%, -17% volume
+    USE_GEX_DEAD_ZONE_FILTER: bool = True
+    GEX_DEAD_ZONE_MIN_PCT: float = 2.0   # lower bound: spot > flip + 2%
+    GEX_DEAD_ZONE_MAX_PCT: float = 5.0   # upper bound: spot < flip + 5%
+
     # Adaptive RSI — bounce-day relaxation (V29) — DISABLED by S4
     USE_ADAPTIVE_RSI: bool = False
     ADAPTIVE_RSI_THRESHOLD: float = 60.0  # RSI threshold on bounce days (normal = RSI_THRESHOLD)

@@ -46,7 +46,7 @@ Before ending ANY session (whether asked to or not), you MUST:
 _Last updated: 2026-02-23_
 
 - **market_cap column added** to `master_tickers` — 3,766/5,980 symbols populated via Polygon API
-- **v55 deployed** — S5 filter live: RSI raised to 55, call_pct gate removed. Revision `paper-trading-live-00100-7tl`. 3-year backtest: ~46 trades/month, Sharpe 2.97, improving trajectory (1.59→3.23→3.27 by year).
+- **v56 deployed** — S5 + GEX dead zone filter live. RSI<55, call_pct gate removed, skip 2-5% above gamma flip. Revision `paper-trading-live-00101-htx`. Sharpe 3.50, ~38 trades/month.
 - **DuckDB backtest infrastructure complete** — `temp/BACKTEST_PLAN_S4_MULTIDAY_v2.md`, `temp/run_s4_backtest.py`. Cache at `D:\backtest_cache\`. Group B multi-day (D+3 ex-REAL Sharpe 3.42) deferred pending separate account.
 
 ---

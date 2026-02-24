@@ -1110,3 +1110,69 @@ The signal filter applies these **9 active** checks in `apply()`:
 ### Files Changed
 - `paper_trading/config.py` — RSI_THRESHOLD 50->55, USE_CALL_PCT_FILTER True->False
 - `paper_trading/signal_filter.py` — docstring updated
+
+## [2026-02-23 12:55 PST] — S5+GEX: Dead Zone Filter
+
+### Done
+- **Added GEX dead zone filter** (`USE_GEX_DEAD_ZONE_FILTER = True`):
+  - Skips signals where spot price is 2-5% above gamma flip level
+  - Rationale: in this band dealers are marginally long gamma — neither the amplification
+    of short gamma (below flip) nor the stabilizing floor of deep long gamma. The band
+    has structurally weak intraday dynamics for UOA signals.
+  - 3-year backtest result: Sharpe 0.91 in dead zone vs 2.54 baseline
+  - Combined filter (S5 + skip dead zone): Sharpe 3.30 → 3.50, mean +0.655% → +0.737%
+  - Cost: ~17% fewer trades (~38/mo vs ~46/mo). Consistent improvement 2024, 2025, 2026.
+- **No new DB queries at runtime**: GEX cache already loaded once at startup via
+  `_load_gex_cache()`. Dead zone check is a pure dict lookup + arithmetic.
+- Added `gex_dead_zone` to `filter_reasons` counter
+- Updated signal_filter.py docstring
+
+### Config Changes (`paper_trading/config.py`)
+```python
+USE_GEX_DEAD_ZONE_FILTER: bool = True
+GEX_DEAD_ZONE_MIN_PCT: float = 2.0
+GEX_DEAD_ZONE_MAX_PCT: float = 5.0
+```
+
+### Deferred GEX Filters (need more data)
+- `S5_combined`: also skip `near_call_wall` zone — D+3 uplift real but 2026 Sharpe drops.
+  Revisit after 6 months live data.
+- `S5_below_flip_only`: Sharpe 4.06 but only ~7 trades/month — too thin for live.
+
+### State
+- Ready for Docker build + Cloud Run deploy (combine with S5 deploy)
+- Smoke test passed: all 5 config assertions green, `gex_dead_zone` in filter_reasons
+
+### Files Changed
+- `paper_trading/config.py` — 3 new GEX config fields
+- `paper_trading/signal_filter.py` — dead zone check added after call_pct block,
+  gex_dead_zone added to filter_reasons, docstring updated
+- `temp/run_gex_analysis.py` (new) — full GEX hypothesis analysis script
+- `temp/_gex_combined_test.py` (new) — combined filter comparison script
+- `D:\backtest_cache\GEX_Analysis_Report.xlsx` (new) — 13-tab GEX analysis report
+- `D:\backtest_cache\signals_gex_enriched.parquet` (new) — GEX-enriched signal cache
+
+---
+
+## [2026-02-23 19:54 PST] — v56 Deployed: S5 + GEX Dead Zone Filter
+
+### Done
+- **Docker build + push + deploy** of `paper-trading:v56` to Cloud Run
+  - Revision: `paper-trading-live-00101-htx`, serving 100% traffic
+  - Includes both S5 (RSI<55, no call_pct gate) and GEX dead zone filter
+- **v56 startup verified**: zero errors, RSI < 55.0 confirmed in logs, TA cache loaded (2,612 symbols)
+- Replaces v55 (`paper-trading-live-00100-7tl`) which had S5 but not GEX filter
+
+### Live Config Summary (v56)
+| Filter | Setting | Backtest Impact |
+|--------|---------|-----------------|
+| RSI threshold | < 55 | Sharpe improving YoY: 1.59/3.23/3.27 |
+| call_pct gate | DISABLED | Was blocking 99.6% of signals |
+| GEX dead zone | 2-5% above flip | Sharpe 3.30 -> 3.50, -17% volume |
+| Hard stop | -2% | Unchanged |
+| Max positions | 10 | Unchanged |
+
+### Files Changed
+- `paper_trading/config.py` — GEX dead zone config (3 new fields)
+- `paper_trading/signal_filter.py` — dead zone check, gex_dead_zone counter, docstring
+- `CHANGELOG.md` — v56 deploy entry
