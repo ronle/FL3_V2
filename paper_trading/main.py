@@ -38,7 +38,10 @@ from paper_trading.signal_filter import SignalFilter, Signal, SignalGenerator
 from paper_trading.eod_closer import EODCloser, time_until_close
 from paper_trading.trade_aggregator import TradeAggregator
 from paper_trading.dashboard import get_dashboard, Dashboard
-from paper_trading.engulfing_checker import EngulfingChecker
+from paper_trading.engulfing_checker import PatternPoller
+from paper_trading.rsi_screener import MomentumScreener
+from paper_trading.cameron_checker import CameronChecker
+from paper_trading.cameron_scanner import CameronScanner
 
 from firehose.client import FirehoseClient, Trade
 from firehose.stock_price_monitor import StockPriceMonitor
@@ -109,7 +112,7 @@ class PaperTradingEngine:
             on_close_complete=self._on_eod_complete,
         )
 
-        # Account B — V2 + Engulfing Pattern
+        # Account B — Big-Hitter Pattern Trader
         self._account_b_enabled = False
         self.dashboard_b = None
         if config.USE_ACCOUNT_B:
@@ -125,15 +128,55 @@ class PaperTradingEngine:
                     skip_dashboard=False,
                     dashboard=self.dashboard_b,
                 )
-                self.engulfing_checker = EngulfingChecker(database_url=db_url)
+                self.pattern_poller = PatternPoller(
+                    database_url=db_url,
+                    max_candle_range=config.ACCOUNT_B_MAX_CANDLE_RANGE,
+                    min_risk_per_share=config.ACCOUNT_B_MIN_RISK_PER_SHARE,
+                    lookback_min=config.ACCOUNT_B_LOOKBACK_MIN,
+                )
                 self.eod_closer_b = EODCloser(
                     self.position_manager_b, config,
                     on_close_complete=self._on_eod_complete_b,
+                    use_prior_day_close=False,  # Account B always closes all at EOD
                 )
                 self._account_b_enabled = True
-                logger.info("Account B (V2 + Engulfing) initialized with dashboard")
+                logger.info("Account B (Big-Hitter Pattern Trader) initialized")
             else:
                 logger.warning("Account B: ALPACA keys not found, disabled")
+
+        # Account C — Cameron B2 Pattern Trader
+        self._account_c_enabled = False
+        self.dashboard_c = None
+        if config.USE_ACCOUNT_C:
+            alpaca_key_c = os.environ.get("ALPACA_API_KEY_C")
+            alpaca_secret_c = os.environ.get("ALPACA_SECRET_KEY_C")
+            if alpaca_key_c and alpaca_secret_c:
+                db_url = os.environ.get("DATABASE_URL")
+                self.trader_c = AlpacaTrader(alpaca_key_c, alpaca_secret_c, config)
+                self.dashboard_c = Dashboard(tab_prefix="Cameron ")
+                self.position_manager_c = PositionManager(
+                    self.trader_c, config,
+                    trades_table="paper_trades_log_c",
+                    skip_dashboard=False,
+                    dashboard=self.dashboard_c,
+                )
+                self.cameron_checker = CameronChecker(
+                    database_url=db_url,
+                    max_bf_per_day=config.CAMERON_MAX_BF_PER_DAY,
+                    lookback_min=10,
+                )
+                # Scanner initialized in run() after db_pool is created
+                self.cameron_scanner: Optional[CameronScanner] = None
+                self.eod_closer_c = EODCloser(
+                    self.position_manager_c, config,
+                    on_close_complete=self._on_eod_complete_c,
+                    use_prior_day_close=False,  # Account C always closes all at EOD
+                )
+                self._account_c_enabled = True
+                self._closing_symbols_c: set = set()
+                logger.info("Account C (Cameron B2 Pattern Trader) initialized")
+            else:
+                logger.warning("Account C: ALPACA keys not found, disabled")
 
         # State
         self._running = False
@@ -163,6 +206,12 @@ class PaperTradingEngine:
         # Hard stop debounce — prevent duplicate close tasks for same symbol
         self._closing_symbols: set = set()
         self._closing_symbols_b: set = set()
+
+        # v58: Momentum EOD Screener state (Account A)
+        self._momentum_screener: Optional[MomentumScreener] = None  # Initialized in run() after db_pool
+        self._momentum_candidates = []
+        self._momentum_screened_today = False
+        self._momentum_bought_today = False
 
     def _get_et_now(self) -> datetime:
         """Get current time in ET."""
@@ -196,20 +245,59 @@ class PaperTradingEngine:
                 self._closing_symbols.add(symbol)
                 asyncio.create_task(self._async_hard_stop(symbol))
 
-        # Check hard stop for Account B
+        # Check stop/target for Account B (direction-aware)
         if (self._account_b_enabled
-                and symbol in self.position_manager_b.active_trades
-                and self.config.USE_HARD_STOP):
+                and symbol in self.position_manager_b.active_trades):
             trade_b = self.position_manager_b.active_trades[symbol]
-            pnl_pct_b = (price - trade_b.entry_price) / trade_b.entry_price
+            if symbol not in self._closing_symbols_b:
+                should_close = False
+                reason = ""
 
-            if pnl_pct_b <= self.config.HARD_STOP_PCT and symbol not in self._closing_symbols_b:
-                logger.warning(
-                    f"ACCOUNT B HARD STOP triggered via WebSocket: {symbol} "
-                    f"@ ${price:.2f} ({pnl_pct_b*100:.1f}%)"
-                )
-                self._closing_symbols_b.add(symbol)
-                asyncio.create_task(self._async_hard_stop_b(symbol))
+                if trade_b.direction == "bullish":
+                    if trade_b.stop_price and price <= trade_b.stop_price:
+                        should_close = True
+                        reason = "stop"
+                    elif trade_b.target_price and price >= trade_b.target_price:
+                        should_close = True
+                        reason = "target"
+                else:  # bearish
+                    if trade_b.stop_price and price >= trade_b.stop_price:
+                        should_close = True
+                        reason = "stop"
+                    elif trade_b.target_price and price <= trade_b.target_price:
+                        should_close = True
+                        reason = "target"
+
+                if should_close:
+                    logger.warning(
+                        f"ACCOUNT B {reason.upper()} triggered via WebSocket: "
+                        f"{trade_b.direction} {symbol} @ ${price:.2f}"
+                    )
+                    self._closing_symbols_b.add(symbol)
+                    asyncio.create_task(self._async_exit_b(symbol, reason))
+
+        # Check stop/target for Account C (bullish only — Cameron is long-only)
+        if (self._account_c_enabled
+                and symbol in self.position_manager_c.active_trades):
+            trade_c = self.position_manager_c.active_trades[symbol]
+            if symbol not in self._closing_symbols_c:
+                should_close = False
+                reason = ""
+
+                if trade_c.stop_price and price <= trade_c.stop_price:
+                    should_close = True
+                    reason = "stop"
+                elif trade_c.target_price and price >= trade_c.target_price:
+                    should_close = True
+                    reason = "target"
+
+                if should_close:
+                    logger.warning(
+                        f"CAMERON {reason.upper()} triggered via WebSocket: "
+                        f"{symbol} @ ${price:.2f}"
+                    )
+                    self._closing_symbols_c.add(symbol)
+                    asyncio.create_task(self._async_exit_c(symbol, reason))
 
     async def _async_hard_stop(self, symbol: str):
         """Execute hard stop asynchronously."""
@@ -227,21 +315,220 @@ class PaperTradingEngine:
         finally:
             self._closing_symbols.discard(symbol)
 
-    async def _async_hard_stop_b(self, symbol: str):
-        """Execute hard stop for Account B asynchronously."""
+    async def _async_exit_b(self, symbol: str, reason: str = "stop"):
+        """Execute stop or target exit for Account B asynchronously."""
         if self.dry_run:
             self._closing_symbols_b.discard(symbol)
-            logger.info(f"[DRY RUN] Would close Account B {symbol} for hard stop")
+            logger.info(f"[DRY RUN] Would close Account B {symbol} for {reason}")
             return
 
         try:
-            trade = await self.position_manager_b.close_position(symbol, "stop")
+            trade = await self.position_manager_b.close_position(symbol, reason)
             if trade:
-                logger.info(f"Account B hard stop executed: {symbol} P&L: ${trade.pnl:+.2f}")
+                logger.info(f"Account B {reason} executed: {symbol} P&L: ${trade.pnl:+.2f}")
         except Exception as e:
-            logger.error(f"Account B hard stop execution failed for {symbol}: {e}")
+            logger.error(f"Account B {reason} execution failed for {symbol}: {e}")
         finally:
             self._closing_symbols_b.discard(symbol)
+
+    async def _async_exit_c(self, symbol: str, reason: str = "stop"):
+        """Execute stop or target exit for Account C asynchronously."""
+        if self.dry_run:
+            self._closing_symbols_c.discard(symbol)
+            logger.info(f"[DRY RUN] Would close Cameron {symbol} for {reason}")
+            return
+
+        try:
+            trade = await self.position_manager_c.close_position(symbol, reason)
+            if trade:
+                logger.info(f"Cameron {reason} executed: {symbol} P&L: ${trade.pnl:+.2f}")
+        except Exception as e:
+            logger.error(f"Cameron {reason} execution failed for {symbol}: {e}")
+        finally:
+            self._closing_symbols_c.discard(symbol)
+
+    async def _poll_account_b_patterns(self):
+        """Poll engulfing_scores for qualifying big-hitter patterns and submit limit orders."""
+        if not self._account_b_enabled or self._eod_complete:
+            return
+        if not self._is_entry_allowed():
+            return
+
+        setups = self.pattern_poller.poll_qualifying_patterns()
+        if not setups:
+            return
+
+        for setup in setups:
+            if not self.position_manager_b.can_open_position:
+                logger.info("Account B at max positions, stopping pattern poll")
+                break
+
+            if self.position_manager_b.already_traded(setup.symbol):
+                continue
+
+            # Log signal to dashboard
+            if self.dashboard_b and self.dashboard_b.enabled:
+                self.dashboard_b.log_signal(
+                    symbol=setup.symbol,
+                    score=0,
+                    rsi=0,
+                    ratio=0,
+                    notional=0,
+                    price=setup.entry_price,
+                    direction=setup.direction,
+                    stop_loss=setup.stop_loss,
+                    target_1=setup.target_1,
+                    risk_per_share=setup.risk_per_share,
+                    pattern_strength=setup.pattern_strength,
+                )
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY RUN] Account B: {setup.direction.upper()} {setup.symbol} "
+                    f"@ ${setup.entry_price:.2f} (stop=${setup.stop_loss:.2f}, "
+                    f"target=${setup.target_1:.2f}, strength={setup.pattern_strength})"
+                )
+                continue
+
+            trade = await self.position_manager_b.open_limit_position(
+                setup, max_risk=self.config.ACCOUNT_B_MAX_RISK_PER_TRADE
+            )
+            if trade:
+                # Subscribe for real-time price updates
+                if self.stock_monitor.is_connected:
+                    await self.stock_monitor.subscribe([setup.symbol])
+
+    async def _check_account_b_pending(self):
+        """Check pending limit orders for fills/expiry."""
+        if not self._account_b_enabled:
+            return
+
+        if not self.position_manager_b._pending_limit_orders:
+            return
+
+        result = await self.position_manager_b.check_pending_orders(
+            max_age_minutes=self.config.ACCOUNT_B_CONFIRMATION_WINDOW_MIN
+        )
+
+        for trade in result["filled"]:
+            logger.info(f"Account B FILL: {trade.direction} {trade.symbol} "
+                       f"{trade.shares} shares @ ${trade.entry_price:.2f}")
+            # Subscribe for price monitoring
+            if self.stock_monitor.is_connected:
+                await self.stock_monitor.subscribe([trade.symbol])
+
+        for trade in result["cancelled"]:
+            logger.info(f"Account B CANCEL: {trade.symbol} (unfilled/expired)")
+
+    async def _poll_cameron_patterns(self):
+        """Poll cameron_scores for qualifying Cameron B2 patterns and submit limit orders."""
+        if not self._account_c_enabled or self._eod_complete:
+            return
+        if not self._is_entry_allowed():
+            return
+
+        setups = self.cameron_checker.poll_qualifying_patterns()
+        if not setups:
+            return
+
+        # Enrich setups with article data (data collection, not a filter)
+        db_url = os.environ.get("DATABASE_URL")
+        if db_url:
+            from paper_trading.article_lookup import check_articles_for_symbol
+            for setup in setups:
+                info = check_articles_for_symbol(db_url, setup.symbol)
+                setup.has_news = info.has_news
+                setup.article_count = info.article_count
+                if info.has_news:
+                    logger.info(
+                        f"Cameron NEWS: {setup.symbol} has {info.article_count} articles"
+                    )
+
+        for setup in setups:
+            if not self.position_manager_c.can_open_position:
+                logger.info("Cameron: at max positions, stopping pattern poll")
+                break
+
+            if self.position_manager_c.already_traded(setup.symbol):
+                continue
+
+            # Log signal to dashboard (annotate with news count if present)
+            pattern_display = f"{setup.pattern_type} ({setup.pattern_strength})"
+            if setup.has_news:
+                pattern_display += f" [NEWS x{setup.article_count}]"
+
+            if self.dashboard_c and self.dashboard_c.enabled:
+                self.dashboard_c.log_signal(
+                    symbol=setup.symbol,
+                    score=0,
+                    rsi=0,
+                    ratio=0,
+                    notional=0,
+                    price=setup.entry_price,
+                    direction=setup.direction,
+                    stop_loss=setup.stop_loss,
+                    target_1=setup.target_1,
+                    risk_per_share=setup.risk_per_share,
+                    pattern_strength=pattern_display,
+                )
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY RUN] Cameron: BUY {setup.symbol} "
+                    f"@ ${setup.entry_price:.2f} (stop=${setup.stop_loss:.2f}, "
+                    f"target=${setup.target_1:.2f}, type={setup.pattern_type}, "
+                    f"gap={setup.gap_pct:.0%}, rvol={setup.rvol:.0f}x)"
+                )
+                continue
+
+            trade = await self.position_manager_c.open_limit_position(
+                setup, max_risk=self.config.CAMERON_MAX_RISK_PER_TRADE
+            )
+            if trade:
+                # Subscribe for real-time price updates
+                if self.stock_monitor.is_connected:
+                    await self.stock_monitor.subscribe([setup.symbol])
+
+    async def _check_cameron_pending(self):
+        """Check pending Cameron limit orders for fills/expiry."""
+        if not self._account_c_enabled:
+            return
+
+        if not self.position_manager_c._pending_limit_orders:
+            return
+
+        result = await self.position_manager_c.check_pending_orders(
+            max_age_minutes=self.config.CAMERON_CONFIRMATION_WINDOW_MIN
+        )
+
+        for trade in result["filled"]:
+            logger.info(f"Cameron FILL: {trade.symbol} "
+                       f"{trade.shares} shares @ ${trade.entry_price:.2f}")
+            if self.stock_monitor.is_connected:
+                await self.stock_monitor.subscribe([trade.symbol])
+
+        for trade in result["cancelled"]:
+            logger.info(f"Cameron CANCEL: {trade.symbol} (unfilled/expired)")
+
+    async def _cameron_scan_tick(self):
+        """Run one Cameron scanner cycle if within scan window."""
+        if not self._account_c_enabled or not self.cameron_scanner:
+            return
+
+        now_et = self._get_et_now()
+        if not self.cameron_scanner.is_scan_window(now_et):
+            return
+
+        # Load candidates once per day on first tick
+        if not self.cameron_scanner._candidates_loaded:
+            await self.cameron_scanner.load_candidates()
+
+        try:
+            count = await self.cameron_scanner.scan_tick()
+            if count > 0:
+                logger.info(f"Cameron scan: {count} new patterns detected")
+        except Exception as e:
+            logger.warning(f"Cameron scan_tick failed: {e}")
 
     def get_realtime_price(self, symbol: str) -> Optional[float]:
         """Get real-time price from WebSocket cache."""
@@ -285,10 +572,15 @@ class PaperTradingEngine:
         position_symbols = list(self.position_manager.active_trades.keys())
         pending_symbols = list(self.position_manager._pending_buys)
 
-        # Include Account B positions and pending buys
+        # Include Account B positions and pending limit orders
         if self._account_b_enabled:
             position_symbols += list(self.position_manager_b.active_trades.keys())
-            pending_symbols += list(self.position_manager_b._pending_buys)
+            pending_symbols += list(self.position_manager_b._pending_limit_orders.keys())
+
+        # Include Account C positions and pending limit orders
+        if self._account_c_enabled:
+            position_symbols += list(self.position_manager_c.active_trades.keys())
+            pending_symbols += list(self.position_manager_c._pending_limit_orders.keys())
 
         all_symbols = list(set(position_symbols + pending_symbols))
 
@@ -308,15 +600,26 @@ class PaperTradingEngine:
             self.eod_closer.reset_daily()
             self._eod_complete = False  # Re-enable signal processing for new day
             self._bar_retention_pending = True  # Schedule old bar cleanup
+
+            # v58: Reset momentum screener state for new day
+            self._momentum_screened_today = False
+            self._momentum_bought_today = False
+            self._momentum_candidates = []
             self._last_daily_reset = today
 
             # Account B daily reset
             if self._account_b_enabled:
                 self.position_manager_b.reset_daily()
                 self.eod_closer_b.reset_daily()
-                self.engulfing_checker.load_daily_watchlist(
-                    lookback_hours=self.config.ENGULFING_DAILY_LOOKBACK_HOURS
-                )
+                self.pattern_poller.reset_daily()
+
+            # Account C daily reset
+            if self._account_c_enabled:
+                self.position_manager_c.reset_daily()
+                self.eod_closer_c.reset_daily()
+                self.cameron_checker.reset_daily()
+                if self.cameron_scanner:
+                    self.cameron_scanner.reset_daily()
 
             # Only clear dashboard if we're in pre-market (before 9:30 AM)
             # This prevents wiping data on mid-day restarts
@@ -328,6 +631,9 @@ class PaperTradingEngine:
                 if self.dashboard_b and self.dashboard_b.enabled:
                     logger.info("Pre-market: clearing Account B dashboard for new day")
                     self.dashboard_b.clear_daily()
+                if self.dashboard_c and self.dashboard_c.enabled:
+                    logger.info("Pre-market: clearing Cameron dashboard for new day")
+                    self.dashboard_c.clear_daily()
             else:
                 logger.info("Mid-day restart: preserving dashboard data")
 
@@ -511,72 +817,18 @@ class PaperTradingEngine:
             await self.stock_monitor.subscribe(triggered_symbols)
 
         for symbol, stats in triggered.items():
-            # Check per-symbol eligibility for each account
+            # Account B now uses independent pattern polling, not UOA triggers
             a_eligible = (self.position_manager.can_open_position
                           and not self.position_manager.already_traded(symbol)
                           and not self.position_manager.has_position(symbol))
-            b_eligible = (self._account_b_enabled
-                          and self.position_manager_b.can_open_position
-                          and not self.position_manager_b.already_traded(symbol)
-                          and not self.position_manager_b.has_position(symbol))
 
-            # Skip if neither account can trade this symbol
-            if not a_eligible and not b_eligible:
-                # Break only if BOTH accounts are at max capacity
-                a_full = not self.position_manager.can_open_position
-                b_full = not self._account_b_enabled or not self.position_manager_b.can_open_position
-                if a_full and b_full:
-                    logger.info("All accounts at max positions, skipping signal check")
-                    break
-                continue
-
-            # ── Account B: engulfing-primary, score as confirmation ──
-            # Evaluates at aggregator level — no Signal object or filter chain needed.
-            # Account B is NOT a subset of Account A (may trade symbols that fail A's RSI filter).
-            if b_eligible and stats.get("score", 0) >= self.config.SCORE_THRESHOLD:
-                has_eng, engulfing_data = self.engulfing_checker.has_engulfing_confirmation(
-                    symbol=symbol,
-                    lookback_minutes=self.config.ENGULFING_LOOKBACK_MINUTES,
-                )
-                if has_eng:
-                    vol_ratio = self.engulfing_checker.get_volume_ratio(symbol)
-                    vol_str = f"vol_ema30={vol_ratio:.1f}x" if vol_ratio else "vol_ema30=N/A"
-                    logger.info(
-                        f"ACCOUNT B TRADE: {symbol} score={stats['score']} "
-                        f"engulfing_strength={engulfing_data['pattern_strength']} "
-                        f"{vol_str}"
-                    )
-                    # Log to Account B dashboard
-                    if self.dashboard_b and self.dashboard_b.enabled:
-                        price = await self.trader_b.get_latest_price(symbol) or 0
-                        self.dashboard_b.log_signal(
-                            symbol=symbol,
-                            score=stats.get("score", 0),
-                            rsi=0,
-                            ratio=0,
-                            notional=stats.get("notional", 0),
-                            price=price,
-                            volume_ratio=vol_ratio,
-                            engulfing_strength=engulfing_data.get("pattern_strength"),
-                        )
-                    if not self.dry_run:
-                        await self.position_manager_b.open_position(
-                            symbol=symbol,
-                            signal_score=stats.get("score", 0),
-                            signal_rsi=0,  # metadata only — not used for trading
-                            signal_notional=stats.get("notional", 0),
-                            volume_ratio=vol_ratio,
-                        )
-                    else:
-                        logger.info(f"[DRY RUN] Would open Account B position: {symbol}")
-                else:
-                    logger.info(
-                        f"ACCOUNT B SKIP: {symbol} score={stats['score']} — "
-                        f"no bullish engulfing (daily or 5min)"
-                    )
-
-            # ── Account A: full filter chain (unchanged) ──
+            # ── Account A: full filter chain (disabled when momentum screener active) ──
+            if not self.config.USE_UOA_SIGNALS:
+                continue  # v58: Account A uses momentum screener, not UOA signals
             if not a_eligible:
+                if not self.position_manager.can_open_position:
+                    logger.info("Account A at max positions, skipping signal check")
+                    break
                 continue
 
             # Create signal from aggregated stats (with dynamic TA fetch if needed)
@@ -628,6 +880,74 @@ class PaperTradingEngine:
                 else:
                     logger.info(f"[DRY RUN] Would open position: {symbol}")
 
+    async def _execute_momentum_buys(self):
+        """
+        Execute buys for momentum screener candidates (v58).
+
+        Iterates through candidates (sorted by momentum ascending = most beaten-down first),
+        skips if already holding, opens position until max reached.
+        """
+        if not self._momentum_candidates:
+            logger.info("Momentum buy: no candidates to buy")
+            return
+
+        bought = 0
+        skipped = 0
+        for candidate in self._momentum_candidates:
+            if not self.position_manager.can_open_position:
+                logger.info(f"Momentum buy: max positions reached after {bought} buys")
+                break
+
+            symbol = candidate.symbol
+            if self.position_manager.has_position(symbol):
+                logger.info(f"Momentum buy: skip {symbol} — already holding")
+                skipped += 1
+                continue
+            if self.position_manager.already_traded(symbol):
+                logger.info(f"Momentum buy: skip {symbol} — already traded today")
+                skipped += 1
+                continue
+
+            if self.dry_run:
+                logger.info(
+                    f"[DRY RUN] Momentum buy: {symbol} mom={candidate.momentum:.1%} "
+                    f"price=${candidate.price:.2f}"
+                )
+                bought += 1
+                continue
+
+            trade = await self.position_manager.open_position(
+                symbol=symbol,
+                signal_score=0,  # No UOA score for momentum screener
+                signal_rsi=0,    # No RSI for momentum screener
+                signal_notional=0,
+            )
+
+            if trade:
+                # Log to Google Sheet Active Signals tab
+                dashboard = get_dashboard()
+                if dashboard.enabled:
+                    dashboard.log_signal(
+                        symbol=symbol,
+                        score=0,
+                        rsi=candidate.momentum * 100,  # Show momentum % in RSI column
+                        ratio=0,
+                        notional=0,
+                        price=trade.entry_price,
+                    )
+
+                logger.info(
+                    f"Momentum buy: {symbol} mom={candidate.momentum:.1%} "
+                    f"{trade.shares} shares @ ${trade.entry_price:.2f} "
+                    f"(overnight hold)"
+                )
+                bought += 1
+            else:
+                logger.warning(f"Momentum buy: failed to open {symbol}")
+
+        logger.info(f"Momentum buy complete: {bought} opened, {skipped} skipped, "
+                     f"{len(self._momentum_candidates)} candidates")
+
     async def _check_hard_stops(self):
         """
         Check if any positions hit hard stop.
@@ -652,9 +972,35 @@ class PaperTradingEngine:
 
     def _on_eod_complete_b(self, closed_trades):
         """Callback when Account B EOD close completes."""
+        # Cancel any pending limit orders at EOD
+        asyncio.ensure_future(self._cancel_account_b_pending_at_eod())
+
         logger.info(f"Account B EOD: closed {len(closed_trades)} positions")
         for t in closed_trades:
             logger.info(f"  Account B: {t.symbol} P&L: ${t.pnl:+.2f} ({t.pnl_pct:+.2f}%)")
+
+    def _on_eod_complete_c(self, closed_trades):
+        """Callback when Account C (Cameron) EOD close completes."""
+        asyncio.ensure_future(self._cancel_cameron_pending_at_eod())
+        logger.info(f"Cameron EOD: closed {len(closed_trades)} positions")
+        for t in closed_trades:
+            logger.info(f"  Cameron: {t.symbol} P&L: ${t.pnl:+.2f} ({t.pnl_pct:+.2f}%)")
+
+    async def _cancel_cameron_pending_at_eod(self):
+        """Cancel all pending Cameron limit orders at EOD."""
+        if not self._account_c_enabled:
+            return
+        cancelled = await self.position_manager_c.cancel_all_pending_limit_orders()
+        if cancelled:
+            logger.info(f"Cameron EOD: cancelled {len(cancelled)} pending limit orders")
+
+    async def _cancel_account_b_pending_at_eod(self):
+        """Cancel all pending Account B limit orders at EOD."""
+        if not self._account_b_enabled:
+            return
+        cancelled = await self.position_manager_b.cancel_all_pending_limit_orders()
+        if cancelled:
+            logger.info(f"Account B EOD: cancelled {len(cancelled)} pending limit orders")
 
     def _on_eod_complete(self, closed_trades):
         """Callback when EOD close completes."""
@@ -714,11 +1060,29 @@ class PaperTradingEngine:
         """
         logger.info("=" * 60)
         logger.info("Paper Trading Engine Starting")
-        logger.info(f"Config: Score >= {self.config.SCORE_THRESHOLD}, "
-                   f"RSI < {self.config.RSI_THRESHOLD}, "
-                   f"Notional >= ${self.config.MIN_NOTIONAL:,}")
+        if self.config.USE_MOMENTUM_SCREENER:
+            logger.info(f"Account A: Momentum<{self.config.MOMENTUM_THRESHOLD:.0%} EOD Screener "
+                       f"(screen@{self.config.MOMENTUM_SCREEN_TIME}, buy@{self.config.MOMENTUM_BUY_TIME})")
+            logger.info(f"  Price >= ${self.config.MOMENTUM_PRICE_FLOOR}, "
+                       f"max {self.config.MOMENTUM_MAX_CANDIDATES} candidates")
+        else:
+            logger.info(f"Account A: UOA signals — Score >= {self.config.SCORE_THRESHOLD}, "
+                       f"RSI < {self.config.RSI_THRESHOLD}, "
+                       f"Notional >= ${self.config.MIN_NOTIONAL:,}")
+        logger.info(f"Hard stop: {self.config.HARD_STOP_PCT*100:.0f}%")
         logger.info(f"Max positions: {self.config.MAX_CONCURRENT_POSITIONS}")
         logger.info(f"Exit time: {self.config.EXIT_TIME}")
+        if self._account_b_enabled:
+            logger.info(f"Account B: Big-Hitter Pattern Trader "
+                       f"(poll every {self.config.ACCOUNT_B_POLL_INTERVAL_SEC}s, "
+                       f"max_risk=${self.config.ACCOUNT_B_MAX_RISK_PER_TRADE}, "
+                       f"candle_range<={self.config.ACCOUNT_B_MAX_CANDLE_RANGE})")
+        if self._account_c_enabled:
+            logger.info(f"Account C: Cameron B2 Pattern Trader "
+                       f"(scan {self.config.CAMERON_SCAN_START}-{self.config.CAMERON_SCAN_END}, "
+                       f"poll every {self.config.CAMERON_POLL_INTERVAL_SEC}s, "
+                       f"max_risk=${self.config.CAMERON_MAX_RISK_PER_TRADE}, "
+                       f"rvol>={self.config.CAMERON_RVOL_MIN}x)")
         logger.info(f"Dry run: {self.dry_run}")
         logger.info("=" * 60)
 
@@ -739,6 +1103,21 @@ class PaperTradingEngine:
                 self.bucket_aggregator = BucketAggregator(db_pool=self._db_pool)
                 logger.info("BucketAggregator initialized with asyncpg pool")
 
+                # Initialize momentum screener (v58)
+                if self.config.USE_MOMENTUM_SCREENER:
+                    self._momentum_screener = MomentumScreener(
+                        db_pool=self._db_pool,
+                        momentum_threshold=self.config.MOMENTUM_THRESHOLD,
+                        price_floor=self.config.MOMENTUM_PRICE_FLOOR,
+                        min_adv=self.config.MIN_ADV if self.config.USE_ADV_FILTER else 0,
+                        max_candidates=self.config.MOMENTUM_MAX_CANDIDATES,
+                    )
+                    logger.info(
+                        f"Momentum Screener initialized: threshold={self.config.MOMENTUM_THRESHOLD:.0%}, "
+                        f"price>=${self.config.MOMENTUM_PRICE_FLOOR}, "
+                        f"screen@{self.config.MOMENTUM_SCREEN_TIME}, buy@{self.config.MOMENTUM_BUY_TIME}"
+                    )
+
                 # Initialize intraday bar collector
                 if self.config.COLLECT_INTRADAY_BARS:
                     self.bar_collector = IntradayBarCollector(
@@ -752,6 +1131,31 @@ class PaperTradingEngine:
                         f"max_batches={self.config.INTRADAY_BARS_MAX_BATCHES} "
                         f"({self.config.INTRADAY_BARS_MAX_BATCHES * 100} symbols)"
                     )
+
+                # Initialize Cameron scanner (Account C)
+                if self._account_c_enabled:
+                    self.cameron_scanner = CameronScanner(
+                        db_pool=self._db_pool,
+                        alpaca_key=os.environ.get("ALPACA_API_KEY_C", ""),
+                        alpaca_secret=os.environ.get("ALPACA_SECRET_KEY_C", ""),
+                        scan_start=self.config.CAMERON_SCAN_START,
+                        scan_end=self.config.CAMERON_SCAN_END,
+                        rvol_min=self.config.CAMERON_RVOL_MIN,
+                    )
+                    logger.info(
+                        f"CameronScanner initialized: "
+                        f"scan={self.config.CAMERON_SCAN_START}-{self.config.CAMERON_SCAN_END}, "
+                        f"rvol>={self.config.CAMERON_RVOL_MIN}x"
+                    )
+
+                    # Pre-load candidates at startup so they're published to
+                    # cameron_candidates_daily before 9:45 AM (V1 article
+                    # fetch job reads this table at 8:30 AM ET)
+                    try:
+                        n = await self.cameron_scanner.load_candidates()
+                        logger.info(f"Cameron pre-loaded {n} candidates at startup")
+                    except Exception as e:
+                        logger.warning(f"Cameron pre-load candidates failed: {e}")
             except Exception as e:
                 logger.warning(f"Failed to create asyncpg pool for BucketAggregator: {e}")
 
@@ -780,9 +1184,15 @@ class PaperTradingEngine:
                            f"(${account_b.buying_power:,.2f} buying power)")
             await self.position_manager_b.sync_on_startup()
             self.eod_closer_b.start()
-            self.engulfing_checker.load_daily_watchlist(
-                lookback_hours=self.config.ENGULFING_DAILY_LOOKBACK_HOURS
-            )
+
+        # Account C: sync positions and start EOD closer
+        if self._account_c_enabled and not self.dry_run:
+            account_c = await self.trader_c.get_account()
+            if account_c:
+                logger.info(f"Account C: ${account_c.portfolio_value:,.2f} "
+                           f"(${account_c.buying_power:,.2f} buying power)")
+            await self.position_manager_c.sync_on_startup()
+            self.eod_closer_c.start()
 
         # Start stock price WebSocket monitor (PROD-1)
         # Always starts receive loop with retry — initial failure is non-fatal
@@ -804,12 +1214,18 @@ class PaperTradingEngine:
         subscription_update_interval = 5  # Update subscriptions every 5 seconds
         dashboard_update_interval = 30  # Update dashboard positions every 30 seconds
         bar_collect_interval = self.config.INTRADAY_BARS_INTERVAL_SEC
+        account_b_poll_interval = self.config.ACCOUNT_B_POLL_INTERVAL_SEC if self._account_b_enabled else 9999
+        cameron_poll_interval = self.config.CAMERON_POLL_INTERVAL_SEC if self._account_c_enabled else 9999
+        cameron_scan_interval = self.config.CAMERON_SCAN_INTERVAL_SEC if self._account_c_enabled else 9999
 
         last_signal_check = 0
         last_stop_check = 0
         last_subscription_update = 0
         last_dashboard_update = 0
         last_bar_collect = 0
+        last_account_b_poll = 0
+        last_cameron_poll = 0
+        last_cameron_scan = 0
 
         try:
             async for trade in self.firehose.stream():
@@ -832,12 +1248,69 @@ class PaperTradingEngine:
                     await self._check_for_signals()
                     last_signal_check = now
 
+                    # v58: Momentum screener time-based checks (inside signal interval)
+                    if self._momentum_screener:
+                        now_et = self._get_et_now()
+                        now_time = now_et.time()
+
+                        # Run momentum screen at 3:50 PM
+                        if (not self._momentum_screened_today
+                                and now_time >= self.config.MOMENTUM_SCREEN_TIME):
+                            try:
+                                self._momentum_candidates = await self._momentum_screener.screen()
+                                self._momentum_screened_today = True
+                                logger.info(f"Momentum screen complete: {len(self._momentum_candidates)} candidates")
+                            except Exception as e:
+                                logger.error(f"Momentum screen failed: {e}")
+                                self._momentum_screened_today = True  # Don't retry
+
+                        # Execute momentum buys at 3:56 PM (after EOD closer runs at 3:55)
+                        if (self._momentum_candidates
+                                and not self._momentum_bought_today
+                                and now_time >= self.config.MOMENTUM_BUY_TIME):
+                            await self._execute_momentum_buys()
+                            self._momentum_bought_today = True
+
                 # Periodic stop check (fallback if WebSocket missed something)
                 if now - last_stop_check >= stop_check_interval:
                     await self._check_hard_stops()
-                    if self._account_b_enabled:
-                        await self.position_manager_b.check_hard_stops()
+                    # Account B: REST fallback for stop/target check
+                    if self._account_b_enabled and self.position_manager_b.active_trades:
+                        async def _get_price_b(sym):
+                            return await self.trader_b.get_latest_price(sym)
+                        await self.position_manager_b.check_stops_and_targets(_get_price_b)
+                    # Account C: REST fallback for stop/target check
+                    if self._account_c_enabled and self.position_manager_c.active_trades:
+                        async def _get_price_c(sym):
+                            return await self.trader_c.get_latest_price(sym)
+                        await self.position_manager_c.check_stops_and_targets(_get_price_c)
                     last_stop_check = now
+
+                # Account B: poll patterns and check pending limit orders
+                if self._account_b_enabled and now - last_account_b_poll >= account_b_poll_interval:
+                    try:
+                        await self._poll_account_b_patterns()
+                        await self._check_account_b_pending()
+                    except Exception as e:
+                        logger.warning(f"Account B poll/check failed: {e}")
+                    last_account_b_poll = now
+
+                # Cameron scanner: run pattern detection every 60s
+                if self._account_c_enabled and now - last_cameron_scan >= cameron_scan_interval:
+                    try:
+                        await self._cameron_scan_tick()
+                    except Exception as e:
+                        logger.warning(f"Cameron scan failed: {e}")
+                    last_cameron_scan = now
+
+                # Cameron checker: poll patterns and check pending orders every 30s
+                if self._account_c_enabled and now - last_cameron_poll >= cameron_poll_interval:
+                    try:
+                        await self._poll_cameron_patterns()
+                        await self._check_cameron_pending()
+                    except Exception as e:
+                        logger.warning(f"Cameron poll/check failed: {e}")
+                    last_cameron_poll = now
 
                 # Periodic subscription update for stock monitor
                 if now - last_subscription_update >= subscription_update_interval:
@@ -855,6 +1328,11 @@ class PaperTradingEngine:
                             await self.position_manager_b.update_dashboard_positions()
                         except Exception as e:
                             logger.warning(f"Account B dashboard position update failed: {e}")
+                    if self._account_c_enabled:
+                        try:
+                            await self.position_manager_c.update_dashboard_positions()
+                        except Exception as e:
+                            logger.warning(f"Cameron dashboard position update failed: {e}")
                     last_dashboard_update = now
 
                 # Periodic intraday bar collection
@@ -906,6 +1384,16 @@ class PaperTradingEngine:
         if self._account_b_enabled:
             if hasattr(self, 'eod_closer_b'):
                 self.eod_closer_b.stop()
+            # Cancel any pending limit orders
+            await self.position_manager_b.cancel_all_pending_limit_orders()
+
+        # Account C shutdown
+        if self._account_c_enabled:
+            if hasattr(self, 'eod_closer_c'):
+                self.eod_closer_c.stop()
+            await self.position_manager_c.cancel_all_pending_limit_orders()
+            if self.cameron_scanner:
+                await self.cameron_scanner.close()
 
         # Only close positions on intentional shutdown (KeyboardInterrupt / EOD)
         # Do NOT close on code crashes — positions are safer left open
@@ -914,6 +1402,8 @@ class PaperTradingEngine:
             await self.position_manager.close_all_positions(reason="shutdown")
             if self._account_b_enabled:
                 await self.position_manager_b.close_all_positions(reason="shutdown")
+            if self._account_c_enabled:
+                await self.position_manager_c.close_all_positions(reason="shutdown")
         elif not self._graceful_shutdown:
             logger.warning("Crash shutdown — preserving positions (not closing)")
 
@@ -949,6 +1439,8 @@ class PaperTradingEngine:
         await self.trader.close()
         if self._account_b_enabled and hasattr(self, 'trader_b'):
             await self.trader_b.close()
+        if self._account_c_enabled and hasattr(self, 'trader_c'):
+            await self.trader_c.close()
 
         # Log final stats
         logger.info(f"Signal filter stats: {self.signal_filter.get_stats()}")

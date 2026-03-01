@@ -2,6 +2,473 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-01 11:10 PST] — Cameron Article Enrichment (V2 Side)
+
+### Done
+- **`article_lookup.py`** (new): `check_articles_for_symbol()` queries `articles` + `article_entities` for ticker matches within 36h lookback. Returns `ArticleInfo(has_news, article_count, latest_title, latest_publish_time)`. Graceful degradation on any error.
+- **`cameron_scanner.py`**: Added `_publish_candidates()` — writes today's candidates to `cameron_candidates_daily` table after `load_candidates()`. Coordination table for V1 article fetch job.
+- **`cameron_scanner.py`**: Early `load_candidates()` call at startup (before 9:45 AM scan window) so candidates are published to coordination table before V1 article fetch runs at 8:30 AM.
+- **`cameron_checker.py`**: Added `has_news: bool` and `article_count: int` fields to `CameronTradeSetup` dataclass.
+- **`main.py`**: `_poll_cameron_patterns()` enriches each setup with article data before iteration. Logs `"Cameron NEWS: SYMBOL has N articles"` when articles found. Dashboard strength column shows `[NEWS xN]` suffix.
+- **`dashboard.py`**: `log_trade_open()` extended with `has_news` and `article_count` params. `paper_trades_log_c` INSERT includes both new columns. `paper_trades_log_b` branch unchanged (those columns don't exist on that table).
+- **`position_manager.py`**: `TradeRecord` extended with `has_news` and `article_count`. `open_limit_position()` reads from setup via `getattr()` (safe defaults), passes through to `log_trade_open()`.
+- **SQL**: `cameron_candidates_daily` table (PK: trade_date, symbol) + ALTER `paper_trades_log_c` to add `has_news` BOOLEAN and `article_count` INTEGER.
+- **BACKLOG.md**: Added P1 item for FL3 side: Cameron Pre-Market Article Fetch job (`fr3-cameron-news-fetch`, 8:30 AM ET Mon-Fri)
+
+### State
+- V2 side complete — all code changes ready for deployment
+- DDL must be run before deploying code (`sql/create_cameron_candidates_daily.sql`, `sql/alter_paper_trades_log_c_has_news.sql`)
+- V1 article fetch job NOT yet implemented (backlogged as P1)
+- Without V1 job, `has_news` will be True only for symbols already covered by existing `fr3-media-news-fmp` job
+
+### Next
+- Run DDL on production database
+- Build and deploy new image
+- Implement V1 `cameron_news_fetch.py` (FL3 project, P1 backlog item)
+- After 1-2 weeks of data collection: analyze `paper_trades_log_c WHERE has_news = TRUE` vs baseline
+
+### Files Changed
+- `sql/create_cameron_candidates_daily.sql` (new)
+- `sql/alter_paper_trades_log_c_has_news.sql` (new)
+- `paper_trading/article_lookup.py` (new)
+- `paper_trading/cameron_scanner.py` (modified)
+- `paper_trading/cameron_checker.py` (modified)
+- `paper_trading/main.py` (modified)
+- `paper_trading/dashboard.py` (modified)
+- `paper_trading/position_manager.py` (modified)
+- `BACKLOG.md` (modified — added P1 item)
+
+---
+
+## [2026-02-28 19:00 PST] — Expanded Cameron Backtest (2020-2026) + Sentiment Analysis
+
+### Done
+- **Rebuilt Cameron universe** from 2020-01-01 (was 2023+): 13.2M rows, 18,946 symbols, 1,535 trading days
+- **Expanded intraday backtest**: 4,146 trades across 6 years (2020-2026), dual-exit (target_1 + target_2). Profitable every year. Results saved to `backtest_results/cameron_intraday_trades_target_1_full.csv` and `_target_2_full.csv`
+- **Sentiment correlation on expanded trades**: Ran S1-S6 tests + article-matched subset analysis on 4,146 trades. Conclusion: sentiment_daily is dead for Cameron (0.4% coverage), NEWS ONLY shows directional signal (N=53, Sharpe 4.89) but not significant, no filter meets adoption criteria (p<0.05)
+- **Updated CAMERON_FINDINGS.md**: Section 7 now reflects B2 deployment status, filter stack definition, and remaining next steps
+- **Fixed `cameron_sentiment_correlation.py`**: Added `--trades` CLI arg for flexible input, `::text[]` cast for large symbol arrays, added `run_article_subset_analysis()` for deep dive on article-matched trades
+
+### State
+- B2 filter stack validated across 6 years — no changes needed
+- Sentiment filters conclusively dropped from Cameron roadmap
+- Account C live on Cloud Run (revision `paper-trading-live-00111-4rp`), monitoring starts Monday
+
+### Next
+- Monitor Account C first live trading week
+- Evaluate live performance vs 6-year backtest baseline
+
+### Files Changed
+- `E:/backtest_cache/cameron_daily_universe.parquet` (rebuilt from 2020)
+- `backtest_results/cameron_intraday_trades_target_1_full.csv` (new)
+- `backtest_results/cameron_intraday_trades_target_2_full.csv` (new)
+- `backtest_results/cameron_intraday_summary_target_1_full.json` (new)
+- `backtest_results/cameron_intraday_summary_target_2_full.json` (new)
+- `backtest_results/cameron_trades_with_sentiment_full.csv` (new)
+- `scripts/cameron_sentiment_correlation.py` (modified)
+- `Docs/CAMERON_FINDINGS.md` (updated)
+
+---
+
+## [2026-02-28 00:30 PST] — v61 DEPLOYED: Account C — Cameron B2 Pattern Trader
+
+### Done
+- **Account C integration**: Full Cameron B2 pattern trader wired as third independent paper trading account, mirroring Account B architecture.
+- **`cameron_scanner.py`** (new): Real-time pattern scanner coroutine. Pre-market loads gapper candidates from `orats_daily` (gap≥4%, rvol≥10x, $1-$20, cap 30 symbols). During 9:45-11:00 AM ET every 60s: fetches 5-min bars from Alpaca, runs 3 pattern detectors (consolidation_breakout, vwap_reclaim, bull_flag), UPSERTs moderate-strength patterns to `cameron_scores` table.
+- **`cameron_checker.py`** (new): Polls `cameron_scores` every 30s. B2 filter stack: moderate-only, priority sort (consol_breakout > vwap_reclaim > bull_flag), bull flag max 1/day, dedup by (symbol, pattern_date, pattern_type).
+- **`cameron_scores` table** (new): 13 columns, UNIQUE on (symbol, pattern_date, pattern_type, interval), indexed on scan_ts. Grants to `fr3_app`.
+- **`paper_trades_log_c` table** (new): Cloned from `paper_trades_log_b` (24 columns including direction, stop, target, etc.). Grants to `fr3_app`.
+- **Config**: 10 new settings in `TradingConfig` — scan window, poll/scan intervals, BF daily cap, max risk ($500), max positions (5), confirmation window (30 min).
+- **main.py**: ~130 lines added — Account C init, WebSocket stop/target monitoring (bullish-only), async exit, pattern polling, scanner tick, daily reset, dashboard updates, startup sync, shutdown.
+- **dashboard.py**: `paper_trades_log_c` in ALLOWED_TABLES; extended column branches handle `_c` alongside `_b` for log_trade_open and load_open_trades_from_db.
+- **Deployed** `paper-trading:v61` → revision `paper-trading-live-00110-mlh` (100% traffic)
+- **Note**: Account C is disabled at runtime until `ALPACA_API_KEY_C` / `ALPACA_SECRET_KEY_C` env vars are provisioned on Cloud Run. Accounts A and B unaffected.
+
+### State
+- v61 LIVE on `paper-trading-live` (revision `paper-trading-live-00110-mlh`, 100% traffic)
+- Account C: code deployed, DB tables created, awaiting Alpaca paper account keys
+- Accounts A and B: unchanged, running normally
+- Market closed (Saturday) — Account C first live test after keys provisioned + next market open
+- Rollback: `paper-trading:v60` or set `USE_ACCOUNT_C = False`
+
+### Next
+- Provision Alpaca paper trading account for Account C (API key + secret)
+- Set `ALPACA_API_KEY_C` and `ALPACA_SECRET_KEY_C` on Cloud Run service
+- Monitor first Cameron scan session:
+  - Candidate loading from orats_daily
+  - Pattern detection rate during 9:45-11:00 AM window
+  - Limit order submissions and fill rates
+  - Stop/target exit execution
+
+### Files Changed
+- `paper_trading/cameron_checker.py` (NEW)
+- `paper_trading/cameron_scanner.py` (NEW)
+- `sql/create_cameron_scores.sql` (NEW)
+- `sql/create_paper_trades_log_c.sql` (NEW)
+- `paper_trading/config.py` (MODIFIED)
+- `paper_trading/dashboard.py` (MODIFIED)
+- `paper_trading/main.py` (MODIFIED)
+
+## [2026-02-27 17:35 PST] — v60 DEPLOYED: Account B Redesign — Big-Hitter Pattern Trader
+
+### Done
+- **Full Account B redesign**: Replaced UOA trigger + engulfing confirmation flow with independent pattern polling from `engulfing_scores` table (5-min timeframe).
+- **New signal flow**: Poll `engulfing_scores` every 30s → apply big-hitter filters (candle_range ≤ 0.57, risk/share ≥ $1, volume confirmed, trend context) → submit limit order at pattern's entry_price → monitor fill (cancel after 30 min) → monitor stop_loss/target_1 → exit at stop (market), target (market), or EOD 3:55 PM.
+- **Both directions**: Supports long AND short trades (direction from engulfing pattern). Bearish patterns submit sell-short orders, with direction-aware P&L (entry - exit for shorts).
+- **Limit order entry**: No more market orders for Account B. Limit orders at pattern entry_price with 30-min confirmation window. Unfilled orders auto-cancelled.
+- **$500 max risk/trade**: Position sizing via `qty = floor($500 / risk_per_share)` instead of portfolio-percentage sizing.
+- **DB migration**: Added 9 columns to `paper_trades_log_b`: direction, stop_price, target_price, risk_per_share, limit_order_id, order_submitted_at, pattern_date, candle_range, pattern_strength.
+- **Dashboard update**: Account B tabs now show Direction/Entry/Stop/Target/Risk-per-Share/Strength instead of old Score/Engulfing/Notional layout.
+- **No UOA dependency**: Account B no longer requires firehose UOA triggers. Operates independently via DB polling.
+- **Deployed** `paper-trading:v60` → revision `paper-trading-live-00109-6tx` (100% traffic, latestRevision=true)
+- **Verified**: Clean startup, all components healthy, Account B initialized as Big-Hitter Pattern Trader.
+
+### State
+- v60 LIVE on `paper-trading-live` (revision `paper-trading-live-00109-6tx`, 100% traffic)
+- Account A: 10 momentum positions held (GRAL, BOIL, NVO, KD, MSTZ, QURE, KLAR, ODD, LQDA, FLNC)
+- Account B: 0 positions, $95K equity, $355K buying power — ready for Monday
+- Market closed (Friday 8:30 PM ET) — first live test will be Monday market open
+- Rollback: `paper-trading:v59` or set `USE_ACCOUNT_B = False`
+
+### Next
+- Monitor Monday's first trading session for Account B:
+  - Pattern poll count and filter pass/fail reasons
+  - Limit order submissions at correct entry prices
+  - Fill detection and position tracking
+  - Stop/target monitoring via WebSocket price updates
+  - EOD close of both long and short positions
+  - Pending unfilled order cancellation at EOD
+- Verify dashboard Account B tabs display correctly with new layout
+
+### Files Changed
+- `paper_trading/config.py` — Removed old engulfing lookback settings, added big-hitter config (poll interval, max risk, candle range, min risk/share, confirmation window, lookback)
+- `paper_trading/engulfing_checker.py` — Complete rewrite: `EngulfingChecker` → `PatternPoller` + `TradeSetup` dataclass
+- `paper_trading/alpaca_trader.py` — Added `sell_short()` and `buy_to_cover()` methods
+- `paper_trading/position_manager.py` — Extended `TradeRecord` with direction/stop/target fields, added `_pending_limit_orders`, `open_limit_position()`, `check_pending_orders()`, `check_stops_and_targets()`, `cancel_all_pending_limit_orders()`, direction-aware P&L
+- `paper_trading/dashboard.py` — Updated `log_signal()`, `clear_daily()`, `log_trade_open()`, `load_open_trades_from_db()` for Account B big-hitter layout and new DB columns
+- `paper_trading/main.py` — Replaced `EngulfingChecker` with `PatternPoller`, added `_poll_account_b_patterns()`, `_check_account_b_pending()`, direction-aware stop/target in WebSocket callback, EOD pending order cancellation
+- `sql/alter_paper_trades_b_big_hitter.sql` — Migration adding 9 columns to `paper_trades_log_b`
+- `CHANGELOG.md`, `CLAUDE.md` — Documentation
+
+## [2026-02-27 16:51 PST] — v59 DEPLOYED: Fix orphan position auto-sell on container restart
+
+### Done
+- **Root cause identified**: Cloud Run recycled container at ~1 AM ET. `sync_on_startup()` found Account B positions with no DB records (orphaned), submitted sell orders immediately. Alpaca queued them for market open, closing positions prematurely.
+- **Fix**: Orphaned positions (Alpaca-only, no DB record) are now **adopted** into `active_trades` instead of auto-closed. A DB record is created so future restarts see them as Case A (DB+Alpaca). Normal exit logic (EOD closer / hard stop) handles closing at the right time.
+- **Deployed** `paper-trading:v59` → revision `paper-trading-live-00108-dnh` (100% traffic)
+- **Verified**: Clean startup, Account A 10 momentum positions restored (DB+Alpaca), Account B 0 positions (already sold this morning), 0 orphaned.
+
+### Root Cause Analysis — Account B 1 AM Sell
+- Account B positions were placed at ~3:56-3:58 PM ET yesterday (after EOD closer ran at 3:55 PM)
+- Positions survived overnight (EOD closer had `_closed_today=True`)
+- At ~1 AM ET, Cloud Run recycled container → `sync_on_startup()` ran
+- Positions existed on Alpaca but had no matching records in `paper_trades_log_b`
+- Old code (Case C): immediately submitted sell orders → queued for market open
+- New code (Case C): adopts into `active_trades`, creates DB record, lets EOD closer handle exit
+
+### State
+- v59 LIVE on `paper-trading-live` (revision `paper-trading-live-00108-dnh`, 100% traffic)
+- Account A: 10 momentum positions held (GRAL, BOIL, NVO, KD, MSTZ, QURE, KLAR, ODD, LQDA, FLNC)
+- Account B: 0 positions (sold at market open due to pre-fix bug)
+- Rollback: `paper-trading:v58c` (reverts to auto-close orphans)
+
+### Next
+- Investigate why Account B trades had no DB records despite going through the system (`log_trade_open()` may have failed silently)
+- Monitor next container restart to confirm orphans are adopted correctly
+
+### Files Changed
+- `paper_trading/position_manager.py` (sync_on_startup Case C: close → adopt)
+- `CHANGELOG.md` (this entry)
+- `CLAUDE.md` (current status updated)
+
+## [2026-02-26 13:15 PST] — v58c DEPLOYED: Momentum Query Fix + Fill Retry
+
+### Done
+- **Fixed momentum screen timeout** (v58b): `rsi_screener.py` query used `DISTINCT ON (symbol)` scanning all 8.3M rows of `orats_daily` — timed out on Cloud Run at 3:50 PM ET. Replaced with `WHERE asof_date = (SELECT MAX(asof_date) WHERE asof_date < CURRENT_DATE)` which scans ~5K rows. Same results, sub-second execution.
+- **Fixed ghost position bug** (v58c): `position_manager.py:open_position()` waited only 2s for Alpaca fill confirmation. At market open, fills can take >2s — CNR and PLTK both hit "Position not found after buy" and were never added to `active_trades`. Orders filled on Alpaca but were invisible to EOD closer. Added retry loop: 2s + 3s + 5s + 8s = 18s max with fill status checks.
+- **Manual momentum buys submitted**: Screen timed out at 3:50 PM, ran manually at 3:58 PM. All 10 positions filled (ODD, GRAL, DRVN, KD, TNET, LMND, FLNC, MSTZ, LQDA, NVO).
+- **Cancelled stale Account B orders**: 2 orphaned sell orders for CNR/PLTK (submitted after market close) cancelled. Positions remain — tomorrow's sync_on_startup will close them.
+
+### Root Cause Analysis — Account B Ghost Positions
+- CNR bought 9:46 AM, PLTK bought 9:50 AM (first 2 trades at open)
+- Both: order submitted -> 2s wait -> `get_position()` returned None -> `return None`
+- Orders DID fill on Alpaca moments later, but `active_trades` dict never got the entry
+- EOD closer at 3:55 PM iterated `active_trades` (10 entries) — CNR/PLTK invisible
+- At 4:03 PM (v58b restart), sync_on_startup found them as "orphaned Alpaca positions" but market was closed
+
+### State
+- v58c LIVE on `paper-trading-live` (revision `00107-m6v`, 100% traffic)
+- Account A: 10 momentum positions held overnight (ODD, GRAL, DRVN, KD, TNET, LMND, FLNC, MSTZ, LQDA, NVO)
+- Account B: 2 orphaned positions (CNR, PLTK) — will be closed at tomorrow's startup
+
+### Next
+- Verify tomorrow: momentum screen fires at 3:50 PM without timeout
+- Verify tomorrow: Account B ghost position fix (fills take <18s to confirm)
+- Monitor CNR/PLTK orphan cleanup at market open
+
+### Files Changed
+- `paper_trading/rsi_screener.py` (query optimization: DISTINCT ON -> subquery)
+- `paper_trading/position_manager.py` (fill retry: 2s single check -> 4-attempt backoff up to 18s)
+- `CHANGELOG.md` (this entry)
+- `CLAUDE.md` (current status updated)
+
+## [2026-02-26 01:25 PST] — v58a DEPLOYED: Momentum Screener Live
+
+### Done
+- **Rewrote RSI screener → Momentum screener** (previous session, deployed this session):
+  - `rsi_screener.py`: `RSICandidate` → `MomentumCandidate`, `RSIScreener` → `MomentumScreener`
+  - Eliminated 178-line RSI computation, replaced with single `DISTINCT ON` query on `orats_daily` for `price_momentum_20d < -0.10`
+  - Sorts by momentum ascending (most beaten-down first), returns top 10
+  - `config.py`: `USE_RSI_SCREENER` → `USE_MOMENTUM_SCREENER`, all `RSI_SCREEN_*` → `MOMENTUM_*`, hard stop -3%
+  - `main.py`: All `_rsi_*` references → `_momentum_*`, updated imports and log messages
+  - `eod_closer.py`: `USE_RSI_SCREENER` → `USE_MOMENTUM_SCREENER`
+- **Fixed 107GB Docker context leak**: `.tmp/` directory (DuckDB temp storage) was not in `.dockerignore`/`.gcloudignore`. Added to both.
+- **Built locally** via Docker Desktop (Cloud Build MCP tool was being rejected). Context now ~2.4 MB.
+- **Deployed** `paper-trading:v58a` → revision `paper-trading-live-00105-mgg` (ACTIVE, 100% traffic)
+- **Verified**: Zero errors, startup healthy (1.19s), caches loaded (5,977 sector, 1,679 earnings)
+
+### State
+- v58a is LIVE on `paper-trading-live`
+- Momentum screener will run at 3:50 PM ET, buy at 3:56 PM, D+1 exit at 3:55 PM, -3% hard stop
+- Account B unchanged (engulfing-primary)
+
+### Next
+- Monitor first live run today at 3:50/3:55/3:56 PM ET
+- Verify momentum candidates logged correctly
+- Consider -2% stop upgrade after live validation (backtest Sharpe 1.31 vs 1.03)
+
+### Files Changed
+- `paper_trading/rsi_screener.py` (rewritten: RSI → Momentum screener)
+- `paper_trading/config.py` (renamed RSI fields → MOMENTUM fields)
+- `paper_trading/main.py` (renamed all _rsi_ → _momentum_ references)
+- `paper_trading/eod_closer.py` (USE_RSI_SCREENER → USE_MOMENTUM_SCREENER)
+- `.dockerignore` (added `.tmp/` — was leaking 107GB DuckDB temp)
+- `.gcloudignore` (added `.tmp/` — kept in sync)
+- `CHANGELOG.md` (this entry)
+- `CLAUDE.md` (current status updated)
+
+## [2026-02-26 00:30 PST] — V6 Research: OI Direction Killed, Momentum < -10% Validated
+
+### Done
+- **V6 OI Direction Investigation** (7 tests):
+  - Tests 1-3: Same-day OI showed promising results (Sharpe 1.40, p=0.0015) — but used look-ahead bias
+  - Test 4: D-1 OI entry timing (5 months) — EOD still optimal, but favorable window artifact
+  - **Test 5 (DEFINITIVE): D-1 OI, 3 years, minute bars — OI direction DEAD** (spread=0.016%, t=0.195, p=0.85)
+- **RSI<30 minute-bar reality check**:
+  - Ran V5 `backtest_rsi30_minutebars.py` — Sharpe **0.25** (top 10) vs clip-method's 1.87 (7x overstatement)
+  - Random 10 from RSI<30 pool = Sharpe 0.24 (zero selection skill)
+  - Root cause: `ret.clip(lower=-3%)` counts intraday stop-and-reverse as winners
+- **Momentum < -10% discovery and validation** (`backtest_momentum_realistic.py`):
+  - `price_momentum_20d < -0.10`, top 10 most beaten-down, -3% stop: **Sharpe 1.03**
+  - With slippage (3bp/10bp/3bp), position limits (10/day), real minute-bar stops
+  - t=5.57, p<0.0001, 3/3 years positive (2023: 0.74, 2024: 1.12, 2025: 1.25)
+  - Selection skill exists: most beaten 1.03 > random 0.64 > least beaten 0.41
+  - Stop sensitivity: -2% Sharpe 1.31, -3% Sharpe 1.03, no stop 0.23
+- **Documentation updated**: V6_OI_DIRECTION_FINDINGS.md (complete rewrite), V5_FINDINGS_SUMMARY.md (corrected recommendations), CLAUDE.md (v58 plan revised), MEMORY.md (V6 conclusions)
+
+### State
+- v58 plan revised: momentum < -10% replaces RSI<30 as screener strategy
+- Existing `rsi_screener.py` code needs update to use momentum filter instead
+- Not yet deployed
+
+### Next
+- Rewrite `rsi_screener.py` → `momentum_screener.py` (or update in-place):
+  - Query orats_daily D-1 for `price_momentum_20d < -0.10, stock_price >= 10, avg_daily_volume >= 1000`
+  - Sort by momentum ascending (most beaten-down first)
+  - Buy top 10 at 3:56 PM, exit D+1 at 3:55 PM, -3% hard stop
+- Build and deploy v58
+- Consider -2% stop (Sharpe 1.31) vs -3% (Sharpe 1.03) — tradeoff between Sharpe and stop frequency
+
+### Files Changed
+- `temp/V6_OI_DIRECTION_FINDINGS.md` (complete rewrite — OI killed, momentum validated)
+- `temp/V5_FINDINGS_SUMMARY.md` (corrected recommendations with V6 update)
+- `temp/backtest_oi_d1_3yr.py` (definitive D-1 OI test — written in prior session)
+- `temp/backtest_momentum_realistic.py` (NEW — realistic momentum backtest)
+- `CLAUDE.md` (current status updated for v58 momentum plan)
+- `CHANGELOG.md` (this entry)
+- `.claude/projects/.../memory/MEMORY.md` (V6 conclusions replace V5)
+
+## [2026-02-25 16:30 PST] — v58: RSI<30 EOD Screener (Account A)
+
+### Done
+- **New module:** `paper_trading/rsi_screener.py` — EOD screener queries orats_daily D-1, computes RSI(14) via Wilder's smoothing, filters price>=$10 + ADV>=1K, ranks by RSI ascending
+- **Config:** Added `USE_RSI_SCREENER=True`, `USE_UOA_SIGNALS=False`, `RSI_SCREEN_TIME=15:50`, `RSI_BUY_TIME=15:56`, `RSI_MAX_CANDIDATES=10`, `HARD_STOP_PCT=-0.03`
+- **EOD closer:** `_close_prior_day_positions()` — only closes prior-day positions at 3:55 PM (D+1 exit), leaves same-day buys open overnight. Account B always closes all (via `use_prior_day_close=False`).
+- **Main loop:** RSI screen at 3:50 PM, prior-day close at 3:55 PM, RSI buys at 3:56 PM. Account A UOA signal path gated on `USE_UOA_SIGNALS` (disabled). Account B unchanged.
+- **Timezone safety:** `_close_prior_day_positions()` localizes naive datetimes to ET before date comparison
+
+### State
+- Code complete, not yet deployed. Next step: build image, deploy as v58.
+
+### Next
+- Build and deploy v58 to Cloud Run
+- Verify logs at 3:50/3:55/3:56 PM — screen runs, prior-day closes, new buys execute
+- Monitor overnight hold + next-day D+1 exit
+- Verify Account B independence (engulfing signals continue all day)
+
+### Files Changed
+- `paper_trading/rsi_screener.py` (NEW — ~150 lines)
+- `paper_trading/config.py` (added RSI screener flags, -3% stop)
+- `paper_trading/eod_closer.py` (prior-day close + use_prior_day_close param)
+- `paper_trading/main.py` (import, init, run loop, _execute_rsi_buys, daily reset, UOA gate)
+- `CHANGELOG.md` (this entry)
+
+## [2026-02-25 16:00 PST] — V5 Research Complete + Entry Timing + RSI<30 Strategy Discovery
+
+### Done
+- **V5 Hypothesis Tests** (43K filtered signals): All 4 hypotheses rejected
+  - H1-B: Vol does NOT expand post-signal (ratio 1.019, not significant)
+  - H5-A: Fade call-heavy has no contrarian edge
+  - H6-A: Zero stock-specific alpha after sector ETF adjustment
+  - H2-C: Aggregate call_pct does not predict SPY direction (r=-0.041)
+- **Base Assumption Test** (1.55M unfiltered signals): call_pct has ZERO directional power (r=-0.0014). 66% of signals are 100% call
+- **Put-Heavy Mean Reversion**: Raw returns looked great (+0.50% D+5), but excess vs SPY = 0.00%. Pure market beta
+- **B8 vs SPY Decomposition**: Raw excess +0.055% (p=0.65). Stop-adjusted excess +0.260% (p=0.03). Stop creates the P&L
+- **B8 vs Random Monte Carlo** (500 sims): B8 beats 100% of random (z=7.6). UOA stocks 4.8x more volatile — stop works harder
+- **B8 vs Random by Year**: 2022 bear: B8 loses (-$15K), worse than random (-$7K). 2023 drives 53% of total P&L
+- **Regime Indicators**: Tested 8 indicators (SMA50/200, momentum, vol, drawdown, golden cross, composite). None improve P&L over "always long + stop"
+- **B8 Entry Timing** (critical finding): EOD entry -> D+1 = +$643K. Signal-time -> same-day EOD = **-$321K**. Current live engine runs the worst strategy. Stocks move UP between signal and close (t=-10.03, p=0.0000)
+- **B8 vs RSI<30 Universe**: B8 only beats 71% of random RSI<30 picks (z=0.55). UOA adds marginal value over simple RSI screening
+- **RSI<30 Config Sweep**: Full parameter sweep on 440K symbol-days. Best config: RSI<30, $10+, -3% stop = **Sharpe 1.87**, 7/7 years positive, +$545K (10-pos sim). 6.7x higher Sharpe than B8
+  - RSI threshold: lower is better per-trade (RSI<20 = +0.64%/trade) but fewer opportunities
+  - Price floor: higher = better Sharpe ($10+ = 1.61, $30+ = 1.89, $50+ = 1.94)
+  - Stop: tighter = higher Sharpe (-2% = 3.17, -3% = 2.41, -5% = 1.61)
+  - Momentum: most beaten-down Q1 (<-11% 5d) = +1.17%/trade, Sharpe 3.35
+  - Trend filter: irrelevant (RSI<30 stocks are 99% below SMA20 already)
+  - Excess vs SPY: +0.105% (t=22.58, p=0.0000) — statistically significant
+- **V5 Findings Summary**: `temp/V5_FINDINGS_SUMMARY.md` — comprehensive report with all 13 tests
+
+### Key Conclusions
+1. UOA does NOT predict direction — it selects volatile stocks
+2. The stop loss IS the strategy (truncates fat left tail, right tail runs)
+3. **Entry timing is critical**: EOD entry required. Signal-time entry DESTROYS returns
+4. **UOA adds no value over simple RSI<30 screening** (z=0.55 vs random RSI<30)
+5. **RSI<30 + EOD buy + D+1 exit + -3% stop** = Sharpe 1.87, 7/7 years positive, no UOA needed
+6. Most beaten-down stocks (5d momentum Q1) bounce hardest: Sharpe 3.35
+7. UOA's real value is for options volatility strategies (4.8x more volatile)
+
+### State
+- V5 research phase complete. All findings documented in `temp/V5_FINDINGS_SUMMARY.md`
+- v57 still deployed (UOA-based, intraday entry). Needs fundamental architecture change
+- Recommended new strategy: RSI<30 EOD screener (replaces UOA signal-based approach)
+- Parallel track: options_trader project exploring volatility-based options strategies
+
+### Next
+- Design and implement v58: RSI<30 EOD screener (replace UOA intraday triggers)
+- Architecture change: queue/screen at ~3:50 PM, buy at 3:55 PM, sell next day 3:55 PM
+- Test ADV filter within RSI<30 universe (not yet tested)
+- options_trader: test straddle/strangle strategies using UOA as volatility selector
+
+### Files Changed
+- `temp/run_v5_hypothesis_tests.py` (new) — V5 enrichment + 4 hypothesis tests
+- `temp/test_base_assumption.py` (new) — Base assumption on 1.55M signals
+- `temp/test_actionable_paths.py` (new) — 3 actionable paths analysis
+- `temp/deep_dive_put_reversion.py` (new) — Put-heavy deep dive
+- `temp/put_reversion_clean.py` (new) — Clean universe analysis
+- `temp/put_reversion_vs_spy.py` (new) — SPY benchmark comparison
+- `temp/b8_vs_spy.py` (new) — B8 P&L decomposition
+- `temp/b8_random_baseline.py` (new) — Monte Carlo vs random stocks
+- `temp/b8_random_by_year.py` (new) — Year-by-year bear market test
+- `temp/regime_indicators.py` (new) — 8 regime indicators tested
+- `temp/composite_deep_dive.py` (new) — Composite regime breakdown
+- `temp/b8_entry_timing.py` (new) — Entry timing comparison (signal vs EOD)
+- `temp/b8_vs_rsi30_universe.py` (new) — B8 vs RSI<30 universe Monte Carlo
+- `temp/rsi30_config_sweep.py` (new) — RSI<30 parameter optimization
+- `temp/V5_FINDINGS_SUMMARY.md` (new, updated) — Complete findings report with 13 tests
+- `CLAUDE.md` — Updated Current Status
+- `CHANGELOG.md` — This entry
+
+---
+
+## [2026-02-25 08:00 PST] — Re-enrich combined_signals_v5.parquet (full 6-year dataset)
+
+### Done
+- **Created `enrich_signals_v4.py`** — single enrichment script that reads `combined_signals_v4.parquet` (43,788 signals, 2020-2026) and adds 18 columns from Cloud SQL + derived calculations
+- **Forward returns** (ret_p1 through ret_p20): 99.6% coverage from `orats_daily_returns`, multiplied by 100 for percentages
+- **SMA-50** (D-1 shifted): 97.8% coverage, computed from `orats_daily.stock_price` rolling 50-day mean, shifted by 1 trading day to avoid look-ahead
+- **price_momentum_20d + avg_daily_volume** (D-1 shifted): 100% coverage from `orats_daily`
+- **SPY daily return + spy_up**: 100% coverage from `orats_daily` WHERE symbol='SPY', pct_change()
+- **market_cap**: 79.2% coverage from `master_tickers` (34,664/43,788 signals)
+- **Derived analytical bands**: sma50_ok, s4_group (A_PASS_S4: 14,119 / C_RSI_FAIL_CP_OK: 29,669), rsi_band (9 bins), cp_band (6 bins), score_band (4 tiers), signal_hour, time_bucket (4 categories)
+- **Output**: `D:/backtest_cache/combined_signals_v5.parquet` — 43,788 rows x 50 columns, runtime ~2.5 min
+
+### State
+- `combined_signals_v5.parquet` is the fully enriched 6-year signal dataset, ready for backtest analysis
+- Supersedes `signals_enriched_v2.parquet` (which only covered 2023-2026, 9.6K rows)
+
+### Next
+- Run full S4 backtest on v5 dataset (6 years vs previous 3 years)
+- Investigate s4_group distribution: 0 B/D/E groups (all signals have RSI, none in B_RSI_OK_CP_FAIL or D_FAIL_BOTH)
+
+### Files Changed
+- `temp/enrich_signals_v4.py` (new) — enrichment script
+- `D:/backtest_cache/combined_signals_v5.parquet` (new) — enriched output
+
+---
+
+## [2026-02-24 01:00 PST] — v57: ADV >= 1K filter + -5% hard stop (3-year backtest validated)
+
+### Done
+- **3-year realistic backtest (v2)** using minute-bar data (780 trading days, DuckDB bar cache)
+  - 16-config sweep across stop levels, ADV thresholds, slippage stress, and multi-day holds
+  - Per-ADV-bucket slippage model from 142 live trades: <1K=19bp, 1-2K=6bp, 2-5K=7bp, 5-10K=5bp, 10-20K=8bp, 20K+=6bp
+  - T+1 entry (1-min delay), bar-by-bar hard stop on lows, 15:55 ET EOD exit
+  - Cloud SQL proxy for D-1 ADV enrichment (orats_daily LATERAL JOIN)
+- **D-1 ADV timing fix**: Corrected look-ahead bias — ORATS data arrives after close, so live uses prior day's value. LATERAL JOIN pattern finds most recent `asof_date < signal_date`.
+  - D-1 vs D0 impact: 1,346 signals (14%) cross the 5K boundary, 47.5% of signals < 1K ADV (was 31.7% with D0)
+- **ADV threshold sweep** (0 to 6K in 500 increments): ADV >= 1K is optimal
+  - ADV 0: Sharpe 0.78, 806 trades | ADV 500: 1.03, 522 | **ADV 1K: 1.25, 404** | ADV 2K: 0.83, 297 | ADV 5K: 0.56, 183
+- **Stop sensitivity at ADV >= 1K**: -7% best (Sharpe 1.33), -4% close (1.28), -5% deployed (1.25)
+- **Slippage stress**: ADV model Sharpe 1.25, 5bp=1.31, 10bp=1.09, 15bp=0.86, 20bp=0.62, 25bp=0.39 (still profitable)
+- **Deployed v57** to `paper-trading-live-00102-zgf`:
+  - `config.py`: `MIN_ADV=1000`, `HARD_STOP_PCT=-0.05`, `USE_ADV_FILTER=True`
+  - `signal_filter.py`: ADV cache (bulk DISTINCT ON from orats_daily, O(1) lookup), rejection logged as `adv_below_1000`
+  - Verified: ADV cache loaded 7,391 symbols on startup, no errors
+
+### Key Findings
+| Config | Trades | WR | Sharpe | P&L | MaxDD | PF |
+|--------|--------|------|--------|---------|--------|------|
+| No filter, -2% stop (old S5) | 811 | 48.3% | 0.39 | $3,784 | -4.71% | 1.09 |
+| No filter, -5% stop | 806 | 51.4% | 0.78 | $8,636 | -3.22% | 1.19 |
+| **ADV>=1K, -5% stop (v57)** | **404** | **56.7%** | **1.25** | **$10,457** | **-2.20%** | **1.52** |
+| ADV>=5K, -5% stop (D0 bias) | 231 | 58.0% | 1.56 | $11,950 | -1.81% | 2.00 |
+| ADV>=5K, -5% stop (D-1 correct) | 183 | 54.1% | 0.56 | $2,388 | -1.83% | 1.26 |
+
+- Multi-day holds dead: only 7 trades in 3 years at ADV>=5K + high call_pct
+- Original B4 (ADV 5K) collapsed from Sharpe 1.56 to 0.56 after D-1 correction — look-ahead bias was massive
+
+### Live Config Summary (v57)
+| Filter | Setting | Source |
+|--------|---------|--------|
+| RSI threshold | < 55 (S5) | `ta_daily_close` / `ta_snapshots_v2` |
+| call_pct gate | DISABLED (S5) | — |
+| GEX dead zone | Skip 2-5% above flip (S5+GEX) | `gex_metrics_snapshot` cache |
+| ADV filter | >= 1,000 contracts/day, D-1 (v57) | `orats_daily` cache |
+| Hard stop | -5% (v57, widened from -2%) | Alpaca positions API |
+| Max positions | 10 | — |
+| Sentiment | mentions < 5, sentiment >= 0 | `vw_media_daily_features` |
+| Earnings | reject within ±2 days | `earnings_calendar` cache |
+| Market regime | pause if SPY < -0.5% from open | Alpaca snapshot API |
+
+### State
+- v57 live on `paper-trading-live-00102-zgf`. Next trading day: Mon Feb 24.
+- Backtest artifacts: `D:\backtest_cache\realistic_results\` (16 configs + sweep CSVs)
+
+### Next
+- Monitor ADV filter rejection rate in signal_evaluations during first live trading day
+- Consider -4% stop (Sharpe 1.28, 5% stop rate vs 3%) if -5% proves too wide
+
+### Files Changed
+- `paper_trading/config.py` — `MIN_ADV=1000`, `HARD_STOP_PCT=-0.05`, `USE_ADV_FILTER=True`
+- `paper_trading/signal_filter.py` — `_load_adv_cache()`, ADV filter in `apply()`, cache refresh on daily reset
+- `temp/enrich_adv_d1.py` — D-1 ADV enrichment (LATERAL JOIN)
+- `temp/run_backtest_v2.py` — 16-config sweep runner
+- `temp/adv_threshold_sweep.py` — ADV threshold sweep (0-6K)
+- `temp/adv1k_deep_test.py` — Stop + slippage sensitivity at ADV>=1K
+- `temp/realistic_backtest.py` — Added ADV slippage model, per-bucket entry slippage, ADV filter
+
+---
+
 ## [2026-02-23 09:10 PST] — Add market_cap column to master_tickers
 
 ### Done
@@ -941,48 +1408,62 @@ Fixed critical WebSocket stability issues causing service hangs during market ho
 
 ---
 
-## Filter Chain Reference (as of S4)
+## Filter Chain Reference (as of v57)
 
-The signal filter applies these **9 active** checks in `apply()`:
+The signal filter applies these **11 checks** in `apply()`:
 
-1. **ETF exclusion** - Hardcoded list (SPY, QQQ, IWM, etc.)
-2. **Score threshold** - score >= 10
-3. **Uptrend SMA20** - price > 20-day SMA (includes trend check)
-4. **RSI filter** - RSI < 50 (hard cap, adaptive relaxation disabled by S4)
-5. **SMA50 momentum** - price > 50-day SMA
-6. **Notional baseline** - >= per-symbol baseline from `intraday_baselines_30m`
-7. **Call% gate** - call_pct <= 95% (S4, rejects pure-call triggers)
-8. **Crowded trade + sentiment** - mentions < 5, sentiment >= 0 (from `vw_media_daily_features`)
-9. **Earnings proximity** - no earnings within 2 days (from `earnings_calendar`)
+| # | Filter | Threshold | Rejection Tag | Source |
+|---|--------|-----------|---------------|--------|
+| 1 | ETF exclusion | Hardcoded list (55 ETFs) | `etf` | Hardcoded |
+| 2 | Score threshold | >= 10 | `score` | Signal |
+| 3 | Uptrend SMA20 | price > SMA20 (trend = 1) | `trend` | TA cache |
+| 4 | RSI filter | < 55 (S5; adaptive bounce disabled) | `rsi` | `ta_daily_close` / `ta_snapshots_v2` |
+| 5 | SMA50 momentum | price > SMA50 | `sma50` | `ta_daily_close` |
+| 6 | Notional baseline | >= $50K per-symbol baseline | `notional` | `intraday_baselines_30m` |
+| 7 | ADV filter (v57) | >= 1,000 contracts/day (D-1) | `adv_below_1000` | `orats_daily` bulk cache |
+| 8 | Call% gate (S4) | <= 95% — **DISABLED** (`USE_CALL_PCT_FILTER=False`) | `call_pct` | Signal |
+| 9 | GEX dead zone (S5+GEX) | Skip 2-5% above gamma flip | `gex_dead_zone` | `gex_metrics_snapshot` cache |
+| 10 | Sentiment filter | mentions < 5 AND sentiment >= 0 | `sentiment_mentions` / `sentiment_negative` | `vw_media_daily_features` (T-1) |
+| 11 | Earnings proximity | no earnings within ±2 days | `earnings` | `earnings_calendar` cache |
 
-**Configured but NOT called in `apply()` (as of v43):**
-- Sector concentration (max 2 per sector) — code exists, not wired
-- Market regime (SPY check) — code exists, not wired
+**Exit rules (outside `apply()`):**
+- **Hard stop**: -5% (v57), checked every 30s via Alpaca positions API + Alpaca SIP WebSocket (real-time)
+- **EOD exit**: 3:55 PM ET, all positions liquidated
+- **Market regime**: pause new entries if SPY < -0.5% from open (checked in PositionManager, not apply())
 
 ---
 
-## Database Tables (as of v46a)
+## Database Tables (as of v57)
 
 ### Written by Live Trading
-- `active_signals` - Signals that passed all filters
-- `paper_trades_log` - Executed trades (open/close with DB IDs)
-- `tracked_tickers_v2` - Symbols added for intraday TA updates
-- `signal_evaluations` - All signal evaluations with pass/fail + `metadata` JSONB (shadow GEX)
-- `intraday_baselines_30m` - Live bucket aggregation from firehose
-- `spot_prices_1m` - 1-min OHLCV bars for ~1,800 symbols (SIP feed, 60s cycle, 7-day retention)
+| Table | Purpose | Write Point |
+|-------|---------|-------------|
+| `active_signals` | Signals that passed all filters | INSERT on pass, UPDATE on trade/close |
+| `paper_trades_log` | Account A trades (open/close with DB IDs) | `log_trade_open()` / `log_trade_close()` |
+| `paper_trades_log_b` | Account B trades (same schema, separate sequence) | Same as above, Account B path |
+| `signal_evaluations` | All evaluations with pass/fail + `metadata` JSONB | Every signal (passed or rejected) |
+| `tracked_tickers_v2` | Symbols added for intraday TA updates | Every UOA trigger |
+| `intraday_baselines_30m` | Live bucket aggregation from firehose | BucketAggregator flush at 30-min boundary |
+| `spot_prices_1m` | 1-min OHLCV bars for ~1,800 symbols (SIP, 60s cycle, 21-day retention) | IntradayBarCollector |
 
 ### Written by ORATS Ingest (nightly)
-- `orats_daily` - Symbol-level options activity (~5,831 rows/day)
-- `gex_metrics_snapshot` - Per-symbol GEX/DEX/walls/gamma flip (~5,570 rows/day, 2.85M total)
+| Table | Purpose | Volume |
+|-------|---------|--------|
+| `orats_daily` | Symbol-level options activity | ~5,831 rows/day |
+| `gex_metrics_snapshot` | Per-symbol GEX/DEX/walls/gamma flip | ~5,570 rows/day, 2.85M total |
 
 ### Read by Live Trading
-- `ta_daily_close` - Prior-day TA (before 9:35 AM)
-- `ta_snapshots_v2` - Intraday TA (after 9:35 AM, 5-min refresh)
-- `vw_media_daily_features` - Crowded trade + sentiment filter
-- `master_tickers` - Sector lookup (used in signal creation, not filtering)
-- `earnings_calendar` - Earnings proximity filter
-- `intraday_baselines_30m` - Per-symbol notional baselines
-- `gex_metrics_snapshot` - Shadow GEX lookup for signal metadata
+| Table/View | Purpose | Loaded As |
+|------------|---------|-----------|
+| `orats_daily` | ADV filter — D-1 avg_daily_volume (v57) | Bulk cache at startup (`_load_adv_cache`, 7,391 symbols) |
+| `gex_metrics_snapshot` | GEX dead zone filter + shadow metadata | Bulk cache at startup (`_load_gex_cache`, ~5,500 symbols) |
+| `ta_daily_close` | Prior-day RSI, SMA20, SMA50 (before 9:35 AM) | Pre-loaded by premarket_ta_cache |
+| `ta_snapshots_v2` | Intraday RSI/SMA20 (after 9:35 AM, 5-min refresh) | Lazy refresh every 5 min |
+| `vw_media_daily_features` | Crowded trade + sentiment filter (T-1) | Per-query (psycopg2) |
+| `master_tickers` | Sector lookup for concentration limit | Bulk cache at startup (`_load_sector_cache`) |
+| `earnings_calendar` | Earnings proximity filter (±2 days) | Bulk cache at startup (`_load_earnings_cache`) |
+| `intraday_baselines_30m` | Per-symbol notional baselines | Bulk load at startup (`load_baselines`) |
+| `engulfing_scores` | Account B engulfing watchlist (daily + 5-min) | Daily watchlist cache + per-query fallback |
 
 ## [2026-02-23 11:30 PST] — DuckDB Backtest Infrastructure + S4 Signal Quality Analysis
 

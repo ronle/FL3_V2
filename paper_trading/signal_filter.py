@@ -231,6 +231,10 @@ class SignalFilter:
         self._adv_cache: Dict[str, int] = {}
         self._adv_cache_loaded = False
 
+        # GEX cache — loaded once from gex_metrics_snapshot for dead zone filter
+        self._gex_cache: Dict[str, Dict] = {}
+        self._gex_cache_loaded = False
+
         # Adaptive RSI state (V29)
         self._bounce_eligible = False
         self._bounce_checked = False
@@ -940,6 +944,8 @@ class SignalFilter:
         self._earnings_cache.clear()  # Clear earnings cache for new day
         self._adv_cache.clear()  # Refresh ADV cache for new day (D-1 data changes nightly)
         self._adv_cache_loaded = False
+        self._gex_cache.clear()  # Refresh GEX cache for new day
+        self._gex_cache_loaded = False
 
         # Reset bounce-day state for new day (V29)
         self._bounce_eligible = False
@@ -952,6 +958,45 @@ class SignalFilter:
         # Re-check bounce eligibility for the new day
         if self.config.USE_ADAPTIVE_RSI:
             self._check_bounce_day_eligible()
+
+    def _load_gex_cache(self):
+        """Bulk load latest GEX metrics for all symbols into cache (for dead zone filter)."""
+        if self._gex_cache_loaded or not self.database_url:
+            return
+
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT ON (symbol)
+                    symbol, net_gex, net_dex, call_wall_strike, put_wall_strike,
+                    gamma_flip_level, spot_price, contracts_analyzed
+                FROM gex_metrics_snapshot
+                ORDER BY symbol, snapshot_ts DESC
+            """)
+            for row in cur.fetchall():
+                self._gex_cache[row[0]] = {
+                    "net_gex": float(row[1]) if row[1] else None,
+                    "net_dex": float(row[2]) if row[2] else None,
+                    "call_wall": float(row[3]) if row[3] else None,
+                    "put_wall": float(row[4]) if row[4] else None,
+                    "gamma_flip": float(row[5]) if row[5] else None,
+                    "gex_spot": float(row[6]) if row[6] else None,
+                    "contracts_analyzed": int(row[7]) if row[7] else None,
+                }
+            cur.close()
+            conn.close()
+            self._gex_cache_loaded = True
+            logger.info(f"Loaded GEX cache (filter): {len(self._gex_cache)} symbols")
+        except Exception as e:
+            logger.warning(f"Failed to load GEX cache (filter): {e}")
+
+    def _lookup_gex(self, symbol: str) -> Optional[Dict]:
+        """Lookup latest GEX metrics for a symbol from cache."""
+        if not self._gex_cache_loaded:
+            self._load_gex_cache()
+        return self._gex_cache.get(symbol)
 
 
 class SignalGenerator:

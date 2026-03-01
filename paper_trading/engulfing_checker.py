@@ -1,175 +1,163 @@
 """
-Engulfing Pattern Checker for Account B
+Pattern Poller for Account B — Big-Hitter Pattern Trader
 
-Checks the engulfing_scores table for bullish engulfing pattern confirmation.
-Written by a separate DayTrading scanner agent; we only read from it.
+Polls engulfing_scores table for qualifying 5-min patterns and returns
+TradeSetup objects with entry, stop, target, and direction.
 
-Architecture: Daily watchlist (bulk-loaded, O(1) lookups) + per-query 5-min fallback.
-Account B checks engulfing BEFORE the filter chain — it's the primary gate.
+Replaces the old EngulfingChecker (v59 and earlier).
 """
 
 import logging
+from dataclasses import dataclass
 from datetime import datetime
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 
-class EngulfingChecker:
-    """
-    Engulfing pattern checker with daily watchlist cache + 5-min fallback.
+@dataclass
+class TradeSetup:
+    """A qualifying pattern ready for order submission."""
+    symbol: str
+    direction: str           # 'bullish' or 'bearish'
+    entry_price: float
+    stop_loss: float
+    target_1: float
+    risk_per_share: float    # abs(entry_price - stop_loss)
+    candle_range: float
+    pattern_strength: str    # 'strong', 'moderate', 'weak'
+    pattern_date: datetime
+    scan_ts: datetime
 
-    Daily patterns (timeframe='1D') are bulk-loaded into memory at startup
-    and daily reset. 5-min patterns are queried per-symbol as fallback.
+
+class PatternPoller:
+    """
+    Polls engulfing_scores for 5-min patterns matching big-hitter profile.
+
+    Filters applied:
+    - timeframe = '5min'
+    - scan_ts within lookback window
+    - volume_confirmed = TRUE
+    - trend_context IN ('uptrend', 'downtrend')
+    - candle_range <= max_candle_range
+    - risk_per_share >= min_risk_per_share
+    - Not already seen this session
     """
 
-    def __init__(self, database_url: Optional[str] = None):
+    def __init__(
+        self,
+        database_url: Optional[str] = None,
+        max_candle_range: float = 0.57,
+        min_risk_per_share: float = 1.00,
+        lookback_min: int = 10,
+    ):
         self.database_url = database_url.strip() if database_url else database_url
-        self._daily_watchlist: Dict[str, Dict] = {}
+        self.max_candle_range = max_candle_range
+        self.min_risk_per_share = min_risk_per_share
+        self.lookback_min = lookback_min
+        self._seen_patterns: Set[Tuple[str, str]] = set()  # (symbol, pattern_date_str)
 
-    def load_daily_watchlist(self, lookback_hours: int = 20):
+    def reset_daily(self):
+        """Clear seen patterns for a new trading day."""
+        self._seen_patterns.clear()
+        logger.info("PatternPoller: reset seen patterns for new day")
+
+    def poll_qualifying_patterns(self) -> List[TradeSetup]:
         """
-        Bulk-load daily bullish engulfing patterns from last N hours into memory.
-        Called at startup and daily reset.
+        Query engulfing_scores for recent 5-min patterns that pass big-hitter filters.
 
-        Args:
-            lookback_hours: How far back to look for daily patterns (default 20h)
+        Returns list of TradeSetup objects for patterns not yet seen this session.
         """
         if not self.database_url:
-            logger.warning("EngulfingChecker: no database_url, skipping daily watchlist load")
-            return
+            logger.warning("PatternPoller: no database_url configured")
+            return []
 
         try:
             import psycopg2
             conn = psycopg2.connect(self.database_url)
             cur = conn.cursor()
+
             cur.execute("""
-                SELECT symbol, pattern_strength, scan_ts, pattern_date
+                SELECT symbol, direction, entry_price, stop_loss, target_1,
+                       candle_range, pattern_strength, pattern_date, scan_ts
                 FROM engulfing_scores
-                WHERE direction = 'bullish'
-                  AND timeframe IN ('1D', 'daily')
-                  AND scan_ts > NOW() - make_interval(hours := %s)
-                ORDER BY scan_ts DESC
-            """, (lookback_hours,))
-
-            self._daily_watchlist = {}
-            for row in cur.fetchall():
-                symbol = row[0]
-                # Keep first (most recent) entry per symbol
-                if symbol not in self._daily_watchlist:
-                    self._daily_watchlist[symbol] = {
-                        "pattern_strength": row[1],
-                        "scan_ts": row[2],
-                        "pattern_date": row[3],
-                    }
-
-            cur.close()
-            conn.close()
-
-            logger.info(
-                f"Engulfing daily watchlist loaded: {len(self._daily_watchlist)} symbols "
-                f"(lookback={lookback_hours}h)"
-            )
-            if self._daily_watchlist:
-                symbols = sorted(self._daily_watchlist.keys())[:10]
-                logger.info(f"  Sample: {', '.join(symbols)}{'...' if len(self._daily_watchlist) > 10 else ''}")
-
-        except Exception as e:
-            logger.warning(f"Failed to load daily engulfing watchlist: {e}")
-            self._daily_watchlist = {}
-
-    def has_engulfing_confirmation(
-        self, symbol: str, lookback_minutes: int = 30
-    ) -> Tuple[bool, Optional[Dict]]:
-        """
-        Check if symbol has a recent bullish engulfing pattern.
-
-        Checks daily watchlist first (O(1)), then falls back to per-query
-        5-min check.
-
-        Args:
-            symbol: Ticker to check
-            lookback_minutes: How recent the 5-min pattern must be (default 30)
-
-        Returns:
-            (True, {"pattern_strength": ..., "scan_ts": ..., "pattern_date": ...}) or
-            (False, None)
-        """
-        # 1. Check daily watchlist (O(1) dict lookup)
-        if symbol in self._daily_watchlist:
-            data = self._daily_watchlist[symbol]
-            logger.info(
-                f"Engulfing confirmed (daily): {symbol} "
-                f"strength={data['pattern_strength']} scan_ts={data['scan_ts']}"
-            )
-            return True, data
-
-        # 2. Fallback: per-query 5-min check
-        if not self.database_url:
-            return False, None
-
-        try:
-            import psycopg2
-            conn = psycopg2.connect(self.database_url)
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT symbol, direction, pattern_date, pattern_strength, scan_ts
-                FROM engulfing_scores
-                WHERE symbol = %s
-                  AND direction = 'bullish'
-                  AND timeframe = '5min'
+                WHERE timeframe = '5min'
                   AND scan_ts > NOW() - make_interval(mins := %s)
+                  AND volume_confirmed = TRUE
+                  AND trend_context IN ('uptrend', 'downtrend')
+                  AND entry_price IS NOT NULL
+                  AND stop_loss IS NOT NULL
+                  AND target_1 IS NOT NULL
                 ORDER BY scan_ts DESC
-                LIMIT 1
-            """, (symbol, lookback_minutes))
+            """, (self.lookback_min,))
 
-            row = cur.fetchone()
+            rows = cur.fetchall()
             cur.close()
             conn.close()
 
-            if row:
-                data = {
-                    "pattern_strength": row[3],
-                    "scan_ts": row[4],
-                    "pattern_date": row[2],
-                }
-                logger.info(
-                    f"Engulfing confirmed (5min): {symbol} "
-                    f"strength={data['pattern_strength']} scan_ts={data['scan_ts']}"
+        except Exception as e:
+            logger.warning(f"PatternPoller: DB query failed: {e}")
+            return []
+
+        setups: List[TradeSetup] = []
+        skipped_seen = 0
+        skipped_range = 0
+        skipped_risk = 0
+
+        for row in rows:
+            symbol, direction, entry_price, stop_loss, target_1, \
+                candle_range, pattern_strength, pattern_date, scan_ts = row
+
+            entry_price = float(entry_price) if entry_price else 0
+            stop_loss = float(stop_loss) if stop_loss else 0
+            target_1 = float(target_1) if target_1 else 0
+            candle_range_val = float(candle_range) if candle_range else 0
+
+            # Deduplicate: skip if we've already evaluated this pattern
+            key = (symbol, str(pattern_date))
+            if key in self._seen_patterns:
+                skipped_seen += 1
+                continue
+            self._seen_patterns.add(key)
+
+            # Filter: candle range
+            if candle_range_val > self.max_candle_range:
+                skipped_range += 1
+                logger.debug(
+                    f"PatternPoller SKIP {symbol}: candle_range={candle_range_val:.2f} "
+                    f"> max {self.max_candle_range}"
                 )
-                return True, data
+                continue
 
-            return False, None
+            # Compute risk per share
+            risk_per_share = abs(entry_price - stop_loss)
 
-        except Exception as e:
-            logger.warning(f"Engulfing check failed for {symbol}: {e}")
-            return False, None
+            # Filter: minimum risk per share (avoid tiny stops that get clipped)
+            if risk_per_share < self.min_risk_per_share:
+                skipped_risk += 1
+                logger.debug(
+                    f"PatternPoller SKIP {symbol}: risk_per_share=${risk_per_share:.2f} "
+                    f"< min ${self.min_risk_per_share}"
+                )
+                continue
 
-    def get_volume_ratio(self, symbol: str) -> Optional[float]:
-        """Fetch volume_vs_ema30 from orats_daily for display/logging (not filtering)."""
-        if not self.database_url:
-            return None
+            setups.append(TradeSetup(
+                symbol=symbol,
+                direction=direction,
+                entry_price=entry_price,
+                stop_loss=stop_loss,
+                target_1=target_1,
+                risk_per_share=risk_per_share,
+                candle_range=candle_range_val,
+                pattern_strength=pattern_strength or "unknown",
+                pattern_date=pattern_date,
+                scan_ts=scan_ts,
+            ))
 
-        try:
-            import psycopg2
-            conn = psycopg2.connect(self.database_url)
-            cur = conn.cursor()
-            cur.execute("""
-                SELECT total_volume, volume_ema_30d
-                FROM orats_daily
-                WHERE symbol = %s AND total_volume IS NOT NULL
-                ORDER BY asof_date DESC
-                LIMIT 1
-            """, (symbol,))
+        if rows:
+            logger.info(
+                f"PatternPoller: {len(rows)} raw, {len(setups)} qualified, "
+                f"skipped: {skipped_seen} seen, {skipped_range} range, {skipped_risk} risk"
+            )
 
-            row = cur.fetchone()
-            cur.close()
-            conn.close()
-
-            if row and row[1] and row[1] > 0:
-                return float(row[0]) / float(row[1])
-            return None
-
-        except Exception as e:
-            logger.warning(f"Volume ratio fetch failed for {symbol}: {e}")
-            return None
+        return setups

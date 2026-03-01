@@ -1,13 +1,15 @@
 """
 End-of-Day Position Closer
 
-Closes all positions at 3:55 PM ET (5 minutes before market close).
+v57 and earlier: Closes all positions at 3:55 PM ET.
+v58+: When momentum screener is active, only closes prior-day positions (D+1 exit).
+      Same-day positions (bought at 3:56 PM) survive overnight.
 """
 
 import asyncio
 import logging
 from datetime import datetime, time as dt_time
-from typing import Callable, Optional
+from typing import Callable, List, Optional
 
 import pytz
 
@@ -32,10 +34,17 @@ class EODCloser:
         position_manager: PositionManager,
         config: TradingConfig = DEFAULT_CONFIG,
         on_close_complete: Optional[Callable] = None,
+        use_prior_day_close: Optional[bool] = None,
     ):
         self.position_manager = position_manager
         self.config = config
         self.on_close_complete = on_close_complete
+        # When True, only close prior-day positions (D+1 exit).
+        # Defaults to config.USE_MOMENTUM_SCREENER if not specified.
+        self._use_prior_day_close = (
+            use_prior_day_close if use_prior_day_close is not None
+            else config.USE_MOMENTUM_SCREENER
+        )
 
         self._running = False
         self._closed_today = False
@@ -73,21 +82,83 @@ class EODCloser:
         logger.info("EOD closer reset for new day")
 
     async def close_positions(self):
-        """Close all positions for EOD."""
+        """Close positions for EOD.
+
+        When USE_MOMENTUM_SCREENER is active, only closes prior-day positions
+        (D+1 exit). Same-day positions survive overnight.
+        Otherwise, closes all positions (legacy behavior).
+        """
         if self._closed_today:
             logger.info("Positions already closed today")
             return
 
-        logger.info("EOD: Closing all positions...")
+        if self._use_prior_day_close:
+            closed = await self._close_prior_day_positions()
+        else:
+            closed = await self._close_all()
 
-        # Get current positions
+        self._closed_today = True
+
+        if self.on_close_complete:
+            self.on_close_complete(closed)
+
+    async def _close_prior_day_positions(self) -> list:
+        """Close only positions from prior days (D+1 exit).
+        Leaves same-day positions open for overnight hold.
+
+        Note: entry_time is naive (UTC on Cloud Run). We localize to ET
+        before comparing dates to handle the UTC/ET day boundary correctly.
+        """
+        today = datetime.now(ET).date()
+        positions = self.position_manager.active_trades
+
+        def _entry_date_et(t):
+            """Get entry date in ET (handles naive datetimes from Cloud Run)."""
+            if t.entry_time is None:
+                return today  # treat missing as same-day (don't close)
+            if t.entry_time.tzinfo is None:
+                # Naive datetime from Cloud Run (UTC) — localize then convert
+                return t.entry_time.replace(tzinfo=pytz.utc).astimezone(ET).date()
+            return t.entry_time.astimezone(ET).date()
+
+        prior_day = [
+            t for t in positions.values()
+            if _entry_date_et(t) < today
+        ]
+
+        if not prior_day:
+            logger.info("EOD D+1: No prior-day positions to close")
+            return []
+
+        logger.info(f"EOD D+1: Closing {len(prior_day)} prior-day positions "
+                     f"(keeping {len(positions) - len(prior_day)} same-day)")
+
+        closed = []
+        for trade in prior_day:
+            result = await self.position_manager.close_position(
+                trade.symbol, reason="eod_d1"
+            )
+            if result:
+                closed.append(result)
+
+        total_pnl = sum(t.pnl for t in closed if t.pnl)
+        logger.info(f"EOD D+1: Closed {len(closed)} positions, P&L: ${total_pnl:+.2f}")
+
+        for trade in closed:
+            logger.info(
+                f"  {trade.symbol}: ${trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%)"
+            )
+
+        return closed
+
+    async def _close_all(self) -> list:
+        """Close all positions (legacy EOD behavior)."""
         positions = self.position_manager.active_trades
         if not positions:
             logger.info("No positions to close")
-            self._closed_today = True
-            return
+            return []
 
-        # Close all
+        logger.info("EOD: Closing all positions...")
         closed = await self.position_manager.close_all_positions(reason="eod")
 
         logger.info(f"EOD: Closed {len(closed)} positions")
@@ -97,14 +168,10 @@ class EODCloser:
                 f"  {trade.symbol}: ${trade.pnl:+.2f} ({trade.pnl_pct:+.2f}%)"
             )
 
-        # Calculate total P&L
         total_pnl = sum(t.pnl for t in closed if t.pnl)
         logger.info(f"EOD Total P&L: ${total_pnl:+.2f}")
 
-        self._closed_today = True
-
-        if self.on_close_complete:
-            self.on_close_complete(closed)
+        return closed
 
     async def monitor_loop(self):
         """

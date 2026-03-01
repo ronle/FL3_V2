@@ -4,7 +4,7 @@
 
 ## IDENTITY
 You are working on FL3_V2, a market-wide options UOA detection system.
-Project root: C:\Users\levir\Documents\FL3_V2
+Project root: C:\Users\levir\Documents\Projects\FL3_V2
 Owner: Ron (levir). Local time is PST. Market hours are ET.
 
 ## STARTUP PROTOCOL (every session, no exceptions)

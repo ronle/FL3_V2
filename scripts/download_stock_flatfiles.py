@@ -1,5 +1,5 @@
 """
-Download Polygon Flat Files — Stock Minute Bars (3 years)
+Download Polygon Flat Files — Stock Minute Bars (2020–present)
 
 Downloads daily csv.gz files from Polygon's S3-compatible flat file storage.
 Skips files that already exist locally. Handles pagination and retries.
@@ -8,7 +8,7 @@ Usage:
     python -m scripts.download_stock_flatfiles                  # Download all missing
     python -m scripts.download_stock_flatfiles --discover       # List available prefixes
     python -m scripts.download_stock_flatfiles --dry-run        # Show what would download
-    python -m scripts.download_stock_flatfiles --year 2023      # Only download 2023
+    python -m scripts.download_stock_flatfiles --year 2020      # Only download 2020
 """
 
 import boto3
@@ -26,14 +26,14 @@ S3_ENDPOINT = "https://files.massive.com"
 BUCKET = "flatfiles"
 
 # ── Local paths ──────────────────────────────────────────────────────
-OUTPUT_DIR = r"C:\Users\levir\Documents\FL3_V2\polygon_data\stocks"
+OUTPUT_DIR = r"D:\polygon_data\stocks"
 
 # ── S3 prefix — will be confirmed via discovery ──────────────────────
 # Minute aggs based on existing file schema (OHLCV + transactions)
 STOCKS_PREFIX = "us_stocks_sip/minute_aggs_v1"
 
 # ── Date range ───────────────────────────────────────────────────────
-START_DATE = date(2023, 1, 1)
+START_DATE = date(2022, 1, 1)  # Polygon Starter plan: 2022+ downloadable (2020-2021 listable but 403 on download)
 END_DATE = date.today()
 
 

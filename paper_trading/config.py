@@ -1,18 +1,23 @@
 """
 Paper Trading Configuration
 
-Entry Rules:
-- Uptrend (price > 20d SMA at signal time)
-- Score >= 10
-- Prior-day RSI < 55 (S5)
-- ADV >= 1,000 contracts/day (v57 — D-1 from orats_daily)
-- GEX dead zone filter (skip 2-5% above gamma flip)
-- $50K+ notional
-- Max 10 concurrent positions
+Account A (v58 — Momentum EOD Screener):
+- 3:50 PM: Screen orats_daily for momentum < -10%, $10+, ADV>=1K
+- 3:55 PM: Close prior-day positions (D+1 exit)
+- 3:56 PM: Buy top 10 most beaten-down, hold overnight
+- Next day: -3% hard stop intraday, close at 3:55 PM (D+1 exit)
+- V6 research: Sharpe 1.03 (minute bars, slippage, 3/3 years+, t=5.57)
 
-Exit Rules:
-- Hold to market close (3:55 PM ET)
-- -5% hard stop (v57 — widened from -2%; 3yr backtest Sharpe 1.25 vs 1.06)
+Account B (big-hitter pattern trader):
+- Poll engulfing_scores for 5min patterns every 30s
+- Big-hitter filters: candle_range <= 0.57, risk >= $1/share, volume confirmed
+- Limit order entry at pattern's entry_price, cancel after 30min if unfilled
+- Exit at stop_loss (market), target_1 (market), or EOD 3:55 PM
+- Supports both long and short (direction from pattern)
+
+Legacy (UOA signals, disabled by default):
+- Uptrend, Score >= 10, RSI < 55, ADV >= 1K, $50K+ notional
+- Same-day exit at 3:55 PM
 """
 
 from dataclasses import dataclass
@@ -23,7 +28,16 @@ from datetime import time as dt_time
 class TradingConfig:
     """Paper trading configuration."""
 
-    # Entry filters
+    # v58: Momentum EOD Screener (Account A)
+    USE_MOMENTUM_SCREENER: bool = True     # Enable momentum EOD screening for Account A
+    USE_UOA_SIGNALS: bool = False          # Disable UOA-based Account A entries
+    MOMENTUM_THRESHOLD: float = -0.10      # price_momentum_20d cutoff (< -10%)
+    MOMENTUM_PRICE_FLOOR: float = 10.0     # Min stock price
+    MOMENTUM_SCREEN_TIME: dt_time = dt_time(15, 50)  # 3:50 PM ET — run screen
+    MOMENTUM_BUY_TIME: dt_time = dt_time(15, 56)     # 3:56 PM ET — submit buys
+    MOMENTUM_MAX_CANDIDATES: int = 10      # Max stocks to buy per day
+
+    # Entry filters (legacy UOA path — active when USE_UOA_SIGNALS=True)
     SCORE_THRESHOLD: int = 10
     RSI_THRESHOLD: float = 55.0  # S5: raised from 50 — RSI<55 shows improving Sharpe YoY (1.59→3.23→3.27), RSI<50 degrading
     MIN_NOTIONAL: float = 50_000
@@ -54,10 +68,26 @@ class TradingConfig:
     ADAPTIVE_RSI_THRESHOLD: float = 60.0  # RSI threshold on bounce days (normal = RSI_THRESHOLD)
     ADAPTIVE_RSI_MIN_RED_DAYS: int = 2    # Minimum consecutive red SPY closes for bounce day
 
-    # Account B — Engulfing-Primary, V2 Score as Confirmation (A/B test)
+    # Account B — Big-Hitter Pattern Trader
     USE_ACCOUNT_B: bool = True
-    ENGULFING_LOOKBACK_MINUTES: int = 30       # 5-min pattern fallback window
-    ENGULFING_DAILY_LOOKBACK_HOURS: int = 20   # Daily patterns persist overnight
+    ACCOUNT_B_POLL_INTERVAL_SEC: int = 30         # Poll engulfing_scores every 30s
+    ACCOUNT_B_MAX_RISK_PER_TRADE: float = 500.0   # Max $ risk per trade
+    ACCOUNT_B_MAX_CANDLE_RANGE: float = 0.57       # Max candle range (high-low) for big-hitter
+    ACCOUNT_B_MIN_RISK_PER_SHARE: float = 1.00     # Min distance entry→stop (avoid tiny stops)
+    ACCOUNT_B_CONFIRMATION_WINDOW_MIN: int = 30    # Cancel unfilled limit orders after this
+    ACCOUNT_B_LOOKBACK_MIN: int = 10               # Only patterns from last N minutes
+
+    # Account C — Cameron B2 Pattern Trader
+    USE_ACCOUNT_C: bool = True
+    CAMERON_RVOL_MIN: float = 10.0                    # Min relative volume for candidates
+    CAMERON_SCAN_START: dt_time = dt_time(9, 45)      # Start scanning at 9:45 AM ET
+    CAMERON_SCAN_END: dt_time = dt_time(11, 0)        # Stop scanning at 11:00 AM ET
+    CAMERON_POLL_INTERVAL_SEC: int = 30               # Poll cameron_scores every 30s
+    CAMERON_SCAN_INTERVAL_SEC: int = 60               # Run scanner every 60s
+    CAMERON_MAX_BF_PER_DAY: int = 1                   # Max bull flag trades per day
+    CAMERON_MAX_RISK_PER_TRADE: float = 500.0         # Max dollar risk per trade
+    CAMERON_MAX_POSITIONS: int = 5                    # Max concurrent Cameron positions
+    CAMERON_CONFIRMATION_WINDOW_MIN: int = 30         # Cancel unfilled limit orders after this
 
     # ADV filter (v57) — reject illiquid names (avg_daily_volume from orats_daily, D-1)
     # 3yr backtest: ADV>=1K Sharpe 1.25, WR 56.7%, PF 1.52 vs no-filter Sharpe 0.78
@@ -83,7 +113,7 @@ class TradingConfig:
     # Exit rules
     EXIT_TIME: dt_time = dt_time(15, 55)  # 3:55 PM ET
     LAST_ENTRY_TIME: dt_time = dt_time(15, 50)  # No new positions after 3:50 PM
-    HARD_STOP_PCT: float = -0.05  # -5% hard stop — 3yr backtest: -5% Sharpe 1.25 vs -2% Sharpe 1.06 at ADV>=1K
+    HARD_STOP_PCT: float = -0.03  # -3% hard stop — V6 research: Sharpe 1.03 on minute bars (momentum screener)
     USE_HARD_STOP: bool = True
 
     # Market hours (ET)

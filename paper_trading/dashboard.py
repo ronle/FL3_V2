@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 ET = pytz.timezone("America/New_York")
 
 # Safety: only allow known trade log tables in dynamic SQL
-ALLOWED_TABLES = {"paper_trades_log", "paper_trades_log_b"}
+ALLOWED_TABLES = {"paper_trades_log", "paper_trades_log_b", "paper_trades_log_c"}
 
 # Google Sheets Configuration
 SHEET_ID = os.environ.get("DASHBOARD_SHEET_ID", "")
@@ -144,11 +144,18 @@ class Dashboard:
         timestamp: Optional[datetime] = None,
         volume_ratio: Optional[float] = None,
         engulfing_strength: Optional[float] = None,
+        # Account B big-hitter fields
+        direction: Optional[str] = None,
+        stop_loss: Optional[float] = None,
+        target_1: Optional[float] = None,
+        risk_per_share: Optional[float] = None,
+        pattern_strength: Optional[str] = None,
     ):
         """
         Log a signal that passed all filters to Active Signals tab.
 
-        Account B uses engulfing_strength + volume_ratio columns instead of RSI + Ratio.
+        Account B uses direction + stop/target layout.
+        Account A uses RSI + Ratio layout.
         """
         if not self._enabled:
             return
@@ -158,18 +165,16 @@ class Dashboard:
             time_str = ts.strftime("%Y-%m-%d %H:%M:%S")
 
             if self.tab_prefix:
-                # Account B layout: Date/Time, Symbol, Score, Engulfing, Notional, Price, VolR, Action
-                vol_str = f"{volume_ratio:.1f}x" if volume_ratio is not None else "—"
-                eng_str = str(engulfing_strength) if engulfing_strength is not None else "—"
+                # Account B layout: Date/Time, Symbol, Direction, Entry, Stop, Target, Risk/Share, Strength
                 row = [
                     time_str,
                     symbol,
-                    score,
-                    eng_str,
-                    f"${notional:,.0f}",
-                    f"${price:.2f}",
-                    vol_str,
-                    "BUY",
+                    (direction or "bullish").upper(),
+                    f"${price:.2f}" if price else "—",
+                    f"${stop_loss:.2f}" if stop_loss else "—",
+                    f"${target_1:.2f}" if target_1 else "—",
+                    f"${risk_per_share:.2f}" if risk_per_share else "—",
+                    pattern_strength or "—",
                 ]
             else:
                 # Account A layout: Date/Time, Symbol, Score, RSI, Ratio, Notional, Price, Action
@@ -308,10 +313,18 @@ class Dashboard:
             self._positions_tab.clear()
             self._closed_tab.clear()
 
-            # Add headers (Account B uses different signal columns)
+            # Add headers (Account B uses different columns)
             if self.tab_prefix:
                 self._signals_tab.append_row(
-                    ['Date/Time', 'Symbol', 'Score', 'Engulfing', 'Notional', 'Price', 'VolR', 'Action'],
+                    ['Date/Time', 'Symbol', 'Direction', 'Entry', 'Stop', 'Target', 'Risk/Share', 'Strength'],
+                    value_input_option='USER_ENTERED'
+                )
+                self._positions_tab.append_row(
+                    ['Symbol', 'Direction', 'Entry', 'Current', 'Stop', 'Target', 'P/L %', 'Status'],
+                    value_input_option='USER_ENTERED'
+                )
+                self._closed_tab.append_row(
+                    ['Date/Time', 'Symbol', 'Direction', 'Entry', 'Exit', 'P/L %', '$ P/L', 'Reason'],
                     value_input_option='USER_ENTERED'
                 )
             else:
@@ -319,14 +332,14 @@ class Dashboard:
                     ['Date/Time', 'Symbol', 'Score', 'RSI', 'Ratio', 'Notional', 'Price', 'Action'],
                     value_input_option='USER_ENTERED'
                 )
-            self._positions_tab.append_row(
-                ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status'],
-                value_input_option='USER_ENTERED'
-            )
-            self._closed_tab.append_row(
-                ['Date/Time', 'Symbol', 'Score', 'Shares', 'Entry', 'Exit', 'P/L %', '$ P/L', 'Result'],
-                value_input_option='USER_ENTERED'
-            )
+                self._positions_tab.append_row(
+                    ['Symbol', 'Score', 'Entry', 'Current', 'P/L %', 'Status'],
+                    value_input_option='USER_ENTERED'
+                )
+                self._closed_tab.append_row(
+                    ['Date/Time', 'Symbol', 'Score', 'Shares', 'Entry', 'Exit', 'P/L %', '$ P/L', 'Result'],
+                    value_input_option='USER_ENTERED'
+                )
 
             logger.info(f"Dashboard: cleared for new trading day (prefix='{self.tab_prefix}')")
         except Exception as e:
@@ -465,6 +478,19 @@ def log_trade_open(
     signal_notional: float,
     table_name: str = "paper_trades_log",
     volume_ratio: Optional[float] = None,
+    # Account B big-hitter fields
+    direction: Optional[str] = None,
+    stop_price: Optional[float] = None,
+    target_price: Optional[float] = None,
+    risk_per_share: Optional[float] = None,
+    limit_order_id: Optional[str] = None,
+    order_submitted_at=None,
+    pattern_date=None,
+    candle_range: Optional[float] = None,
+    pattern_strength: Optional[str] = None,
+    # Article enrichment (Account C)
+    has_news: bool = False,
+    article_count: int = 0,
 ):
     """
     Log a new trade to paper_trades_log (or paper_trades_log_b) when a position is opened.
@@ -480,12 +506,42 @@ def log_trade_open(
         conn = psycopg2.connect(db_url.strip())
         cur = conn.cursor()
 
-        cur.execute(f"""
-            INSERT INTO {table_name}
-            (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            RETURNING id
-        """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio))
+        if table_name == "paper_trades_log_c" and direction is not None:
+            # Account C: include extended columns + article enrichment
+            cur.execute(f"""
+                INSERT INTO {table_name}
+                (symbol, entry_time, entry_price, shares, signal_score, signal_rsi,
+                 signal_notional, volume_ratio, direction, stop_price, target_price,
+                 risk_per_share, limit_order_id, order_submitted_at, pattern_date,
+                 candle_range, pattern_strength, has_news, article_count)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi,
+                  signal_notional, volume_ratio, direction, stop_price, target_price,
+                  risk_per_share, limit_order_id, order_submitted_at, pattern_date,
+                  candle_range, pattern_strength, has_news, article_count))
+        elif table_name == "paper_trades_log_b" and direction is not None:
+            # Account B: include extended columns (no article enrichment)
+            cur.execute(f"""
+                INSERT INTO {table_name}
+                (symbol, entry_time, entry_price, shares, signal_score, signal_rsi,
+                 signal_notional, volume_ratio, direction, stop_price, target_price,
+                 risk_per_share, limit_order_id, order_submitted_at, pattern_date,
+                 candle_range, pattern_strength)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi,
+                  signal_notional, volume_ratio, direction, stop_price, target_price,
+                  risk_per_share, limit_order_id, order_submitted_at, pattern_date,
+                  candle_range, pattern_strength))
+        else:
+            # Account A: original columns only
+            cur.execute(f"""
+                INSERT INTO {table_name}
+                (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                RETURNING id
+            """, (symbol, entry_time, entry_price, shares, signal_score, signal_rsi, signal_notional, volume_ratio))
 
         row = cur.fetchone()
         trade_id = row[0] if row else None
@@ -557,6 +613,7 @@ def load_open_trades_from_db(db_url: str, table_name: str = "paper_trades_log") 
 
     Returns list of dicts with trade data where exit_time IS NULL.
     Only looks at trades from the last 7 days to avoid stale data.
+    Account B includes big-hitter columns (direction, stop, target, etc.).
     """
     assert table_name in ALLOWED_TABLES, f"Invalid table: {table_name}"
     if not db_url:
@@ -567,27 +624,62 @@ def load_open_trades_from_db(db_url: str, table_name: str = "paper_trades_log") 
         conn = psycopg2.connect(db_url.strip())
         cur = conn.cursor()
 
-        cur.execute(f"""
-            SELECT id, symbol, entry_time, entry_price, shares,
-                   signal_score, signal_rsi, signal_notional
-            FROM {table_name}
-            WHERE exit_time IS NULL
-            AND created_at > CURRENT_DATE - 7
-            ORDER BY entry_time DESC
-        """)
+        if table_name in ("paper_trades_log_b", "paper_trades_log_c"):
+            cur.execute(f"""
+                SELECT id, symbol, entry_time, entry_price, shares,
+                       signal_score, signal_rsi, signal_notional,
+                       direction, stop_price, target_price, risk_per_share,
+                       limit_order_id, order_submitted_at, pattern_date,
+                       candle_range, pattern_strength
+                FROM {table_name}
+                WHERE exit_time IS NULL
+                AND created_at > CURRENT_DATE - 7
+                ORDER BY entry_time DESC
+            """)
 
-        trades = []
-        for row in cur.fetchall():
-            trades.append({
-                "db_id": row[0],
-                "symbol": row[1],
-                "entry_time": row[2],
-                "entry_price": float(row[3]) if row[3] else 0,
-                "shares": row[4] or 0,
-                "signal_score": row[5] or 0,
-                "signal_rsi": float(row[6]) if row[6] else 0,
-                "signal_notional": float(row[7]) if row[7] else 0,
-            })
+            trades = []
+            for row in cur.fetchall():
+                trades.append({
+                    "db_id": row[0],
+                    "symbol": row[1],
+                    "entry_time": row[2],
+                    "entry_price": float(row[3]) if row[3] else 0,
+                    "shares": row[4] or 0,
+                    "signal_score": row[5] or 0,
+                    "signal_rsi": float(row[6]) if row[6] else 0,
+                    "signal_notional": float(row[7]) if row[7] else 0,
+                    "direction": row[8] or "bullish",
+                    "stop_price": float(row[9]) if row[9] else None,
+                    "target_price": float(row[10]) if row[10] else None,
+                    "risk_per_share": float(row[11]) if row[11] else None,
+                    "limit_order_id": row[12],
+                    "order_submitted_at": row[13],
+                    "pattern_date": row[14],
+                    "candle_range": float(row[15]) if row[15] else None,
+                    "pattern_strength": row[16],
+                })
+        else:
+            cur.execute(f"""
+                SELECT id, symbol, entry_time, entry_price, shares,
+                       signal_score, signal_rsi, signal_notional
+                FROM {table_name}
+                WHERE exit_time IS NULL
+                AND created_at > CURRENT_DATE - 7
+                ORDER BY entry_time DESC
+            """)
+
+            trades = []
+            for row in cur.fetchall():
+                trades.append({
+                    "db_id": row[0],
+                    "symbol": row[1],
+                    "entry_time": row[2],
+                    "entry_price": float(row[3]) if row[3] else 0,
+                    "shares": row[4] or 0,
+                    "signal_score": row[5] or 0,
+                    "signal_rsi": float(row[6]) if row[6] else 0,
+                    "signal_notional": float(row[7]) if row[7] else 0,
+                })
 
         cur.close()
         conn.close()

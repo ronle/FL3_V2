@@ -267,6 +267,26 @@ class AlpacaTrader:
         """Submit a sell order."""
         return await self.submit_order(symbol, qty, OrderSide.SELL, order_type)
 
+    async def sell_short(
+        self,
+        symbol: str,
+        qty: float,
+        limit_price: Optional[float] = None,
+    ) -> Optional[Order]:
+        """Submit a sell-short order (open a short position)."""
+        order_type = OrderType.LIMIT if limit_price else OrderType.MARKET
+        return await self.submit_order(
+            symbol, qty, OrderSide.SELL, order_type, limit_price=limit_price,
+        )
+
+    async def buy_to_cover(
+        self,
+        symbol: str,
+        qty: float,
+    ) -> Optional[Order]:
+        """Submit a buy-to-cover order (close a short position)."""
+        return await self.submit_order(symbol, qty, OrderSide.BUY, OrderType.MARKET)
+
     async def close_position(self, symbol: str) -> Optional[Order]:
         """Close an entire position."""
         session = await self._get_session()

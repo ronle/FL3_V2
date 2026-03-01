@@ -1,5 +1,5 @@
 """
-Download Polygon Options Flat Files — 2023 & 2024
+Download Polygon Options Flat Files — 2020–present
 
 Downloads daily csv.gz files from Polygon's S3 flat file storage.
 Skips files that already exist locally. Handles pagination and retries.
@@ -7,8 +7,7 @@ Skips files that already exist locally. Handles pagination and retries.
 Usage:
     python -m scripts.download_options_flatfiles                  # Download all missing
     python -m scripts.download_options_flatfiles --dry-run        # Show what would download
-    python -m scripts.download_options_flatfiles --year 2023      # Only download 2023
-    python -m scripts.download_options_flatfiles --year 2024      # Only download 2024
+    python -m scripts.download_options_flatfiles --year 2020      # Only download 2020
 """
 
 import boto3
@@ -26,14 +25,14 @@ S3_ENDPOINT   = "https://files.massive.com"
 BUCKET        = "flatfiles"
 
 # ── Local output ─────────────────────────────────────────────────────
-OUTPUT_DIR = r"C:\Users\levir\Documents\FL3_V2\polygon_data\options"
+OUTPUT_DIR = r"D:\polygon_data\options"
 
 # ── S3 prefix ────────────────────────────────────────────────────────
 OPTIONS_PREFIX = "us_options_opra/trades_v1"
 
 # ── Date range ───────────────────────────────────────────────────────
-START_DATE = date(2023, 1, 1)
-END_DATE   = date(2024, 12, 31)
+START_DATE = date(2020, 1, 1)
+END_DATE   = date.today()
 
 
 def get_s3_client():
@@ -176,7 +175,7 @@ def run_download(s3, *, dry_run: bool = False, year_filter: int = None):
 def main():
     parser = argparse.ArgumentParser(description="Download Polygon options trades flat files")
     parser.add_argument("--dry-run", action="store_true", help="Show what would download without downloading")
-    parser.add_argument("--year",    type=int,            help="Limit to a single year (2023 or 2024)")
+    parser.add_argument("--year",    type=int,            help="Limit to a single year (2020-2026)")
     args = parser.parse_args()
 
     print("=" * 60)

@@ -45,6 +45,7 @@ archive/
 temp/
 context/
 .claude/
+.tmp/
 
 # Data files (CSV, compressed, etc.)
 *.csv
@@ -114,6 +115,57 @@ prd*.json
 
 # Other root scripts not needed in production
 start_paper_trading.py
+
+# =============================================================================
+# NON-PRODUCTION DIRECTORIES
+# =============================================================================
+backtest_results/
+deploy/
+sql/
+.pytest_cache/
+
+# Non-production scripts (keep only firehose_main, ta_pipeline_v2, refresh_baselines)
+scripts/_*.py
+scripts/backfill_*.py
+scripts/backtest_*.py
+scripts/check_*.py
+scripts/cleanup_*.py
+scripts/create_*.py
+scripts/debug_*.py
+scripts/discover_*.py
+scripts/download_*.py
+scripts/enrich_*.py
+scripts/export_*.py
+scripts/fetch_*.py
+scripts/generate_*.py
+scripts/gex_*.py
+scripts/identify_*.py
+scripts/label_*.py
+scripts/list_*.py
+scripts/premarket_*.py
+scripts/recreate_*.py
+scripts/refresh_market_cap.py
+scripts/refresh_sector_data.py
+scripts/run_db_query.ps1
+scripts/sync_*.py
+scripts/test_*.py
+scripts/tune_*.py
+scripts/update_*.py
+scripts/upload_*.py
+
+# Non-production analysis modules
+analysis/baseline_performance.py
+analysis/direction_classifier.py
+analysis/liquidity_filter.py
+analysis/phase_accuracy.py
+analysis/ta_deep_analysis.py
+analysis/ta_prior_day_enricher.py
+analysis/ta_rsi_only_analysis.py
+analysis/ta_signal_enricher.py
+
+# Misc non-production files
+claude_start.ps1
+*.ps1
 
 # =============================================================================
 # LOGS
