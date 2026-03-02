@@ -405,7 +405,10 @@ Exit Rules:
 | Table | Purpose | Write Points |
 |-------|---------|--------------|
 | `active_signals` | Signals that passed all filters | INSERT on signal pass, UPDATE on trade placed + close |
-| `paper_trades_log` | Executed trades with full lifecycle | INSERT on entry (`log_trade_open`), UPDATE on exit (`log_trade_close`) |
+| `paper_trades_log` | Account A executed trades with full lifecycle | INSERT on entry (`log_trade_open`), UPDATE on exit (`log_trade_close`) |
+| `paper_trades_log_b` | Account B trades (engulfing patterns) | INSERT on limit order submit, UPDATE on exit |
+| `paper_trades_log_c` | Account C trades (Cameron patterns + article metadata) | INSERT on limit order submit, UPDATE on exit |
+| `cameron_candidates_daily` | Cameron gapper candidates for V1 article fetch | INSERT at startup (`_publish_candidates`) |
 | `tracked_tickers_v2` | Symbols added for intraday TA updates | UPSERT on every UOA trigger |
 
 ### Crash-Resilient Trade Persistence (v45+)
@@ -535,6 +538,13 @@ Every 30s:
     → Monitor fill (cancel after 30 min if unfilled)
     → Monitor price vs stop_loss and target_1 (via WebSocket, REST fallback)
     → Exit at stop (market), target (market), or EOD 3:55 PM
+
+Article enrichment (v62, data collection — NOT a filter):
+  _poll_cameron_patterns() → for each setup:
+    → article_lookup.check_articles_for_symbol() queries articles + article_entities
+    → Annotates setup with has_news + article_count
+    → Dashboard shows [NEWS xN] in Strength column
+    → Logged to paper_trades_log_c (has_news, article_count columns)
 ```
 
 **Environment variables:**
@@ -547,7 +557,8 @@ Every 30s:
 | Table | Purpose |
 |-------|---------|
 | `cameron_scores` | Written by CameronScanner (5-min patterns). UNIQUE on (symbol, pattern_date, pattern_type, interval) |
-| `paper_trades_log_c` | Account C trade log (same schema as `paper_trades_log_b`: direction, stop_price, target_price, etc.) |
+| `paper_trades_log_c` | Account C trade log (extends `paper_trades_log_b` schema + `has_news` BOOLEAN, `article_count` INTEGER) |
+| `cameron_candidates_daily` | Coordination table for V1 article fetch. Written by CameronScanner at startup. PK: (trade_date, symbol) |
 
 **Config (`paper_trading/config.py`):**
 | Setting | Default | Purpose |
@@ -564,9 +575,10 @@ Every 30s:
 | `CAMERON_CONFIRMATION_WINDOW_MIN` | `30` | Cancel unfilled limit orders after N minutes |
 
 **Key files:**
-- `paper_trading/cameron_scanner.py` — `CameronScanner` class. Loads candidates from `orats_daily`, fetches 5-min bars, runs pattern detectors, UPSERTs to `cameron_scores`. `.strip()` on DB URL.
+- `paper_trading/cameron_scanner.py` — `CameronScanner` class. Loads candidates from `orats_daily`, publishes to `cameron_candidates_daily`, fetches 5-min bars, runs pattern detectors, UPSERTs to `cameron_scores`. `.strip()` on DB URL.
 - `paper_trading/cameron_checker.py` — `CameronChecker` class + `CameronTradeSetup` dataclass. Polls `cameron_scores` for B2-qualifying patterns. Priority sort, BF daily cap, dedup.
-- `paper_trading/main.py` — `_cameron_scan_tick()` runs on 60s interval, `_poll_cameron_patterns()` + `_check_cameron_pending()` on 30s interval, `_async_exit_c()` handles stop/target exits.
+- `paper_trading/article_lookup.py` — `check_articles_for_symbol()`. Queries `articles` + `article_entities` for ticker news (36h lookback). Returns `ArticleInfo(has_news, article_count, latest_title, latest_publish_time)`. Graceful on error.
+- `paper_trading/main.py` — `_cameron_scan_tick()` runs on 60s interval, `_poll_cameron_patterns()` (+ article enrichment) + `_check_cameron_pending()` on 30s interval, `_async_exit_c()` handles stop/target exits.
 
 **Rollback:** Set `USE_ACCOUNT_C = False` in config.py, redeploy. Accounts A and B continue unaffected.
 
@@ -621,10 +633,27 @@ FL3_V2/
 │   └── ticker_manager_v2.py     # Permanent tracking
 ├── utils/
 │   └── occ_parser.py            # OCC symbol parsing
+├── paper_trading/
+│   ├── main.py                  # Main orchestrator (3 accounts)
+│   ├── position_manager.py      # Position tracking + trade persistence
+│   ├── dashboard.py             # Google Sheets + DB logging
+│   ├── signal_filter.py         # UOA signal filter chain
+│   ├── alpaca_trader.py         # Alpaca API wrapper
+│   ├── engulfing_checker.py     # Account B pattern poller
+│   ├── cameron_scanner.py       # Account C pattern scanner + candidate publisher
+│   ├── cameron_checker.py       # Account C B2 filter + trade setup
+│   ├── article_lookup.py        # Article enrichment for Cameron trades
+│   ├── rsi_screener.py          # Account A momentum screener
+│   ├── eod_closer.py            # EOD position closer
+│   └── config.py                # Trading configuration
 ├── scripts/
 │   ├── firehose_main.py         # Main firehose orchestrator
 │   ├── ta_pipeline_v2.py        # TA refresh orchestrator
-│   └── refresh_baselines.py     # Daily baseline refresh
+│   ├── refresh_baselines.py     # Daily baseline refresh
+│   └── patterns/                # Cameron pattern detectors
+│       ├── bull_flag.py
+│       ├── consolidation_breakout.py
+│       └── vwap_reclaim.py
 ├── sql/
 │   ├── create_tables_v2.sql     # Schema DDL
 │   └── cleanup_legacy.sql       # V1 table cleanup
