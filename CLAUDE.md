@@ -45,31 +45,25 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-03-01 11:10 PST_
+_Last updated: 2026-03-03 08:45 PST_
 
+- **v72 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00123-9bd` (2026-03-03 08:40 PST)
+  - **Over-leveraging fix**: Position sizing now caps by `equity * 0.90` instead of `buying_power * 0.95`. Short sale proceeds inflate Alpaca buying_power but not equity. Applies to all 3 accounts.
+- **v71 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00122-nw2` (2026-03-02 13:12 PST)
+  - **Account B/C buying power cap**: `open_limit_position()` now checks Alpaca buying power before submitting limit orders. Caps qty so position value stays within 95% of available buying power. Prevents cash overdraft.
+- **v70 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00121-l9b` (2026-03-02 10:07 PST)
+  - **Weekend EOD closer bug FIXED**: `should_close()` now rejects weekends (`weekday() >= 5`). Root cause of Account A momentum positions being force-sold at Monday open.
+  - **WebSocket callback guarded**: `_on_stock_price_update()` returns early outside trading hours. Defense in depth for all 3 accounts.
+  - Account A: Momentum screener active, `log_signal()` fix live
+  - Account B: Big-hitter pattern trader active (v60 redesign)
+  - Account C: Cameron B2 pattern trader active
+- **Account A weekend sell investigation COMPLETE** (2026-03-02): Alpaca order history confirmed sell orders created Saturday 3:55 PM ET by our code. Two batches affected (Feb 26 + Feb 27 buys). Combined bug damage ~$3,339 vs ~$2,026 with intended stops+D+1 exit.
+- **Account A data backfilled** (2026-03-02): 10 trades from 02/27 updated in DB with actual Alpaca exit prices. Total P&L: -$5,485.53 (QURE -40.28% gap-down). Google Sheet "Closed Today" tab populated.
+- **Account A Google Sheet fix** (2026-03-02): `_execute_momentum_buys()` was missing `dashboard.log_signal()`. Fix committed in `245525c`, deployed in v70.
 - **Cameron Article Enrichment (V2 side) READY** — Code complete, DDL pending deployment
-  - `article_lookup.py`: checks `articles`+`article_entities` for symbol news (36h lookback)
-  - `cameron_scanner.py`: publishes candidates to `cameron_candidates_daily` at startup
-  - `_poll_cameron_patterns()`: enriches setups with `has_news`/`article_count`, logs to dashboard + `paper_trades_log_c`
-  - V1 article fetch job backlogged as P1 (`fr3-cameron-news-fetch`, 8:30 AM ET)
   - DDL needed before deploy: `sql/create_cameron_candidates_daily.sql`, `sql/alter_paper_trades_log_c_has_news.sql`
-- **v61 DEPLOYED** — Account C: Cameron B2 Pattern Trader on `paper-trading-live` (revision `00110-mlh`)
-  - Third independent paper trading account using Cameron B2 filter stack (Sharpe 2.51, WR 57.3%)
-  - CameronScanner: loads gapper candidates from `orats_daily`, runs 3 pattern detectors (consol_breakout, vwap_reclaim, bull_flag) on 5-min bars during 9:45-11:00 AM
-  - CameronChecker: polls `cameron_scores` every 30s, moderate-only, priority sort, bull flag max 1/day
-  - Limit order entry, stop/target via WebSocket, EOD close at 3:55 PM
-  - DB tables created: `cameron_scores` (13 cols), `paper_trades_log_c` (24 cols, cloned from `_b`)
-  - **Account C currently DISABLED at runtime** — awaiting `ALPACA_API_KEY_C` / `ALPACA_SECRET_KEY_C` env vars
-  - Accounts A and B unchanged, running normally
-  - Rollback: `paper-trading:v60` or set `USE_ACCOUNT_C = False`
-- **V6 Research COMPLETE (2026-02-26)** — OI direction DISPROVEN, momentum strategy discovered:
-  - OI direction is DEAD: D-1 over 3yr, spread=0.016%, p=0.85
-  - RSI<30 "Sharpe 1.87" was clip-method artifact → 0.25 on minute bars (7x overstatement)
-  - Momentum < -10% is 4x better than RSI<30 (Sharpe 1.03 vs 0.25)
-  - Full reports: `temp/V6_OI_DIRECTION_FINDINGS.md`, `temp/V5_FINDINGS_SUMMARY.md`
-- **combined_signals_v5.parquet** — Full 6-year enriched dataset (43,788 signals, 50 columns)
+- **V6 Research COMPLETE (2026-02-26)** — OI direction DISPROVEN, momentum strategy discovered
 - **3-year realistic backtest (v2) complete** — 16-config sweep with minute-bar data. Cache at `D:\backtest_cache\`
-- **market_cap column** on `master_tickers` — 3,766/5,980 symbols populated via Polygon API
 
 ---
 
