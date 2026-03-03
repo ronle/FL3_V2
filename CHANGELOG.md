@@ -11,11 +11,11 @@ All notable changes to FL3_V2 paper trading system.
 - Full findings documented in `Docs/ACCOUNT_B_11AM_CUTOFF.md`
 
 ### State
-- v73 ready for deploy (pending)
+- **v73 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00124-9cd` (2026-03-03 14:58 PST)
 - Accounts A and C unaffected
 
 ### Next
-- Deploy v73, monitor Account B behavior across first week
+- Monitor Account B behavior across first week with 11 AM cutoff
 
 ### Files Changed
 - `paper_trading/config.py` — added `ACCOUNT_B_LAST_ENTRY_TIME`

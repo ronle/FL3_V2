@@ -45,21 +45,14 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-03-03 08:45 PST_
+_Last updated: 2026-03-03 14:58 PST_
 
-- **v72 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00123-9bd` (2026-03-03 08:40 PST)
-  - **Over-leveraging fix**: Position sizing now caps by `equity * 0.90` instead of `buying_power * 0.95`. Short sale proceeds inflate Alpaca buying_power but not equity. Applies to all 3 accounts.
-- **v71 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00122-nw2` (2026-03-02 13:12 PST)
-  - **Account B/C buying power cap**: `open_limit_position()` now checks Alpaca buying power before submitting limit orders. Caps qty so position value stays within 95% of available buying power. Prevents cash overdraft.
-- **v70 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00121-l9b` (2026-03-02 10:07 PST)
-  - **Weekend EOD closer bug FIXED**: `should_close()` now rejects weekends (`weekday() >= 5`). Root cause of Account A momentum positions being force-sold at Monday open.
-  - **WebSocket callback guarded**: `_on_stock_price_update()` returns early outside trading hours. Defense in depth for all 3 accounts.
-  - Account A: Momentum screener active, `log_signal()` fix live
-  - Account B: Big-hitter pattern trader active (v60 redesign)
-  - Account C: Cameron B2 pattern trader active
-- **Account A weekend sell investigation COMPLETE** (2026-03-02): Alpaca order history confirmed sell orders created Saturday 3:55 PM ET by our code. Two batches affected (Feb 26 + Feb 27 buys). Combined bug damage ~$3,339 vs ~$2,026 with intended stops+D+1 exit.
-- **Account A data backfilled** (2026-03-02): 10 trades from 02/27 updated in DB with actual Alpaca exit prices. Total P&L: -$5,485.53 (QURE -40.28% gap-down). Google Sheet "Closed Today" tab populated.
-- **Account A Google Sheet fix** (2026-03-02): `_execute_momentum_buys()` was missing `dashboard.log_signal()`. Fix committed in `245525c`, deployed in v70.
+- **v73 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00124-9cd` (2026-03-03 14:58 PST)
+  - **Account B 11 AM ET entry cutoff**: No new orders placed after 11:00 AM ET. 3-year backtest (559 trades): morning +$17,327, afternoon -$209. Trailing stop alternative rejected (hurts P&L by $3-9K). Full analysis: `Docs/ACCOUNT_B_11AM_CUTOFF.md`
+  - Also synced previously deployed v70-v72 changes to git (EOD weekend guard, cancel-before-close, Cameron scanner fixes, multi-stage Dockerfile, unused dep removal)
+- **v72 DEPLOYED** on revision `paper-trading-live-00123-9bd` (2026-03-03 08:40 PST)
+  - **Over-leveraging fix**: Position sizing now caps by `equity * 0.90` instead of `buying_power * 0.95`.
+- **v70-v71** — Weekend EOD closer fix, WebSocket trading hours guard, Account B/C buying power cap
 - **Cameron Article Enrichment (V2 side) READY** — Code complete, DDL pending deployment
   - DDL needed before deploy: `sql/create_cameron_candidates_daily.sql`, `sql/alter_paper_trades_log_c_has_news.sql`
 - **V6 Research COMPLETE (2026-02-26)** — OI direction DISPROVEN, momentum strategy discovered
@@ -462,7 +455,7 @@ Parallel paper trading account using **DayTrading engulfing scanner big-hitter p
 
 **Signal flow:**
 ```
-During market hours (every 30s):
+During market hours, before 11 AM ET (every 30s):
   Poll engulfing_scores (timeframe='5min', last 10 min, volume_confirmed, trend_context)
     → Apply big-hitter filters:
       - candle_range <= 0.57
@@ -496,6 +489,7 @@ During market hours (every 30s):
 | `ACCOUNT_B_MIN_RISK_PER_SHARE` | `1.00` | Min distance entry→stop (avoid tiny stops) |
 | `ACCOUNT_B_CONFIRMATION_WINDOW_MIN` | `30` | Cancel unfilled limit orders after N minutes |
 | `ACCOUNT_B_LOOKBACK_MIN` | `10` | Only patterns from last N minutes |
+| `ACCOUNT_B_LAST_ENTRY_TIME` | `11:00 AM` | No new orders after this time (v73: 3yr backtest validated) |
 
 **Key files:**
 - `paper_trading/engulfing_checker.py` — `PatternPoller` class + `TradeSetup` dataclass. Polls `engulfing_scores` for qualifying 5-min patterns. `.strip()` on DB URL (critical for Cloud Run)
