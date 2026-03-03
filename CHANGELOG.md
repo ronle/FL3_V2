@@ -2,6 +2,26 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-03 14:30 PST] — Account B: 11 AM ET Entry Cutoff (v73)
+
+### Done
+- **3-year backtest analysis**: Morning entries (<11 AM ET) generate +$17,327 across 465 trades (50.3% WR). Afternoon entries (>=11 AM) lose -$209 across 94 trades (48.9% WR). 83% of all profit comes from 61% of trades.
+- **Trailing stop investigation**: Tested 0.5%-3% trailing stops after 11 AM. With realistic per-trade engulfing stop/target baseline ($26,231), all trailing variants HURT performance (-$3K to -$9K). Rejected.
+- **Implementation**: `_poll_account_b_patterns()` now stops polling after `ACCOUNT_B_LAST_ENTRY_TIME` (11:00 AM ET). Existing positions continue stop/target/EOD monitoring normally.
+- Full findings documented in `Docs/ACCOUNT_B_11AM_CUTOFF.md`
+
+### State
+- v73 ready for deploy (pending)
+- Accounts A and C unaffected
+
+### Next
+- Deploy v73, monitor Account B behavior across first week
+
+### Files Changed
+- `paper_trading/config.py` — added `ACCOUNT_B_LAST_ENTRY_TIME`
+- `paper_trading/main.py` — added time check in `_poll_account_b_patterns()`
+- `Docs/ACCOUNT_B_11AM_CUTOFF.md` — full backtest findings and decision rationale
+
 ## [2026-03-03 08:45 PST] — Fix Over-Leveraging from Short Proceeds (v72)
 
 ### Done

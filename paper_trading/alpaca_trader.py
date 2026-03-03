@@ -287,9 +287,36 @@ class AlpacaTrader:
         """Submit a buy-to-cover order (close a short position)."""
         return await self.submit_order(symbol, qty, OrderSide.BUY, OrderType.MARKET)
 
-    async def close_position(self, symbol: str) -> Optional[Order]:
-        """Close an entire position."""
+    async def cancel_open_orders_for_symbol(self, symbol: str) -> int:
+        """Cancel all open orders for a symbol. Returns count cancelled."""
         session = await self._get_session()
+        url = f"{self.base_url}/v2/orders?status=open&symbols={symbol}"
+
+        try:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    return 0
+                orders = await response.json()
+
+            cancelled = 0
+            for order in orders:
+                if await self.cancel_order(order["id"]):
+                    cancelled += 1
+            if cancelled:
+                logger.info(f"Cancelled {cancelled} open orders for {symbol}")
+                await asyncio.sleep(0.5)  # Let Alpaca release held shares
+            return cancelled
+        except Exception as e:
+            logger.error(f"Error cancelling orders for {symbol}: {e}")
+            return 0
+
+    async def close_position(self, symbol: str) -> Optional[Order]:
+        """Close an entire position. Cancels pending orders first to release held shares."""
+        session = await self._get_session()
+
+        # Cancel any pending orders that may be holding shares
+        await self.cancel_open_orders_for_symbol(symbol)
+
         url = f"{self.base_url}/v2/positions/{symbol}"
 
         try:
