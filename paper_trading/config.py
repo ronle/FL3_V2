@@ -30,7 +30,7 @@ class TradingConfig:
     """Paper trading configuration."""
 
     # v58: Momentum EOD Screener (Account A)
-    USE_MOMENTUM_SCREENER: bool = True     # Enable momentum EOD screening for Account A
+    USE_MOMENTUM_SCREENER: bool = False    # PAUSED v73: -$9.9K in 3 days (20 trades, 5% WR). Catching falling knives in down market.
     USE_UOA_SIGNALS: bool = False          # Disable UOA-based Account A entries
     MOMENTUM_THRESHOLD: float = -0.10      # price_momentum_20d cutoff (< -10%)
     MOMENTUM_PRICE_FLOOR: float = 10.0     # Min stock price
