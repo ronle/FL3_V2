@@ -68,7 +68,14 @@ class EODCloser:
         if self._closed_today:
             return False
 
-        now = self._get_et_time()
+        now_dt = self._get_et_datetime()
+
+        # Must be a weekday (Mon-Fri). Cloud Run can restart on weekends
+        # and fire this check — sells get queued and fill Monday open.
+        if now_dt.weekday() >= 5:
+            return False
+
+        now = now_dt.time()
 
         # Close at or after exit time (3:55 PM ET through end of day).
         # Previously required now < MARKET_CLOSE, but that missed the

@@ -13,6 +13,7 @@ Account B (big-hitter pattern trader):
 - Big-hitter filters: candle_range <= 0.57, risk >= $1/share, volume confirmed
 - Limit order entry at pattern's entry_price, cancel after 30min if unfilled
 - Exit at stop_loss (market), target_1 (market), or EOD 3:55 PM
+- No new orders after 11 AM ET (v73: 3yr backtest shows morning +$17K, afternoon -$209)
 - Supports both long and short (direction from pattern)
 
 Legacy (UOA signals, disabled by default):
@@ -76,6 +77,7 @@ class TradingConfig:
     ACCOUNT_B_MIN_RISK_PER_SHARE: float = 1.00     # Min distance entry→stop (avoid tiny stops)
     ACCOUNT_B_CONFIRMATION_WINDOW_MIN: int = 30    # Cancel unfilled limit orders after this
     ACCOUNT_B_LOOKBACK_MIN: int = 10               # Only patterns from last N minutes
+    ACCOUNT_B_LAST_ENTRY_TIME: dt_time = dt_time(11, 0)  # No new orders after 11 AM ET (3yr backtest: morning=+$17K, afternoon=-$209)
 
     # Account C — Cameron B2 Pattern Trader
     USE_ACCOUNT_C: bool = True

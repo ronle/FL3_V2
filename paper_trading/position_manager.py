@@ -321,8 +321,9 @@ class PositionManager:
         # Max position value based on portfolio
         max_position_value = account.portfolio_value * self.config.MAX_POSITION_SIZE_PCT
 
-        # Don't exceed available buying power
-        max_position_value = min(max_position_value, account.buying_power * 0.95)
+        # Cap by equity (not buying_power, which inflates from short proceeds)
+        # Use 90% of equity to leave buffer for unrealized losses + margin
+        max_position_value = min(max_position_value, account.equity * 0.90)
 
         # Calculate shares
         shares = int(max_position_value / price)
@@ -684,6 +685,27 @@ class PositionManager:
             logger.info(f"Skipping {setup.symbol}: risk/share ${setup.risk_per_share:.2f} "
                         f"exceeds max_risk ${max_risk:.2f}")
             return None
+
+        # Cap qty by equity (not buying_power, which inflates from short proceeds)
+        # Use 90% of equity to leave buffer for unrealized losses + margin
+        account = await self.trader.get_account()
+        if account:
+            position_value = qty * setup.entry_price
+            available = account.equity * 0.90
+            if position_value > available:
+                capped_qty = math.floor(available / setup.entry_price)
+                if capped_qty < 1:
+                    logger.warning(
+                        f"Skipping {setup.symbol}: insufficient equity "
+                        f"(${available:,.0f} available, need ${setup.entry_price:.2f}/share)"
+                    )
+                    return None
+                logger.info(
+                    f"Capped {setup.symbol} qty {qty}→{capped_qty} "
+                    f"(equity ${account.equity:,.0f}, 90% = ${available:,.0f}, "
+                    f"was ${position_value:,.0f}, now ${capped_qty * setup.entry_price:,.0f})"
+                )
+                qty = capped_qty
 
         # Submit limit order
         if setup.direction == "bullish":

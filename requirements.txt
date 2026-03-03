@@ -12,13 +12,8 @@ psycopg2-binary>=2.9.9
 pandas>=2.0.0
 numpy>=1.24.0
 
-# Technical Analysis
-ta>=0.10.2
-
 # API Clients
-alpaca-py>=0.21.0
 requests>=2.31.0
-yfinance>=0.2.36
 
 # Time/Timezone
 pytz>=2024.1

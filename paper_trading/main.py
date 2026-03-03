@@ -232,6 +232,11 @@ class PaperTradingEngine:
         """
         self._realtime_prices[symbol] = price
 
+        # Only act on prices during trading hours — Cloud Run can restart
+        # on weekends/overnight and replay stale WebSocket data.
+        if not self._is_trading_hours():
+            return
+
         # Check hard stop if we have a position in this symbol (Account A)
         if symbol in self.position_manager.active_trades and self.config.USE_HARD_STOP:
             trade = self.position_manager.active_trades[symbol]
@@ -352,6 +357,10 @@ class PaperTradingEngine:
         if not self._account_b_enabled or self._eod_complete:
             return
         if not self._is_entry_allowed():
+            return
+        # Account B cutoff: no new orders after 11 AM ET (3yr backtest: morning +$17K, afternoon -$209)
+        now_et = self._get_et_now().time()
+        if now_et > self.config.ACCOUNT_B_LAST_ENTRY_TIME:
             return
 
         setups = self.pattern_poller.poll_qualifying_patterns()
@@ -485,6 +494,8 @@ class PaperTradingEngine:
                 setup, max_risk=self.config.CAMERON_MAX_RISK_PER_TRADE
             )
             if trade:
+                # Mark symbol as traded so we don't re-enter after stop/redeploy
+                self.cameron_checker._traded_today.add(setup.symbol)
                 # Subscribe for real-time price updates
                 if self.stock_monitor.is_connected:
                     await self.stock_monitor.subscribe([setup.symbol])
@@ -522,6 +533,11 @@ class PaperTradingEngine:
         # Load candidates once per day on first tick
         if not self.cameron_scanner._candidates_loaded:
             await self.cameron_scanner.load_candidates()
+            # Subscribe candidates to WS for real-time prices
+            if self.cameron_scanner._candidates and self.stock_monitor:
+                syms = [c["symbol"] for c in self.cameron_scanner._candidates]
+                await self.stock_monitor.subscribe(syms)
+                logger.info(f"Cameron: subscribed {len(syms)} candidates to WS")
 
         try:
             count = await self.cameron_scanner.scan_tick()
@@ -1136,8 +1152,8 @@ class PaperTradingEngine:
                 if self._account_c_enabled:
                     self.cameron_scanner = CameronScanner(
                         db_pool=self._db_pool,
-                        alpaca_key=os.environ.get("ALPACA_API_KEY_C", ""),
-                        alpaca_secret=os.environ.get("ALPACA_SECRET_KEY_C", ""),
+                        alpaca_key=os.environ.get("ALPACA_API_KEY", ""),
+                        alpaca_secret=os.environ.get("ALPACA_SECRET_KEY", ""),
                         scan_start=self.config.CAMERON_SCAN_START,
                         scan_end=self.config.CAMERON_SCAN_END,
                         rvol_min=self.config.CAMERON_RVOL_MIN,

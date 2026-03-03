@@ -70,13 +70,44 @@ class CameronChecker:
         self.max_bf_per_day = max_bf_per_day
         self.lookback_min = lookback_min
         self._seen_patterns: Set[Tuple[str, str, str]] = set()  # (symbol, pattern_date, pattern_type)
+        self._traded_today: Set[str] = set()  # symbols already traded today (survives redeploys via DB seed)
         self._bf_count_today: int = 0
+        self._seeded_from_db: bool = False
 
     def reset_daily(self):
         """Clear seen patterns and bull flag count for a new trading day."""
         self._seen_patterns.clear()
+        self._traded_today.clear()
         self._bf_count_today = 0
+        self._seeded_from_db = False
         logger.info("CameronChecker: reset for new day")
+
+    def _seed_seen_from_db(self):
+        """Load today's traded symbols from paper_trades_log_c to prevent re-entries after restart."""
+        if self._seeded_from_db or not self.database_url:
+            return
+        self._seeded_from_db = True
+        try:
+            import psycopg2
+            conn = psycopg2.connect(self.database_url)
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT DISTINCT symbol
+                FROM paper_trades_log_c
+                WHERE entry_time::date = CURRENT_DATE
+            """)
+            rows = cur.fetchall()
+            cur.close()
+            conn.close()
+            for (symbol,) in rows:
+                self._traded_today.add(symbol)
+            if rows:
+                logger.info(
+                    f"CameronChecker: seeded {len(rows)} symbols from today's trades "
+                    f"(will not re-enter: {self._traded_today})"
+                )
+        except Exception as e:
+            logger.warning(f"CameronChecker: failed to seed from DB: {e}")
 
     def poll_qualifying_patterns(self) -> List[CameronTradeSetup]:
         """
@@ -87,6 +118,9 @@ class CameronChecker:
         if not self.database_url:
             logger.warning("CameronChecker: no database_url configured")
             return []
+
+        # On first poll, seed seen set from today's DB trades (survives redeploys)
+        self._seed_seen_from_db()
 
         try:
             import psycopg2
@@ -126,6 +160,11 @@ class CameronChecker:
             target_1 = float(target_1) if target_1 else 0
             gap_pct_val = float(gap_pct) if gap_pct else 0
             rvol_val = float(rvol) if rvol else 0
+
+            # Skip symbols already traded today (persists across redeploys)
+            if symbol in self._traded_today:
+                skipped_seen += 1
+                continue
 
             # Deduplicate by (symbol, pattern_date, pattern_type)
             key = (symbol, str(pattern_date), pattern_type)

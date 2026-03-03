@@ -92,23 +92,36 @@ class CameronScanner:
                     WITH latest AS (
                         SELECT MAX(asof_date) AS d FROM orats_daily
                     ),
-                    prev AS (
-                        SELECT ticker, stock_price AS prev_close
+                    prev_date AS (
+                        SELECT MAX(asof_date) AS d
                         FROM orats_daily
-                        WHERE asof_date = (SELECT d - 1 FROM latest)
+                        WHERE asof_date < (SELECT d FROM latest)
+                    ),
+                    prev AS (
+                        SELECT symbol, stock_price AS prev_close
+                        FROM orats_daily
+                        WHERE asof_date = (SELECT d FROM prev_date)
+                    ),
+                    avg_vol AS (
+                        SELECT symbol, AVG(total_volume) AS avg_30d_vol
+                        FROM orats_daily
+                        WHERE asof_date >= (SELECT d FROM latest) - INTERVAL '30 days'
+                          AND asof_date <  (SELECT d FROM latest)
+                        GROUP BY symbol
                     )
                     SELECT
-                        o.ticker,
+                        o.symbol,
                         o.stock_price,
                         CASE WHEN p.prev_close > 0
                              THEN (o.stock_price - p.prev_close) / p.prev_close
                              ELSE 0 END AS gap_pct,
-                        CASE WHEN NULLIF(o.avg_daily_volume, 0) > 0
-                             THEN o.daily_volume::float / o.avg_daily_volume
+                        CASE WHEN NULLIF(av.avg_30d_vol, 0) > 0
+                             THEN o.total_volume::float / av.avg_30d_vol
                              ELSE 0 END AS rvol
                     FROM orats_daily o
                     JOIN latest ON o.asof_date = latest.d
-                    LEFT JOIN prev p ON p.ticker = o.ticker
+                    LEFT JOIN prev p ON p.symbol = o.symbol
+                    LEFT JOIN avg_vol av ON av.symbol = o.symbol
                     WHERE o.stock_price BETWEEN 1 AND 20
                     ORDER BY gap_pct DESC
                 """)
@@ -119,7 +132,7 @@ class CameronScanner:
                 rvol = float(r["rvol"]) if r["rvol"] else 0
                 if gap >= 0.04 and rvol >= self.rvol_min:
                     self._candidates.append({
-                        "symbol": r["ticker"],
+                        "symbol": r["symbol"],
                         "price": float(r["stock_price"]),
                         "gap_pct": gap,
                         "rvol": rvol,
@@ -271,7 +284,7 @@ class CameronScanner:
         from scripts.patterns.vwap_reclaim import detect_vwap_reclaim, compute_vwap
 
         patterns_found = []
-        today_str = datetime.now(ET).date().isoformat()
+        today_str = datetime.now(ET).date()
 
         for sym, df in all_bars.items():
             if len(df) < 5:

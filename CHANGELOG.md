@@ -2,6 +2,137 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-03 14:30 PST] — Account B: 11 AM ET Entry Cutoff (v73)
+
+### Done
+- **3-year backtest analysis**: Morning entries (<11 AM ET) generate +$17,327 across 465 trades (50.3% WR). Afternoon entries (>=11 AM) lose -$209 across 94 trades (48.9% WR). 83% of all profit comes from 61% of trades.
+- **Trailing stop investigation**: Tested 0.5%-3% trailing stops after 11 AM. With realistic per-trade engulfing stop/target baseline ($26,231), all trailing variants HURT performance (-$3K to -$9K). Rejected.
+- **Implementation**: `_poll_account_b_patterns()` now stops polling after `ACCOUNT_B_LAST_ENTRY_TIME` (11:00 AM ET). Existing positions continue stop/target/EOD monitoring normally.
+- Full findings documented in `Docs/ACCOUNT_B_11AM_CUTOFF.md`
+
+### State
+- v73 ready for deploy (pending)
+- Accounts A and C unaffected
+
+### Next
+- Deploy v73, monitor Account B behavior across first week
+
+### Files Changed
+- `paper_trading/config.py` — added `ACCOUNT_B_LAST_ENTRY_TIME`
+- `paper_trading/main.py` — added time check in `_poll_account_b_patterns()`
+- `Docs/ACCOUNT_B_11AM_CUTOFF.md` — full backtest findings and decision rationale
+
+## [2026-03-03 08:45 PST] — Fix Over-Leveraging from Short Proceeds (v72)
+
+### Done
+- **Root cause**: Position sizing used `buying_power * 0.95` to cap order size. When a short position is opened, Alpaca adds the sale proceeds to buying_power (e.g., short 100 shares @ $50 = +$5K buying_power). Subsequent trades see inflated buying_power and can allocate more capital than actually exists. If the short then closes at a loss, the account is over-committed.
+- **Fix**: Both `calculate_position_size()` (Account A) and `open_limit_position()` (Account B/C) now cap against `equity * 0.90` instead of `buying_power * 0.95`. Equity reflects true account value (assets minus liabilities) and is not inflated by short sale proceeds. Buffer increased from 5% to 10% for additional margin safety.
+- **Deployed**: revision `paper-trading-live-00123-9bd`, 100% traffic
+
+### State
+- v72 live, will take effect on next trade
+- Account A: `min(portfolio_value * 10%, equity * 90%)`
+- Account B/C: `min(max_risk / risk_per_share * entry_price, equity * 90%)`
+
+### Next
+- Monitor logs for `"equity"` in position sizing messages confirming the new cap is active
+- Verify short positions no longer inflate available capital for subsequent trades
+
+### Files Changed
+- `paper_trading/position_manager.py` — `calculate_position_size()` and `open_limit_position()` both switched from buying_power to equity
+
+---
+
+## [2026-03-02 13:15 PST] — Account B/C Buying Power Cap (v71)
+
+### Done
+- **Root cause**: `open_limit_position()` sized positions purely from risk budget (`$500 / risk_per_share`) with no buying power check. A $100 stock with $1 stop = 500 shares = $50K position. Multiple concurrent positions exceeded account cash, going negative.
+- **Today's data**: 29 Account B trades, avg position $31K, max $61K (AEP). Total notional $875K.
+- **Fix**: Added buying power check in `open_limit_position()` — after computing qty from risk, fetches Alpaca account buying power, caps qty so `qty * entry_price <= 95% of buying_power`. Skips trade entirely if can't afford 1 share.
+- **Scope**: Applies to both Account B (engulfing) and Account C (Cameron) since both use `open_limit_position()`
+- **Built**: `paper-trading:v71` (805 KB context, 1m42s)
+- **Deployed**: revision `paper-trading-live-00122-nw2`, 100% traffic
+
+### State
+- v71 live, market closed — will take effect next trading day
+- Risk-per-trade still capped at $500, now also bounded by available cash
+
+### Next
+- Monitor tomorrow's logs for `"Capped ... qty"` messages confirming the guard is working
+- Verify Account B stays within cash balance throughout the day
+
+### Files Changed
+- `paper_trading/position_manager.py` — buying power cap in `open_limit_position()`
+
+---
+
+## [2026-03-02 10:10 PST] — Weekend EOD Closer Bug Fix (v70 redeploy)
+
+### Done
+- **Root cause identified**: Account A momentum positions (bought Thu/Fri at 3:56 PM) were being sold at next market open because Cloud Run restarted on weekends, EOD closer's `should_close()` fired at Saturday 3:55 PM (no weekday check), and Alpaca queued sell orders until Monday open
+- **Evidence**: Alpaca order history shows sell orders created `2026-02-28T20:55:22Z` (Saturday 3:55 PM ET) with `src=access_key` (our code). Same pattern on Feb 26 (`2026-02-26T21:03:17Z`)
+- **Fix 1 (primary)**: `eod_closer.py:should_close()` — added `weekday() >= 5` guard. Weekends now return `False` immediately
+- **Fix 2 (defense in depth)**: `main.py:_on_stock_price_update()` — added `_is_trading_hours()` guard at top of WebSocket callback. Prevents hard stops and stop/target exits for all 3 accounts outside market hours
+- **Built and deployed**: `paper-trading:v70` → revision `paper-trading-live-00121-l9b`, 100% traffic
+- **Impact analysis (Feb 26 Thursday batch)**:
+  - Bug exit (sold Fri open): -$1,903
+  - If held with -5% stops + 3:55 PM D+1 exit: -$1,664
+  - 5 of 10 positions hit -5% stop on Friday (GRAL, LMND, ODD, FLNC, DRVN)
+- **Impact analysis (Feb 27 Friday batch)**:
+  - Bug exit (sold Mon open): ~-$1,436
+  - If held to Mon 3:55 PM (current as proxy): ~-$362
+- **Checked Alpaca Account A settings**: multiplier=4 (PDT), margin enabled, equity ~$86K
+
+### State
+- v70 deployed with weekend guard — no more Saturday/Sunday phantom sells
+- Weekday restarts safe: `should_close()` returns False before 3:55 PM, True after (correct behavior)
+- Temp credential files cleaned up
+
+### Next
+- Monitor this coming weekend for no phantom sells
+- Consider market holiday calendar check (future hardening)
+
+### Files Changed
+- `paper_trading/eod_closer.py` — weekday guard in `should_close()`
+- `paper_trading/main.py` — trading hours guard in `_on_stock_price_update()`
+
+---
+
+## [2026-03-02 08:30 PST] — Account A Google Sheet Fix + Data Backfill
+
+### Done
+- **Investigated**: Account A actions on 02/27 not appearing on Google Sheet
+- **Root cause**: `_execute_momentum_buys()` in `main.py` was missing `dashboard.log_signal()` — momentum buys wrote to DB (`paper_trades_log`) and Positions tab (`update_position()`) but never logged to Active Signals tab
+- **Fix**: Added `dashboard.log_signal()` call after each successful momentum buy. RSI column shows momentum % (e.g., -51.6 for -51.6% momentum)
+- **Status**: Fix was already committed in `245525c` and deployed in v70 (currently live). No additional deploy needed.
+- **Additional 02/27 context**: Account A "Closed Today" tab was empty because prior-day positions from 02/26 were lost to the orphan-sell bug (pre-v59). Saturday container restart at 9:13 AM ET called `clear_daily()` wiping remaining Positions data.
+- **Backfilled Account A data (02/27 → 03/02)**:
+  - Retrieved actual exit prices from Alpaca order history for 10 momentum positions
+  - Updated `paper_trades_log` records (IDs 173-182): set real exit_price, pnl, pnl_pct; changed exit_reason from `crash_recovery` to `eod_crash_recovery`
+  - Fixed shares mismatch: BOIL (543→561), LQDA (240→297)
+  - Appended 10 closed trades to Google Sheet "Closed Today" tab
+  - **Total P&L: -$5,485.53** — QURE gap-down -40.28% ($15.59→$9.31) over weekend was main loss
+  - Positions were held Thu PM → Mon AM due to v62-v70 deployment churn preventing normal D+1 EOD close
+
+### State
+- v70 DEPLOYED on `paper-trading-live` (built 2026-03-02 10:06 UTC)
+- `log_signal()` fix is live — will populate Active Signals tab starting next trading session
+- All 10 Account A trades from 02/27 now have accurate P&L in DB and Google Sheet
+- v62 through v70 deployments happened between sessions (Cameron fixes, trading hours guard, etc.)
+
+### Next
+- Monitor Monday's Active Signals tab for momentum entries at 3:56 PM ET
+
+### Files Changed
+- `paper_trading/main.py` (verified fix already committed)
+- `paper_trades_log` DB records 173-182 (backfilled exit data)
+- Google Sheet "Closed Today" tab (10 rows appended)
+- `temp/query_account_a.py` (diagnostic script)
+- `temp/alpaca_history.py` (Alpaca order history pull)
+- `temp/backfill_account_a.py` (DB + Sheet backfill script)
+
+---
+
 ## [2026-03-01 11:10 PST] — Cameron Article Enrichment (V2 Side)
 
 ### Done
