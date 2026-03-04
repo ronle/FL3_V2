@@ -133,7 +133,7 @@ class TradingConfig:
 
     # Intraday bar collection
     COLLECT_INTRADAY_BARS: bool = True
-    INTRADAY_BARS_MAX_BATCHES: int = 20      # 20 × 100 = 2,000 symbols (full market)
+    INTRADAY_BARS_MAX_BATCHES: int = 35      # 35 × 100 = 3,500 symbols (covers 3,014 tracked + headroom)
     INTRADAY_BARS_INTERVAL_SEC: int = 60     # collect every 60 seconds
     INTRADAY_BARS_RETENTION_DAYS: int = 21   # 21 calendar days ≈ 14 trading days
 
