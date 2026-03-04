@@ -345,6 +345,51 @@ class Dashboard:
         except Exception as e:
             logger.warning(f"Dashboard clear_daily failed: {e}")
 
+    def sync_order_history(self, orders: list):
+        """
+        Write full order history to the "Engulfing Orders" tab.
+
+        Clears the tab and rewrites all rows. Non-critical — failures are logged
+        but do not affect trading.
+
+        Args:
+            orders: list of dicts from AlpacaTrader.get_all_orders()
+        """
+        if not self._enabled:
+            return
+
+        try:
+            tab = self._get_or_create_worksheet("Engulfing Orders")
+            tab.clear()
+
+            headers = [
+                "Submitted", "Symbol", "Side", "Qty", "Type", "Status",
+                "Filled Qty", "Avg Fill Price", "Filled At",
+            ]
+
+            rows = [headers]
+            for o in orders:
+                # Format timestamps: strip fractional seconds + timezone for readability
+                submitted = (o.get("submitted_at") or "")[:19].replace("T", " ")
+                filled_at = (o.get("filled_at") or "")[:19].replace("T", " ")
+
+                rows.append([
+                    submitted,
+                    o.get("symbol", ""),
+                    (o.get("side") or "").upper(),
+                    o.get("qty", ""),
+                    (o.get("type") or "").upper(),
+                    (o.get("status") or "").upper(),
+                    o.get("filled_qty", ""),
+                    o.get("filled_avg_price", ""),
+                    filled_at,
+                ])
+
+            tab.update(f"A1:I{len(rows)}", rows, value_input_option="USER_ENTERED")
+            logger.info(f"Dashboard: synced {len(orders)} orders to 'Engulfing Orders' tab")
+        except Exception as e:
+            logger.warning(f"Dashboard sync_order_history failed: {e}")
+
     @property
     def enabled(self) -> bool:
         """Check if dashboard is enabled and connected."""

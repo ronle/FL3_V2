@@ -178,6 +178,16 @@ class PaperTradingEngine:
             else:
                 logger.warning("Account C: ALPACA keys not found, disabled")
 
+        # Engulfing dashboard account — order history sync at EOD
+        self.engulfing_trader: Optional[AlpacaTrader] = None
+        engulfing_key = os.environ.get("ALPACA_API_KEY_ENGULFING")
+        engulfing_secret = os.environ.get("ALPACA_SECRET_KEY_ENGULFING")
+        if engulfing_key and engulfing_secret:
+            self.engulfing_trader = AlpacaTrader(engulfing_key, engulfing_secret, config)
+            logger.info("Engulfing dashboard Alpaca client initialized (order history sync)")
+        else:
+            logger.info("Engulfing dashboard: ALPACA keys not set, order history sync disabled")
+
         # State
         self._running = False
         self._graceful_shutdown = False
@@ -1033,6 +1043,10 @@ class PaperTradingEngine:
         # Save to file
         self._save_daily_log(summary, closed_trades)
 
+        # Sync engulfing dashboard order history (non-blocking, non-critical)
+        if self.engulfing_trader:
+            asyncio.ensure_future(self._sync_engulfing_orders())
+
     def _save_daily_log(self, summary: Dict, trades):
         """Save daily trading log to file."""
         log_dir = Path(__file__).parent.parent / "paper_trading_logs"
@@ -1066,6 +1080,17 @@ class PaperTradingEngine:
             json.dump(log_data, f, indent=2)
 
         logger.info(f"Daily log saved: {log_file}")
+
+    async def _sync_engulfing_orders(self):
+        """Fetch engulfing account order history and write to Google Sheet."""
+        try:
+            orders = await self.engulfing_trader.get_all_orders()
+            if orders:
+                dashboard = get_dashboard()
+                if dashboard.enabled:
+                    dashboard.sync_order_history(orders)
+        except Exception as e:
+            logger.warning(f"Engulfing order history sync failed: {e}")
 
     async def run(self):
         """
@@ -1457,6 +1482,8 @@ class PaperTradingEngine:
             await self.trader_b.close()
         if self._account_c_enabled and hasattr(self, 'trader_c'):
             await self.trader_c.close()
+        if self.engulfing_trader:
+            await self.engulfing_trader.close()
 
         # Log final stats
         logger.info(f"Signal filter stats: {self.signal_filter.get_stats()}")
