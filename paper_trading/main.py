@@ -996,6 +996,58 @@ class PaperTradingEngine:
         for symbol in stopped:
             logger.warning(f"Hard stop triggered (REST check): {symbol}")
 
+    async def _refresh_sparklines(self):
+        """Refresh sparkline_1d table from today's spot_prices_1m bars."""
+        if not self._db_pool:
+            return
+
+        try:
+            async with self._db_pool.acquire() as conn:
+                rows = await conn.fetch("""
+                    SELECT symbol, array_agg(close ORDER BY bar_ts) AS closes
+                    FROM spot_prices_1m
+                    WHERE bar_ts >= CURRENT_DATE + INTERVAL '14 hours'
+                    GROUP BY symbol
+                """)
+
+            if not rows:
+                return
+
+            today = self._get_et_now().date()
+            max_pts = self.config.SPARKLINE_POINTS
+            upsert_data = []
+
+            for row in rows:
+                symbol = row['symbol']
+                closes = [float(c) for c in row['closes']]
+                n = len(closes)
+                if n <= max_pts:
+                    sampled = closes
+                else:
+                    step = n // max_pts
+                    sampled = closes[::step]
+
+                upsert_data.append((
+                    symbol, today, json.dumps(sampled), len(closes)
+                ))
+
+            if upsert_data:
+                async with self._db_pool.acquire() as conn:
+                    await conn.executemany("""
+                        INSERT INTO sparkline_1d (symbol, trade_date, closes, bar_count, updated_at)
+                        VALUES ($1, $2, $3::jsonb, $4, NOW())
+                        ON CONFLICT (symbol) DO UPDATE SET
+                            trade_date = EXCLUDED.trade_date,
+                            closes     = EXCLUDED.closes,
+                            bar_count  = EXCLUDED.bar_count,
+                            updated_at = NOW()
+                    """, upsert_data)
+
+                logger.info(f"sparkline_1d refreshed: {len(upsert_data)} symbols")
+
+        except Exception as e:
+            logger.warning(f"Sparkline refresh failed: {e}")
+
     def _on_eod_complete_b(self, closed_trades):
         """Callback when Account B EOD close completes."""
         # Cancel any pending limit orders at EOD
@@ -1258,6 +1310,7 @@ class PaperTradingEngine:
         account_b_poll_interval = self.config.ACCOUNT_B_POLL_INTERVAL_SEC if self._account_b_enabled else 9999
         cameron_poll_interval = self.config.CAMERON_POLL_INTERVAL_SEC if self._account_c_enabled else 9999
         cameron_scan_interval = self.config.CAMERON_SCAN_INTERVAL_SEC if self._account_c_enabled else 9999
+        sparkline_interval = self.config.SPARKLINE_REFRESH_INTERVAL_SEC
 
         last_signal_check = 0
         last_stop_check = 0
@@ -1267,6 +1320,7 @@ class PaperTradingEngine:
         last_account_b_poll = 0
         last_cameron_poll = 0
         last_cameron_scan = 0
+        last_sparkline_refresh = 0
 
         try:
             async for trade in self.firehose.stream():
@@ -1393,6 +1447,14 @@ class PaperTradingEngine:
                     except Exception as e:
                         logger.warning(f"Intraday bar collection failed: {e}")
                     last_bar_collect = now
+
+                # Periodic sparkline refresh (every 5 min, after bars collected)
+                if now - last_sparkline_refresh >= sparkline_interval:
+                    try:
+                        await self._refresh_sparklines()
+                    except Exception as e:
+                        logger.warning(f"Sparkline refresh failed: {e}")
+                    last_sparkline_refresh = now
 
                 # Run bar retention if flagged by daily reset
                 if self._bar_retention_pending and self.bar_collector:

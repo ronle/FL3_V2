@@ -84,6 +84,9 @@ class BaselineRefreshJob:
             # Step 4: Generate health report
             report = await self._generate_health_report()
 
+            # Step 5: Refresh ADV 14-day table (for engulfing dashboard)
+            await self._refresh_adv_14d()
+
         except Exception as e:
             logger.error(f"Refresh job failed: {e}")
             self.stats['errors'] += 1
@@ -218,6 +221,43 @@ class BaselineRefreshJob:
             report['error'] = str(e)
 
         return report
+
+    async def _refresh_adv_14d(self):
+        """Compute 14-day average daily volume from spot_prices_1m and upsert into adv_14d."""
+        logger.info("Refreshing adv_14d (14-day average daily volume)...")
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                result = await conn.execute("""
+                    INSERT INTO adv_14d (symbol, avg_volume, trading_days, computed_at)
+                    SELECT
+                        symbol,
+                        ROUND(AVG(daily_vol))::bigint AS avg_volume,
+                        COUNT(*)::integer AS trading_days,
+                        NOW() AS computed_at
+                    FROM (
+                        SELECT symbol, bar_ts::date AS trade_date, SUM(volume) AS daily_vol
+                        FROM spot_prices_1m
+                        WHERE bar_ts >= CURRENT_DATE - INTERVAL '14 days'
+                          AND bar_ts < CURRENT_DATE
+                        GROUP BY symbol, bar_ts::date
+                    ) daily
+                    GROUP BY symbol
+                    HAVING COUNT(*) >= 5
+                    ON CONFLICT (symbol) DO UPDATE SET
+                        avg_volume   = EXCLUDED.avg_volume,
+                        trading_days = EXCLUDED.trading_days,
+                        computed_at  = EXCLUDED.computed_at
+                """)
+
+                # Parse "INSERT X Y" result
+                parts = result.split() if result else []
+                upserted = int(parts[-1]) if parts else 0
+                logger.info(f"adv_14d refreshed: {upserted} symbols upserted")
+
+        except Exception as e:
+            logger.error(f"adv_14d refresh failed: {e}")
+            self.stats['errors'] += 1
 
     async def _dry_run(self) -> dict:
         """Simulate job without database."""
