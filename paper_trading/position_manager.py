@@ -321,9 +321,12 @@ class PositionManager:
         # Max position value based on portfolio
         max_position_value = account.portfolio_value * self.config.MAX_POSITION_SIZE_PCT
 
-        # Cap by equity (not buying_power, which inflates from short proceeds)
-        # Use 90% of equity to leave buffer for unrealized losses + margin
-        max_position_value = min(max_position_value, account.equity * 0.90)
+        # Cap by remaining equity capacity (total portfolio exposure <= 90% equity)
+        # equity is constant as positions open (cash→stock), so subtract committed capital
+        committed = sum(t.entry_price * t.shares for t in self.active_trades.values())
+        committed += sum(t.entry_price * t.shares for t in self._pending_limit_orders.values())
+        available = max(0, account.equity * 0.90 - committed)
+        max_position_value = min(max_position_value, available)
 
         # Calculate shares
         shares = int(max_position_value / price)
@@ -334,7 +337,8 @@ class PositionManager:
 
         logger.info(
             f"Position size for {symbol}: {shares} shares "
-            f"(${shares * price:,.0f} / max ${max_position_value:,.0f})"
+            f"(${shares * price:,.0f} / max ${max_position_value:,.0f}, "
+            f"equity ${account.equity:,.0f}, committed ${committed:,.0f})"
         )
 
         return shares
@@ -686,24 +690,28 @@ class PositionManager:
                         f"exceeds max_risk ${max_risk:.2f}")
             return None
 
-        # Cap qty by equity (not buying_power, which inflates from short proceeds)
-        # Use 90% of equity to leave buffer for unrealized losses + margin
+        # Cap by remaining equity capacity (total portfolio exposure <= 90% equity)
+        # equity is constant as positions open (cash→stock), so subtract committed capital
         account = await self.trader.get_account()
         if account:
+            committed = sum(t.entry_price * t.shares for t in self.active_trades.values())
+            committed += sum(t.entry_price * t.shares for t in self._pending_limit_orders.values())
+            available = max(0, account.equity * 0.90 - committed)
             position_value = qty * setup.entry_price
-            available = account.equity * 0.90
             if position_value > available:
                 capped_qty = math.floor(available / setup.entry_price)
                 if capped_qty < 1:
                     logger.warning(
-                        f"Skipping {setup.symbol}: insufficient equity "
-                        f"(${available:,.0f} available, need ${setup.entry_price:.2f}/share)"
+                        f"Skipping {setup.symbol}: insufficient equity capacity "
+                        f"(${available:,.0f} available after ${committed:,.0f} committed, "
+                        f"equity ${account.equity:,.0f})"
                     )
                     return None
                 logger.info(
                     f"Capped {setup.symbol} qty {qty}→{capped_qty} "
-                    f"(equity ${account.equity:,.0f}, 90% = ${available:,.0f}, "
-                    f"was ${position_value:,.0f}, now ${capped_qty * setup.entry_price:,.0f})"
+                    f"(equity ${account.equity:,.0f}, committed ${committed:,.0f}, "
+                    f"available ${available:,.0f}, was ${position_value:,.0f}, "
+                    f"now ${capped_qty * setup.entry_price:,.0f})"
                 )
                 qty = capped_qty
 
