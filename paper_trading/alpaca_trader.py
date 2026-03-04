@@ -413,6 +413,69 @@ class AlpacaTrader:
             logger.error(f"Error getting price {symbol}: {e}")
             return None
 
+    async def get_all_orders(
+        self,
+        status: str = "all",
+        limit: int = 500,
+    ) -> List[Dict]:
+        """
+        Fetch all orders from Alpaca, paginating as needed.
+
+        Returns a list of plain dicts (not Order dataclass) with key fields.
+        """
+        session = await self._get_session()
+        all_orders: List[Dict] = []
+        url = f"{self.base_url}/v2/orders"
+        params = {
+            "status": status,
+            "limit": str(limit),
+            "direction": "desc",
+            "nested": "false",
+        }
+
+        try:
+            while True:
+                async with session.get(url, params=params) as response:
+                    if response.status != 200:
+                        text = await response.text()
+                        logger.error(f"Failed to get orders: {response.status} - {text}")
+                        break
+                    data = await response.json()
+
+                if not data:
+                    break
+
+                for o in data:
+                    all_orders.append({
+                        "submitted_at": o.get("submitted_at", ""),
+                        "symbol": o.get("symbol", ""),
+                        "side": o.get("side", ""),
+                        "qty": o.get("qty", ""),
+                        "type": o.get("type", ""),
+                        "status": o.get("status", ""),
+                        "filled_qty": o.get("filled_qty", ""),
+                        "filled_avg_price": o.get("filled_avg_price", ""),
+                        "filled_at": o.get("filled_at", ""),
+                        "limit_price": o.get("limit_price", ""),
+                        "stop_price": o.get("stop_price", ""),
+                    })
+
+                # Paginate if there's a next page token
+                # Alpaca uses the last order ID for cursor-based pagination
+                if len(data) < limit:
+                    break
+                # Use the last order's created_at as the after cursor
+                last_id = data[-1].get("id")
+                if not last_id:
+                    break
+                params["after"] = last_id
+
+            logger.info(f"Fetched {len(all_orders)} orders from Alpaca")
+            return all_orders
+        except Exception as e:
+            logger.error(f"Error fetching all orders: {e}")
+            return all_orders
+
     def _parse_order(self, data: dict) -> Optional[Order]:
         """Parse order response."""
         if not data:
