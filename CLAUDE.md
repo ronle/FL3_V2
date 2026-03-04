@@ -45,8 +45,10 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-03-03 14:58 PST_
+_Last updated: 2026-03-03 17:30 PST_
 
+- **v74 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00126-46h` (2026-03-03 17:20 PST)
+  - **Intraday bar coverage fix**: `INTRADAY_BARS_MAX_BATCHES` 20 → 35 (2000 → 3500 symbols). `tracked_tickers_v2` had grown to 3,014 but cap only covered 2,000 — symbols past 2000th alphabetically (P-Z) had no 1-min bars in `spot_prices_1m`
 - **v73 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00124-9cd` (2026-03-03 14:58 PST)
   - **Account B 11 AM ET entry cutoff**: No new orders placed after 11:00 AM ET. 3-year backtest (559 trades): morning +$17,327, afternoon -$209. Trailing stop alternative rejected (hurts P&L by $3-9K). Full analysis: `Docs/ACCOUNT_B_11AM_CUTOFF.md`
   - Also synced previously deployed v70-v72 changes to git (EOD weekend guard, cancel-before-close, Cameron scanner fixes, multi-stage Dockerfile, unused dep removal)

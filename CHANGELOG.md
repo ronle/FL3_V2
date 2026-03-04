@@ -2,6 +2,21 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-03 17:20 PST] — Bump intraday bar batch cap (v74)
+
+### Done
+- **`INTRADAY_BARS_MAX_BATCHES`**: 20 → 35 (2,000 → 3,500 symbol cap)
+- `tracked_tickers_v2` had grown to 3,014 symbols but the batch cap only covered 2,000. Symbols past the 2,000th alphabetically (P–Z heavy: PLAB, PLG, PWP, QTWO, etc.) had no 1-min bars in `spot_prices_1m`, breaking dashboard day trend sparklines and leaving ~1,000 symbols untracked
+
+### State
+- **v74 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00126-46h`
+
+### Next
+- Verify bars flowing for previously missing symbols (PLAB, PLG, PWP, QTWO) after tomorrow's market open
+
+### Files Changed
+- `paper_trading/config.py` — `INTRADAY_BARS_MAX_BATCHES` 20 → 35
+
 ## [2026-03-03 14:30 PST] — Account B: 11 AM ET Entry Cutoff (v73)
 
 ### Done
