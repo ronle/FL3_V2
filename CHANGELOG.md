@@ -2,6 +2,33 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-04 12:35 PST] — Precomputed Dashboard Tables (v75)
+
+### Done
+- **Two new precomputed tables** (`adv_14d`, `sparkline_1d`) replace expensive `spot_prices_1m` scans in the engulfing dashboard
+- `sparkline_1d`: 3,011 symbols with ~15-point intraday close sparklines, auto-refreshes every 5 min during market hours
+- `adv_14d`: 2,069 symbols with 14-day average daily volume, refreshes daily via `fl3-v2-baseline-refresh` job
+- Dashboard `db_poller.py` updated to read from precomputed tables (simple PK lookups, <100ms vs 30-60s timeouts)
+- DDL created and executed: `sql/create_adv_14d.sql`, `sql/create_sparkline_1d.sql`
+- `fl3-v2-baseline-refresh` job updated from v9 to v75 image
+
+### State
+- **v75 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00131-762`
+- Both tables populated and verified
+- DayTrading `db_poller.py` changes committed (deploy to GCE VM pending)
+
+### Next
+- Deploy DayTrading dashboard to GCE VM to consume precomputed tables
+- Verify dashboard poll cycle times drop from 30-60s to <100ms
+
+### Files Changed
+- `sql/create_adv_14d.sql` — new DDL
+- `sql/create_sparkline_1d.sql` — new DDL
+- `scripts/refresh_baselines.py` — added `_refresh_adv_14d()` as Step 5
+- `paper_trading/config.py` — added `SPARKLINE_REFRESH_INTERVAL_SEC`, `SPARKLINE_POINTS`
+- `paper_trading/main.py` — added `_refresh_sparklines()` + periodic call
+- `DayTrading/engulfing-dashboard/backend/db_poller.py` — replaced `_fetch_avg_volumes()` + `_fetch_day_trends()` with precomputed table reads
+
 ## [2026-03-03 17:20 PST] — Bump intraday bar batch cap (v74)
 
 ### Done
