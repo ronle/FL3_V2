@@ -131,6 +131,10 @@ class TradingConfig:
     ALPACA_PAPER_URL: str = "https://paper-api.alpaca.markets"
     ALPACA_DATA_URL: str = "https://data.alpaca.markets/v2"
 
+    # Sparkline precomputation (for engulfing dashboard)
+    SPARKLINE_REFRESH_INTERVAL_SEC: int = 300  # Refresh sparkline_1d every 5 min
+    SPARKLINE_POINTS: int = 15                 # Downsample to ~15 points per symbol
+
     # Intraday bar collection
     COLLECT_INTRADAY_BARS: bool = True
     INTRADAY_BARS_MAX_BATCHES: int = 35      # 35 × 100 = 3,500 symbols (covers 3,014 tracked + headroom)
