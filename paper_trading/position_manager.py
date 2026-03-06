@@ -690,15 +690,30 @@ class PositionManager:
                         f"exceeds max_risk ${max_risk:.2f}")
             return None
 
-        # Cap by remaining equity capacity (total portfolio exposure <= 90% equity)
-        # equity is constant as positions open (cash→stock), so subtract committed capital
+        # Cap each position at MAX_POSITION_SIZE_PCT of equity (no leverage)
         account = await self.trader.get_account()
         if account:
+            per_position_cap = account.equity * self.config.MAX_POSITION_SIZE_PCT
+            position_value = qty * setup.entry_price
+            if position_value > per_position_cap:
+                qty = math.floor(per_position_cap / setup.entry_price)
+                if qty < 1:
+                    logger.warning(
+                        f"Skipping {setup.symbol}: price ${setup.entry_price:.2f} "
+                        f"exceeds per-position cap ${per_position_cap:,.0f}"
+                    )
+                    return None
+                logger.info(
+                    f"Sized {setup.symbol} qty {math.floor(max_risk / setup.risk_per_share)}→{qty} "
+                    f"(per-position cap ${per_position_cap:,.0f}, "
+                    f"notional ${qty * setup.entry_price:,.0f})"
+                )
+
+            # Also verify total committed stays within 90% equity
             committed = sum(t.entry_price * t.shares for t in self.active_trades.values())
             committed += sum(t.entry_price * t.shares for t in self._pending_limit_orders.values())
             available = max(0, account.equity * 0.90 - committed)
-            position_value = qty * setup.entry_price
-            if position_value > available:
+            if qty * setup.entry_price > available:
                 capped_qty = math.floor(available / setup.entry_price)
                 if capped_qty < 1:
                     logger.warning(
@@ -709,9 +724,7 @@ class PositionManager:
                     return None
                 logger.info(
                     f"Capped {setup.symbol} qty {qty}→{capped_qty} "
-                    f"(equity ${account.equity:,.0f}, committed ${committed:,.0f}, "
-                    f"available ${available:,.0f}, was ${position_value:,.0f}, "
-                    f"now ${capped_qty * setup.entry_price:,.0f})"
+                    f"(committed ${committed:,.0f}, available ${available:,.0f})"
                 )
                 qty = capped_qty
 
