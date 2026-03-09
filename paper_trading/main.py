@@ -46,6 +46,8 @@ from paper_trading.cameron_scanner import CameronScanner
 from firehose.client import FirehoseClient, Trade
 from firehose.stock_price_monitor import StockPriceMonitor
 from firehose.bucket_aggregator import BucketAggregator
+from firehose.aggregator import RollingAggregator
+from firehose.hot_options_detector import HotOptionsDetector
 from paper_trading.bar_collector import IntradayBarCollector
 
 ET = pytz.timezone("America/New_York")
@@ -87,6 +89,10 @@ class PaperTradingEngine:
         # Initialize components
         self.firehose = FirehoseClient(polygon_api_key)
         self.aggregator = TradeAggregator()
+
+        # 5-min rolling aggregator for hot options detection
+        self.rolling_agg_5m = RollingAggregator(window_seconds=300)
+        self.hot_detector: Optional[HotOptionsDetector] = None  # Initialized after DB pool
 
         # Stock price monitor for real-time prices (PROD-1)
         self.stock_monitor = StockPriceMonitor(
@@ -788,6 +794,14 @@ class PaperTradingEngine:
             match = re.match(r"O:([A-Z]+)\d{6}[CP]\d{8}", trade.symbol)
             if match:
                 underlying = match.group(1)
+
+                # Also feed 5-min rolling aggregator for hot options
+                self.rolling_agg_5m.add_trade_fast(
+                    underlying=underlying,
+                    option_symbol=trade.symbol,
+                    price=trade.price,
+                    size=trade.size,
+                )
                 boundary_crossed = self.bucket_aggregator.add_trade(
                     underlying=underlying,
                     option_symbol=trade.symbol,
@@ -798,8 +812,71 @@ class PaperTradingEngine:
                     try:
                         rows = await self.bucket_aggregator.flush()
                         logger.info(f"Bucket boundary: flushed {rows} baseline rows to DB")
+                        # Compute intraday flow signals after flush
+                        if rows:
+                            await self._compute_intraday_flow_signals()
                     except Exception as e:
                         logger.warning(f"Bucket flush failed: {e}")
+
+    async def _compute_intraday_flow_signals(self) -> None:
+        """Compute flow_signals from today's call/put volumes + latest ORATS."""
+        if not self._db_pool:
+            return
+        try:
+            async with self._db_pool.acquire() as conn:
+                result = await conn.execute("""
+                    INSERT INTO flow_signals
+                        (symbol, pattern_date, direction, iv_rank, volume_zscore,
+                         put_call_ratio, flow_aligned, computed_at)
+                    SELECT symbol, pattern_date, direction, iv_rank, volume_zscore,
+                           put_call_ratio, flow_aligned, computed_at
+                    FROM (
+                        SELECT DISTINCT ON (es.symbol, es.pattern_date::DATE)
+                            es.symbol,
+                            es.pattern_date::DATE AS pattern_date,
+                            es.direction,
+                            od.iv_rank,
+                            od.volume_zscore,
+                            tv.put_vol::numeric / NULLIF(tv.call_vol, 0) AS put_call_ratio,
+                            CASE
+                                WHEN es.direction = 'bullish'
+                                     AND tv.call_vol > 0
+                                     AND (tv.put_vol::numeric / tv.call_vol) <= 0.7
+                                     AND COALESCE(od.volume_zscore, 0) >= 1.5 THEN TRUE
+                                WHEN es.direction = 'bearish'
+                                     AND tv.call_vol > 0
+                                     AND (tv.put_vol::numeric / tv.call_vol) >= 1.3
+                                     AND COALESCE(od.volume_zscore, 0) >= 1.5 THEN TRUE
+                                ELSE FALSE
+                            END AS flow_aligned,
+                            NOW() AS computed_at
+                        FROM engulfing_scores es
+                        LEFT JOIN LATERAL (
+                            SELECT iv_rank, volume_zscore FROM orats_daily
+                            WHERE symbol = es.symbol ORDER BY asof_date DESC LIMIT 1
+                        ) od ON TRUE
+                        JOIN (
+                            SELECT symbol, SUM(call_volume) AS call_vol, SUM(put_volume) AS put_vol
+                            FROM intraday_baselines_30m
+                            WHERE trade_date = CURRENT_DATE
+                            GROUP BY symbol
+                        ) tv ON tv.symbol = es.symbol
+                        WHERE es.timeframe = '1D'
+                          AND es.pattern_date::DATE >= CURRENT_DATE - INTERVAL '2 days'
+                          AND tv.call_vol > 0
+                        ORDER BY es.symbol, es.pattern_date::DATE, es.scan_ts DESC
+                    ) sub
+                    ON CONFLICT (symbol, pattern_date) DO UPDATE SET
+                        direction = EXCLUDED.direction, iv_rank = EXCLUDED.iv_rank,
+                        volume_zscore = EXCLUDED.volume_zscore, put_call_ratio = EXCLUDED.put_call_ratio,
+                        flow_aligned = EXCLUDED.flow_aligned, computed_at = EXCLUDED.computed_at
+                """)
+                parts = result.split() if result else []
+                upserted = int(parts[-1]) if parts else 0
+                if upserted > 0:
+                    logger.info(f"Intraday flow_signals: {upserted} rows upserted")
+        except Exception as e:
+            logger.error(f"Intraday flow_signals failed: {e}")
 
     def _is_entry_allowed(self) -> bool:
         """Check if we're within the time window to open new positions."""
@@ -1196,6 +1273,14 @@ class PaperTradingEngine:
                 self.bucket_aggregator = BucketAggregator(db_pool=self._db_pool)
                 logger.info("BucketAggregator initialized with asyncpg pool")
 
+                # Hot options detector (5-min cycle)
+                self.hot_detector = HotOptionsDetector(
+                    rolling_agg=self.rolling_agg_5m,
+                    db_pool=self._db_pool,
+                )
+                await self.hot_detector.refresh_baselines()
+                logger.info("HotOptionsDetector initialized")
+
                 # Initialize momentum screener (v58)
                 if self.config.USE_MOMENTUM_SCREENER:
                     self._momentum_screener = MomentumScreener(
@@ -1311,6 +1396,7 @@ class PaperTradingEngine:
         cameron_poll_interval = self.config.CAMERON_POLL_INTERVAL_SEC if self._account_c_enabled else 9999
         cameron_scan_interval = self.config.CAMERON_SCAN_INTERVAL_SEC if self._account_c_enabled else 9999
         sparkline_interval = self.config.SPARKLINE_REFRESH_INTERVAL_SEC
+        hot_options_interval = 300  # 5 minutes
 
         last_signal_check = 0
         last_stop_check = 0
@@ -1321,6 +1407,7 @@ class PaperTradingEngine:
         last_cameron_poll = 0
         last_cameron_scan = 0
         last_sparkline_refresh = 0
+        last_hot_options_check = 0
 
         try:
             async for trade in self.firehose.stream():
@@ -1455,6 +1542,20 @@ class PaperTradingEngine:
                     except Exception as e:
                         logger.warning(f"Sparkline refresh failed: {e}")
                     last_sparkline_refresh = now
+
+                # Hot options detection (every 5 min)
+                if self.hot_detector and now - last_hot_options_check >= hot_options_interval:
+                    try:
+                        # Refresh baselines every 30 min
+                        if now - (self.hot_detector._last_baseline_refresh or 0) > 1800:
+                            await self.hot_detector.refresh_baselines()
+                        hot = self.hot_detector.detect()
+                        if hot:
+                            await self.hot_detector.flush_to_db(hot)
+                            logger.info(f"Hot options: {len(hot)} symbols detected")
+                    except Exception as e:
+                        logger.warning(f"Hot options detection failed: {e}")
+                    last_hot_options_check = now
 
                 # Run bar retention if flagged by daily reset
                 if self._bar_retention_pending and self.bar_collector:
