@@ -2,7 +2,10 @@
 Hot Options Detector
 
 Detects symbols with unusual options activity every 5 minutes by comparing
-current volume against orats_daily baselines with time-of-day multipliers.
+current volume against historical intraday baselines from intraday_baselines_30m.
+
+Primary baseline: per-symbol, per-30-min-bucket average from recent trading days.
+Fallback: orats_daily.avg_daily_volume / 78 (uniform distribution assumption).
 
 For each flagged symbol, finds the top contract by volume and computes
 concentration metrics (unique_contracts, avg_vol_per_contract).
@@ -25,26 +28,14 @@ logger = logging.getLogger(__name__)
 # 78 five-minute periods in a 6.5-hour trading day (9:30-16:00)
 PERIODS_PER_DAY = 78
 
-# Time-of-day volume multipliers
-TOD_MULTIPLIERS = {
-    "open": 2.0,    # 9:30-10:00
-    "close": 2.0,   # 15:30-16:00
-    "midday": 0.6,  # 11:00-14:00
-    "normal": 1.0,  # everything else
-}
+# How many recent trading days to average for intraday baselines
+BASELINE_LOOKBACK_DAYS = 10
 
 
-def _get_tod_multiplier(hour: int, minute: int) -> float:
-    """Time-of-day volume multiplier based on ET hour/minute."""
-    if hour == 9 and minute >= 30:
-        return TOD_MULTIPLIERS["open"]
-    if hour == 10 and minute < 0:  # first 30 min already covered above
-        return TOD_MULTIPLIERS["open"]
-    if hour == 15 and minute >= 30:
-        return TOD_MULTIPLIERS["close"]
-    if 11 <= hour <= 13:
-        return TOD_MULTIPLIERS["midday"]
-    return TOD_MULTIPLIERS["normal"]
+def _bucket_start(hour: int, minute: int) -> str:
+    """Map hour:minute to 30-min bucket start string (e.g. '09:30:00')."""
+    bucket_minute = (minute // 30) * 30
+    return f"{hour:02d}:{bucket_minute:02d}:00"
 
 
 class HotOptionsDetector:
@@ -72,7 +63,10 @@ class HotOptionsDetector:
         self.min_contracts = min_contracts
         self.cooldown_seconds = cooldown_seconds
 
-        self._baselines: dict[str, int] = {}  # symbol -> avg_daily_volume
+        # {symbol: {bucket_start_str: avg_contracts_per_30min}}
+        self._baselines: dict[str, dict[str, float]] = {}
+        # Fallback: {symbol: avg_daily_volume} from orats_daily
+        self._fallback_baselines: dict[str, int] = {}
         self._last_baseline_refresh: float = 0
         self._recent_detections: dict[str, float] = {}  # symbol -> last detection time
 
@@ -80,33 +74,74 @@ class HotOptionsDetector:
         self._detect_count = 0
         self._symbols_checked = 0
         self._hot_found = 0
+        self._intraday_hits = 0
+        self._fallback_hits = 0
 
     async def refresh_baselines(self):
-        """Load avg_daily_volume from orats_daily (call every 30 min)."""
+        """Load baselines from intraday_baselines_30m + orats_daily fallback."""
         if not self.db_pool:
             return
 
         try:
             async with self.db_pool.acquire() as conn:
-                rows = await conn.fetch(
+                # Primary: per-symbol, per-bucket average from recent days
+                rows = await conn.fetch("""
+                    SELECT symbol, bucket_start::text as bucket,
+                           AVG(call_volume + put_volume) as avg_contracts
+                    FROM intraday_baselines_30m
+                    WHERE trade_date >= CURRENT_DATE - $1 * INTERVAL '1 day'
+                      AND trade_date < CURRENT_DATE
+                      AND (call_volume + put_volume) > 0
+                    GROUP BY symbol, bucket_start
+                """, BASELINE_LOOKBACK_DAYS)
+
+                baselines: dict[str, dict[str, float]] = {}
+                for r in rows:
+                    sym = r["symbol"]
+                    if sym not in baselines:
+                        baselines[sym] = {}
+                    baselines[sym][r["bucket"]] = float(r["avg_contracts"])
+                self._baselines = baselines
+
+                # Fallback: orats_daily for symbols without intraday history
+                fallback_rows = await conn.fetch(
                     "SELECT symbol, avg_daily_volume FROM orats_daily "
                     "WHERE avg_daily_volume IS NOT NULL AND avg_daily_volume > 0"
                 )
-                self._baselines = {r["symbol"]: int(r["avg_daily_volume"]) for r in rows}
+                self._fallback_baselines = {
+                    r["symbol"]: int(r["avg_daily_volume"]) for r in fallback_rows
+                }
+
                 self._last_baseline_refresh = time.time()
-                logger.info(f"Loaded {len(self._baselines)} orats baselines for hot detection")
+                logger.info(
+                    f"Loaded intraday baselines for {len(self._baselines)} symbols "
+                    f"({sum(len(v) for v in self._baselines.values())} buckets), "
+                    f"{len(self._fallback_baselines)} orats fallbacks"
+                )
         except Exception as e:
             logger.error(f"Failed to refresh baselines: {e}")
 
     def _get_expected_volume(self, symbol: str, hour: int, minute: int) -> Optional[float]:
-        """Get expected 5-min volume for a symbol at this time of day."""
-        adv = self._baselines.get(symbol)
-        if not adv or adv <= 0:
-            return None
+        """Get expected 5-min volume for a symbol at this time of day.
 
-        per_period = adv / PERIODS_PER_DAY
-        multiplier = _get_tod_multiplier(hour, minute)
-        return per_period * multiplier
+        Primary: intraday_baselines_30m avg for this bucket / 6 (30min -> 5min).
+        Fallback: orats_daily avg_daily_volume / 78.
+        """
+        bucket = _bucket_start(hour, minute)
+        sym_baselines = self._baselines.get(symbol)
+        if sym_baselines and bucket in sym_baselines:
+            # Historical average for this symbol in this 30-min bucket
+            # Divide by 6 to get expected 5-min volume
+            self._intraday_hits += 1
+            return sym_baselines[bucket] / 6.0
+
+        # Fallback to orats_daily uniform distribution
+        adv = self._fallback_baselines.get(symbol)
+        if adv and adv > 0:
+            self._fallback_hits += 1
+            return adv / PERIODS_PER_DAY
+
+        return None
 
     def _in_cooldown(self, symbol: str) -> bool:
         """Check if symbol was recently detected."""
@@ -181,8 +216,8 @@ class HotOptionsDetector:
         """
         self._detect_count += 1
 
-        # Need baselines
-        if not self._baselines:
+        # Need at least one baseline source
+        if not self._baselines and not self._fallback_baselines:
             logger.debug("No baselines loaded, skipping hot detection")
             return []
 
@@ -271,6 +306,9 @@ class HotOptionsDetector:
             "detect_runs": self._detect_count,
             "symbols_checked": self._symbols_checked,
             "hot_found": self._hot_found,
-            "baselines_loaded": len(self._baselines),
+            "intraday_baselines": len(self._baselines),
+            "fallback_baselines": len(self._fallback_baselines),
+            "intraday_hits": self._intraday_hits,
+            "fallback_hits": self._fallback_hits,
             "cooldown_active": len(self._recent_detections),
         }
