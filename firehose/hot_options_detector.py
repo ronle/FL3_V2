@@ -103,10 +103,11 @@ class HotOptionsDetector:
                     baselines[sym][r["bucket"]] = float(r["avg_contracts"])
                 self._baselines = baselines
 
-                # Fallback: orats_daily for symbols without intraday history
+                # Fallback: orats_daily (latest date only) for symbols without intraday history
                 fallback_rows = await conn.fetch(
                     "SELECT symbol, avg_daily_volume FROM orats_daily "
-                    "WHERE avg_daily_volume IS NOT NULL AND avg_daily_volume > 0"
+                    "WHERE asof_date = (SELECT MAX(asof_date) FROM orats_daily) "
+                    "AND avg_daily_volume IS NOT NULL AND avg_daily_volume > 0"
                 )
                 self._fallback_baselines = {
                     r["symbol"]: int(r["avg_daily_volume"]) for r in fallback_rows
