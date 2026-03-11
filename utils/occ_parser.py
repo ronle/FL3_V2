@@ -154,6 +154,20 @@ def extract_underlying(symbol: str) -> Optional[str]:
     return s[:i].upper() if i > 0 else None
 
 
+def extract_right(symbol: str) -> Optional[str]:
+    """Extract option right ('C' or 'P') from OCC symbol (fastest path)."""
+    if not symbol:
+        return None
+    s = symbol[2:] if symbol.startswith("O:") else symbol
+    i = 0
+    while i < len(s) and s[i].isalpha():
+        i += 1
+    if i == 0 or i + 6 >= len(s):
+        return None
+    right = s[i + 6]
+    return right if right in ('C', 'P') else None
+
+
 # Validation helpers
 def is_valid_occ_symbol(symbol: str) -> bool:
     """Check if symbol is valid OCC format."""

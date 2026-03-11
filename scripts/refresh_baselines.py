@@ -9,6 +9,8 @@ Tasks:
 1. Recalculate 20-day rolling baseline averages
 2. Clean up bucket data older than 30 days
 3. Update baseline cache for next trading day
+4. Refresh adv_14d (14-day average daily volume)
+5. Refresh flow_signals (engulfing pattern + options flow alignment)
 
 Usage:
     python -m scripts.refresh_baselines
@@ -83,6 +85,12 @@ class BaselineRefreshJob:
 
             # Step 4: Generate health report
             report = await self._generate_health_report()
+
+            # Step 5: Refresh ADV 14-day table (for engulfing dashboard)
+            await self._refresh_adv_14d()
+
+            # Step 6: Refresh flow_signals (engulfing + options flow alignment)
+            await self._refresh_flow_signals()
 
         except Exception as e:
             logger.error(f"Refresh job failed: {e}")
@@ -219,12 +227,135 @@ class BaselineRefreshJob:
 
         return report
 
+    async def _refresh_adv_14d(self):
+        """Compute 14-day average daily volume from spot_prices_1m and upsert into adv_14d."""
+        logger.info("Refreshing adv_14d (14-day average daily volume)...")
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                result = await conn.execute("""
+                    INSERT INTO adv_14d (symbol, avg_volume, trading_days, computed_at)
+                    SELECT
+                        symbol,
+                        ROUND(AVG(daily_vol))::bigint AS avg_volume,
+                        COUNT(*)::integer AS trading_days,
+                        NOW() AS computed_at
+                    FROM (
+                        SELECT symbol, bar_ts::date AS trade_date, SUM(volume) AS daily_vol
+                        FROM spot_prices_1m
+                        WHERE bar_ts >= CURRENT_DATE - INTERVAL '14 days'
+                          AND bar_ts < CURRENT_DATE
+                        GROUP BY symbol, bar_ts::date
+                    ) daily
+                    GROUP BY symbol
+                    HAVING COUNT(*) >= 5
+                    ON CONFLICT (symbol) DO UPDATE SET
+                        avg_volume   = EXCLUDED.avg_volume,
+                        trading_days = EXCLUDED.trading_days,
+                        computed_at  = EXCLUDED.computed_at
+                """)
+
+                # Parse "INSERT X Y" result
+                parts = result.split() if result else []
+                upserted = int(parts[-1]) if parts else 0
+                logger.info(f"adv_14d refreshed: {upserted} symbols upserted")
+
+        except Exception as e:
+            logger.error(f"adv_14d refresh failed: {e}")
+            self.stats['errors'] += 1
+
+    async def _refresh_flow_signals(self):
+        """Join engulfing_scores (daily) with orats_daily options flow and upsert to flow_signals.
+
+        Alignment rules:
+        - Bullish: put_call_ratio <= 0.7 AND volume_zscore >= 1.5
+        - Bearish: put_call_ratio >= 1.3 AND volume_zscore >= 1.5
+        Also cleans up rows older than 30 days.
+        """
+        logger.info("Refreshing flow_signals (engulfing + options flow alignment)...")
+
+        try:
+            async with self.db_pool.acquire() as conn:
+                # Upsert flow signals for recent daily patterns
+                # Subquery deduplicates when a symbol has both bullish+bearish
+                # on the same date. Picks the latest scan_ts per (symbol, date).
+                result = await conn.execute("""
+                    INSERT INTO flow_signals
+                        (symbol, pattern_date, direction, iv_rank, volume_zscore,
+                         put_call_ratio, flow_aligned, computed_at)
+                    SELECT symbol, pattern_date, direction, iv_rank, volume_zscore,
+                           put_call_ratio, flow_aligned, computed_at
+                    FROM (
+                        SELECT DISTINCT ON (es.symbol, es.pattern_date::DATE)
+                            es.symbol,
+                            es.pattern_date::DATE AS pattern_date,
+                            es.direction,
+                            od.iv_rank,
+                            od.volume_zscore,
+                            od.put_call_ratio,
+                            CASE
+                                WHEN es.direction = 'bullish'
+                                     AND od.put_call_ratio <= 0.7
+                                     AND od.volume_zscore >= 1.5 THEN TRUE
+                                WHEN es.direction = 'bearish'
+                                     AND od.put_call_ratio >= 1.3
+                                     AND od.volume_zscore >= 1.5 THEN TRUE
+                                ELSE FALSE
+                            END AS flow_aligned,
+                            NOW() AS computed_at
+                        FROM engulfing_scores es
+                        JOIN orats_daily od
+                            ON od.symbol = es.symbol
+                            AND od.asof_date = es.pattern_date::DATE
+                        WHERE es.timeframe = '1D'
+                          AND es.pattern_date::DATE >= CURRENT_DATE - INTERVAL '5 days'
+                          AND od.put_call_ratio > 0
+                        ORDER BY es.symbol, es.pattern_date::DATE, es.scan_ts DESC
+                    ) sub
+                    ON CONFLICT (symbol, pattern_date) DO UPDATE SET
+                        direction      = EXCLUDED.direction,
+                        iv_rank        = EXCLUDED.iv_rank,
+                        volume_zscore  = EXCLUDED.volume_zscore,
+                        put_call_ratio = EXCLUDED.put_call_ratio,
+                        flow_aligned   = EXCLUDED.flow_aligned,
+                        computed_at    = EXCLUDED.computed_at
+                """)
+
+                parts = result.split() if result else []
+                upserted = int(parts[-1]) if parts else 0
+                logger.info(f"flow_signals refreshed: {upserted} rows upserted")
+
+                # Count aligned signals for reporting
+                row = await conn.fetchrow("""
+                    SELECT COUNT(*) as aligned
+                    FROM flow_signals
+                    WHERE flow_aligned = TRUE
+                      AND pattern_date >= CURRENT_DATE - INTERVAL '1 day'
+                """)
+                if row:
+                    logger.info(f"flow_signals aligned today: {row['aligned']}")
+
+                # Cleanup old rows (> 30 days)
+                cleanup = await conn.execute("""
+                    DELETE FROM flow_signals WHERE pattern_date < CURRENT_DATE - INTERVAL '30 days'
+                """)
+                deleted = int(cleanup.split()[-1]) if cleanup else 0
+                if deleted:
+                    logger.info(f"flow_signals cleanup: {deleted} old rows deleted")
+                    self.stats['rows_deleted'] += deleted
+
+        except Exception as e:
+            logger.error(f"flow_signals refresh failed: {e}")
+            self.stats['errors'] += 1
+
     async def _dry_run(self) -> dict:
         """Simulate job without database."""
         logger.info("DRY RUN - No database connection")
         logger.info("Would clean up buckets > 30 days old")
         logger.info("Would clean up TA snapshots > 7 days old")
         logger.info("Would analyze baseline statistics")
+        logger.info("Would refresh adv_14d")
+        logger.info("Would refresh flow_signals")
 
         return {
             'mode': 'dry_run',

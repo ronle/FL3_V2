@@ -21,6 +21,7 @@ import logging
 import os
 import signal
 import sys
+import time
 from datetime import datetime, time as dt_time
 from typing import Optional
 from aiohttp import web
@@ -33,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from firehose.client import FirehoseClient, Trade
 from firehose.aggregator import RollingAggregator
 from firehose.bucket_aggregator import BucketAggregator
+from firehose.hot_options_detector import HotOptionsDetector
 from uoa.detector_v2 import UOADetector, UOATrigger
 from uoa.trigger_handler import TriggerHandler
 from utils.occ_parser import extract_underlying
@@ -142,11 +144,17 @@ class FirehoseOrchestrator:
         # Components
         self.client = FirehoseClient(api_key)
         self.rolling_agg = RollingAggregator(window_seconds=60)
+        self.rolling_agg_5m = RollingAggregator(window_seconds=300)
         self.bucket_agg = BucketAggregator(db_pool=db_pool)
         self.detector = UOADetector(
             on_trigger=self._on_uoa_trigger,
             volume_threshold=3.0,
             cooldown_seconds=300,
+        )
+        self.hot_detector = HotOptionsDetector(
+            rolling_agg=self.rolling_agg_5m,
+            db_pool=db_pool,
+            polygon_api_key=api_key,
         )
         self.trigger_handler = TriggerHandler(db_pool=db_pool)
         self.health_server = HealthServer(self)
@@ -193,10 +201,14 @@ class FirehoseOrchestrator:
                 pass
 
         try:
+            # Load baselines for hot options detector
+            await self.hot_detector.refresh_baselines()
+
             # Start background tasks
             health_task = asyncio.create_task(self._health_check_loop())
             bucket_task = asyncio.create_task(self._bucket_flush_loop())
             trigger_task = asyncio.create_task(self._trigger_process_loop())
+            hot_task = asyncio.create_task(self._hot_options_loop())
 
             # Main trade processing loop
             async for trade in self.client.stream():
@@ -209,6 +221,7 @@ class FirehoseOrchestrator:
             health_task.cancel()
             bucket_task.cancel()
             trigger_task.cancel()
+            hot_task.cancel()
 
         except Exception as e:
             logger.error(f"Pipeline error: {e}")
@@ -228,6 +241,14 @@ class FirehoseOrchestrator:
 
         # Add to rolling aggregator
         self.rolling_agg.add_trade_fast(
+            underlying=underlying,
+            option_symbol=trade.symbol,
+            price=trade.price,
+            size=trade.size,
+        )
+
+        # Add to 5-min rolling aggregator for hot options
+        self.rolling_agg_5m.add_trade_fast(
             underlying=underlying,
             option_symbol=trade.symbol,
             price=trade.price,
@@ -284,6 +305,89 @@ class FirehoseOrchestrator:
                     rows = await self.bucket_agg.flush()
                     if rows:
                         logger.info(f"Flushed {rows} bucket rows")
+                        # Compute intraday flow signals after flush
+                        await self._compute_intraday_flow_signals()
+
+    async def _hot_options_loop(self) -> None:
+        """Background loop for hot options detection (every 5 min)."""
+        while self._running:
+            await asyncio.sleep(300)  # 5 minutes
+            if not self._running:
+                break
+            status, _ = get_market_status()
+            if status != "OPEN" and not self.test_mode:
+                continue
+            try:
+                # Refresh baselines every 30 min
+                if time.time() - (self.hot_detector._last_baseline_refresh or 0) > 1800:
+                    await self.hot_detector.refresh_baselines()
+                hot = await self.hot_detector.detect()
+                if hot:
+                    await self.hot_detector.flush_to_db(hot)
+                    logger.info(f"Hot options: {len(hot)} symbols detected")
+            except Exception as e:
+                logger.error(f"Hot options detection failed: {e}")
+
+    async def _compute_intraday_flow_signals(self) -> None:
+        """Compute flow_signals from today's call/put volumes + latest ORATS."""
+        if not self.db_pool:
+            return
+        try:
+            async with self.db_pool.acquire() as conn:
+                result = await conn.execute("""
+                    INSERT INTO flow_signals
+                        (symbol, pattern_date, direction, iv_rank, volume_zscore,
+                         put_call_ratio, flow_aligned, computed_at)
+                    SELECT symbol, pattern_date, direction, iv_rank, volume_zscore,
+                           put_call_ratio, flow_aligned, computed_at
+                    FROM (
+                        SELECT DISTINCT ON (es.symbol, es.pattern_date::DATE)
+                            es.symbol,
+                            es.pattern_date::DATE AS pattern_date,
+                            es.direction,
+                            od.iv_rank,
+                            od.volume_zscore,
+                            tv.put_vol::numeric / NULLIF(tv.call_vol, 0) AS put_call_ratio,
+                            CASE
+                                WHEN es.direction = 'bullish'
+                                     AND tv.call_vol > 0
+                                     AND (tv.put_vol::numeric / tv.call_vol) <= 0.7
+                                     AND COALESCE(od.volume_zscore, 0) >= 1.5 THEN TRUE
+                                WHEN es.direction = 'bearish'
+                                     AND tv.call_vol > 0
+                                     AND (tv.put_vol::numeric / tv.call_vol) >= 1.3
+                                     AND COALESCE(od.volume_zscore, 0) >= 1.5 THEN TRUE
+                                ELSE FALSE
+                            END AS flow_aligned,
+                            NOW() AS computed_at
+                        FROM engulfing_scores es
+                        LEFT JOIN LATERAL (
+                            SELECT iv_rank, volume_zscore FROM orats_daily
+                            WHERE symbol = es.symbol ORDER BY asof_date DESC LIMIT 1
+                        ) od ON TRUE
+                        JOIN (
+                            SELECT symbol, SUM(call_volume) AS call_vol, SUM(put_volume) AS put_vol
+                            FROM intraday_baselines_30m
+                            WHERE trade_date = CURRENT_DATE
+                            GROUP BY symbol
+                        ) tv ON tv.symbol = es.symbol
+                        WHERE es.timeframe = '1D'
+                          AND es.pattern_date::DATE >= CURRENT_DATE - INTERVAL '2 days'
+                          AND tv.call_vol > 0
+                        ORDER BY es.symbol, es.pattern_date::DATE, es.scan_ts DESC
+                    ) sub
+                    ON CONFLICT (symbol, pattern_date) DO UPDATE SET
+                        direction = EXCLUDED.direction, iv_rank = EXCLUDED.iv_rank,
+                        volume_zscore = EXCLUDED.volume_zscore, put_call_ratio = EXCLUDED.put_call_ratio,
+                        flow_aligned = EXCLUDED.flow_aligned, computed_at = EXCLUDED.computed_at
+                """)
+                # asyncpg returns "INSERT 0 N" string
+                parts = result.split() if result else []
+                upserted = int(parts[-1]) if parts else 0
+                if upserted > 0:
+                    logger.info(f"Intraday flow_signals: {upserted} rows upserted")
+        except Exception as e:
+            logger.error(f"Intraday flow_signals failed: {e}")
 
     async def _health_check_loop(self) -> None:
         """Background loop for health checks."""

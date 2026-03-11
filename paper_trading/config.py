@@ -79,6 +79,14 @@ class TradingConfig:
     ACCOUNT_B_LOOKBACK_MIN: int = 10               # Only patterns from last N minutes
     ACCOUNT_B_LAST_ENTRY_TIME: dt_time = dt_time(11, 0)  # No new orders after 11 AM ET (3yr backtest: morning=+$17K, afternoon=-$209)
 
+    # Account B — TA Tier Filters (v78)
+    # Analysis of 99 trades: momentum RSI 75.8% WR vs 40.9%, trend aligned 67.4% vs 42.4%
+    ACCOUNT_B_FILTER_WEAK: bool = True              # Reject pattern_strength='weak' (-$54/trade avg)
+    ACCOUNT_B_REQUIRE_MOMENTUM_RSI: bool = True      # Bull: RSI>=55, Bear: RSI<=45 (75.8% WR)
+    ACCOUNT_B_RSI_BULL_MIN: float = 55.0             # Min RSI for bullish entries
+    ACCOUNT_B_RSI_BEAR_MAX: float = 45.0             # Max RSI for bearish entries
+    ACCOUNT_B_REQUIRE_TREND_ALIGNMENT: bool = True    # Bull: SMA20>SMA50, Bear: SMA20<SMA50 (67.4% WR)
+
     # Account C — Cameron B2 Pattern Trader
     USE_ACCOUNT_C: bool = True
     CAMERON_RVOL_MIN: float = 10.0                    # Min relative volume for candidates
@@ -130,6 +138,10 @@ class TradingConfig:
     # Alpaca
     ALPACA_PAPER_URL: str = "https://paper-api.alpaca.markets"
     ALPACA_DATA_URL: str = "https://data.alpaca.markets/v2"
+
+    # Sparkline precomputation (for engulfing dashboard)
+    SPARKLINE_REFRESH_INTERVAL_SEC: int = 300  # Refresh sparkline_1d every 5 min
+    SPARKLINE_POINTS: int = 78                 # Downsample to ~78 points (≈ 5-min intervals over 6.5h)
 
     # Intraday bar collection
     COLLECT_INTRADAY_BARS: bool = True

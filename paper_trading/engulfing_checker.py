@@ -50,11 +50,13 @@ class PatternPoller:
         max_candle_range: float = 0.57,
         min_risk_per_share: float = 1.00,
         lookback_min: int = 10,
+        filter_weak: bool = True,
     ):
         self.database_url = database_url.strip() if database_url else database_url
         self.max_candle_range = max_candle_range
         self.min_risk_per_share = min_risk_per_share
         self.lookback_min = lookback_min
+        self.filter_weak = filter_weak
         self._seen_patterns: Set[Tuple[str, str]] = set()  # (symbol, pattern_date_str)
 
     def reset_daily(self):
@@ -103,6 +105,7 @@ class PatternPoller:
         skipped_seen = 0
         skipped_range = 0
         skipped_risk = 0
+        skipped_weak = 0
 
         for row in rows:
             symbol, direction, entry_price, stop_loss, target_1, \
@@ -141,6 +144,12 @@ class PatternPoller:
                 )
                 continue
 
+            # Filter: pattern strength (v78 — weak patterns avg -$54/trade)
+            if self.filter_weak and (pattern_strength or "").lower() == "weak":
+                skipped_weak += 1
+                logger.debug(f"PatternPoller SKIP {symbol}: weak pattern")
+                continue
+
             setups.append(TradeSetup(
                 symbol=symbol,
                 direction=direction,
@@ -157,7 +166,7 @@ class PatternPoller:
         if rows:
             logger.info(
                 f"PatternPoller: {len(rows)} raw, {len(setups)} qualified, "
-                f"skipped: {skipped_seen} seen, {skipped_range} range, {skipped_risk} risk"
+                f"skipped: {skipped_seen} seen, {skipped_range} range, {skipped_risk} risk, {skipped_weak} weak"
             )
 
         return setups

@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, date, time as dt_time, timedelta
 from typing import Optional
 
+from utils.occ_parser import extract_right
+
 logger = logging.getLogger(__name__)
 
 BUCKET_MINUTES = 30
@@ -30,6 +32,8 @@ class BucketStats:
     notional: float = 0.0
     contracts: int = 0
     unique_options: set = field(default_factory=set)
+    call_volume: int = 0
+    put_volume: int = 0
 
     @property
     def contracts_unique(self) -> int:
@@ -143,6 +147,13 @@ class BucketAggregator:
         stats.contracts += size
         stats.unique_options.add(option_symbol)
 
+        # Classify call/put volume
+        right = extract_right(option_symbol)
+        if right == 'C':
+            stats.call_volume += size
+        elif right == 'P':
+            stats.put_volume += size
+
         # Update current bucket tracking
         if boundary_crossed:
             self._current_bucket_start = bucket_start
@@ -171,19 +182,23 @@ class BucketAggregator:
             async with self.db_pool.acquire() as conn:
                 # Batch insert
                 rows = [
-                    (b.symbol, b.trade_date, b.bucket_start, b.prints, b.notional, b.contracts_unique)
+                    (b.symbol, b.trade_date, b.bucket_start, b.prints, b.notional, b.contracts_unique,
+                     b.call_volume, b.put_volume)
                     for b in buckets_to_insert
                 ]
 
                 await conn.executemany("""
                     INSERT INTO intraday_baselines_30m
-                    (symbol, trade_date, bucket_start, prints, notional, contracts_unique)
-                    VALUES ($1, $2, $3, $4, $5, $6)
+                    (symbol, trade_date, bucket_start, prints, notional, contracts_unique,
+                     call_volume, put_volume)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                     ON CONFLICT (symbol, trade_date, bucket_start)
                     DO UPDATE SET
                         prints = intraday_baselines_30m.prints + EXCLUDED.prints,
                         notional = intraday_baselines_30m.notional + EXCLUDED.notional,
-                        contracts_unique = GREATEST(intraday_baselines_30m.contracts_unique, EXCLUDED.contracts_unique)
+                        contracts_unique = GREATEST(intraday_baselines_30m.contracts_unique, EXCLUDED.contracts_unique),
+                        call_volume = intraday_baselines_30m.call_volume + EXCLUDED.call_volume,
+                        put_volume = intraday_baselines_30m.put_volume + EXCLUDED.put_volume
                 """, rows)
 
             self._total_flushes += 1
