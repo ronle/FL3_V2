@@ -139,6 +139,7 @@ class PaperTradingEngine:
                     max_candle_range=config.ACCOUNT_B_MAX_CANDLE_RANGE,
                     min_risk_per_share=config.ACCOUNT_B_MIN_RISK_PER_SHARE,
                     lookback_min=config.ACCOUNT_B_LOOKBACK_MIN,
+                    filter_weak=config.ACCOUNT_B_FILTER_WEAK,
                 )
                 self.eod_closer_b = EODCloser(
                     self.position_manager_b, config,
@@ -382,6 +383,49 @@ class PaperTradingEngine:
         setups = self.pattern_poller.poll_qualifying_patterns()
         if not setups:
             return
+
+        # TA tier filters (v78): momentum RSI + trend alignment
+        if self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI or self.config.ACCOUNT_B_REQUIRE_TREND_ALIGNMENT:
+            filtered_setups = []
+            skipped_rsi = 0
+            skipped_trend = 0
+            for setup in setups:
+                ta = self.signal_generator._get_ta_for_symbol(setup.symbol)
+
+                # Momentum RSI filter
+                if self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI and ta.get("rsi_14") is not None:
+                    rsi = float(ta["rsi_14"])
+                    if setup.direction == "bullish" and rsi < self.config.ACCOUNT_B_RSI_BULL_MIN:
+                        skipped_rsi += 1
+                        logger.debug(f"Account B SKIP {setup.symbol}: RSI {rsi:.1f} < {self.config.ACCOUNT_B_RSI_BULL_MIN} (bullish needs momentum)")
+                        continue
+                    if setup.direction == "bearish" and rsi > self.config.ACCOUNT_B_RSI_BEAR_MAX:
+                        skipped_rsi += 1
+                        logger.debug(f"Account B SKIP {setup.symbol}: RSI {rsi:.1f} > {self.config.ACCOUNT_B_RSI_BEAR_MAX} (bearish needs weakness)")
+                        continue
+
+                # Trend alignment filter
+                if self.config.ACCOUNT_B_REQUIRE_TREND_ALIGNMENT:
+                    sma_20 = ta.get("sma_20")
+                    sma_50 = ta.get("sma_50")
+                    if sma_20 is not None and sma_50 is not None:
+                        sma_20 = float(sma_20)
+                        sma_50 = float(sma_50)
+                        if setup.direction == "bullish" and sma_20 <= sma_50:
+                            skipped_trend += 1
+                            logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} <= SMA50 {sma_50:.2f} (bullish needs uptrend)")
+                            continue
+                        if setup.direction == "bearish" and sma_20 >= sma_50:
+                            skipped_trend += 1
+                            logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} >= SMA50 {sma_50:.2f} (bearish needs downtrend)")
+                            continue
+
+                filtered_setups.append(setup)
+
+            if skipped_rsi or skipped_trend:
+                logger.info(f"Account B TA filters: {len(setups)} → {len(filtered_setups)} "
+                            f"(skipped: {skipped_rsi} RSI, {skipped_trend} trend)")
+            setups = filtered_setups
 
         for setup in setups:
             if not self.position_manager_b.can_open_position:
@@ -1083,7 +1127,7 @@ class PaperTradingEngine:
                 rows = await conn.fetch("""
                     SELECT symbol, array_agg(close ORDER BY bar_ts) AS closes
                     FROM spot_prices_1m
-                    WHERE bar_ts >= CURRENT_DATE + INTERVAL '14 hours'
+                    WHERE bar_ts >= CURRENT_DATE + INTERVAL '13 hours 30 minutes'
                     GROUP BY symbol
                 """)
 
@@ -1277,6 +1321,7 @@ class PaperTradingEngine:
                 self.hot_detector = HotOptionsDetector(
                     rolling_agg=self.rolling_agg_5m,
                     db_pool=self._db_pool,
+                    polygon_api_key=self.polygon_api_key,
                 )
                 await self.hot_detector.refresh_baselines()
                 logger.info("HotOptionsDetector initialized")
@@ -1549,7 +1594,7 @@ class PaperTradingEngine:
                         # Refresh baselines every 30 min
                         if now - (self.hot_detector._last_baseline_refresh or 0) > 1800:
                             await self.hot_detector.refresh_baselines()
-                        hot = self.hot_detector.detect()
+                        hot = await self.hot_detector.detect()
                         if hot:
                             await self.hot_detector.flush_to_db(hot)
                             logger.info(f"Hot options: {len(hot)} symbols detected")

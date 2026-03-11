@@ -154,6 +154,7 @@ class FirehoseOrchestrator:
         self.hot_detector = HotOptionsDetector(
             rolling_agg=self.rolling_agg_5m,
             db_pool=db_pool,
+            polygon_api_key=api_key,
         )
         self.trigger_handler = TriggerHandler(db_pool=db_pool)
         self.health_server = HealthServer(self)
@@ -320,7 +321,7 @@ class FirehoseOrchestrator:
                 # Refresh baselines every 30 min
                 if time.time() - (self.hot_detector._last_baseline_refresh or 0) > 1800:
                     await self.hot_detector.refresh_baselines()
-                hot = self.hot_detector.detect()
+                hot = await self.hot_detector.detect()
                 if hot:
                     await self.hot_detector.flush_to_db(hot)
                     logger.info(f"Hot options: {len(hot)} symbols detected")

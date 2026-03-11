@@ -19,9 +19,10 @@ from collections import defaultdict
 from datetime import datetime, date, timezone
 from typing import Optional
 
+import aiohttp
 import pytz
 
-from utils.occ_parser import extract_right
+from utils.occ_parser import extract_right, parse_occ_symbol
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +46,7 @@ class HotOptionsDetector:
         self,
         rolling_agg,
         db_pool,
+        polygon_api_key: str = None,
         min_volume_ratio: float = 3.0,
         min_contracts: int = 100,
         cooldown_seconds: int = 300,
@@ -53,12 +55,15 @@ class HotOptionsDetector:
         Args:
             rolling_agg: RollingAggregator instance (5-min window)
             db_pool: asyncpg connection pool
+            polygon_api_key: Polygon API key for NBBO snapshot lookups
             min_volume_ratio: Minimum volume/baseline ratio to flag
             min_contracts: Minimum contracts in window to flag
             cooldown_seconds: Min time between detections for same symbol
         """
         self.rolling_agg = rolling_agg
         self.db_pool = db_pool
+        self._polygon_api_key = polygon_api_key
+        self._http_session: Optional[aiohttp.ClientSession] = None
         self.min_volume_ratio = min_volume_ratio
         self.min_contracts = min_contracts
         self.cooldown_seconds = cooldown_seconds
@@ -76,6 +81,8 @@ class HotOptionsDetector:
         self._hot_found = 0
         self._intraday_hits = 0
         self._fallback_hits = 0
+        self._nbbo_fetches = 0
+        self._nbbo_failures = 0
 
     async def refresh_baselines(self):
         """Load baselines from intraday_baselines_30m + orats_daily fallback."""
@@ -210,7 +217,71 @@ class HotOptionsDetector:
             "total_notional": total_notional,
         }
 
-    def detect(self) -> list[dict]:
+    async def _fetch_contract_nbbo(self, occ_symbol: str, underlying: str) -> tuple:
+        """Fetch NBBO snapshot for an option contract via Polygon REST.
+
+        Returns (bid, ask, open_interest) or (None, None, None) on failure.
+        """
+        if not self._polygon_api_key:
+            return None, None, None
+
+        parsed = parse_occ_symbol(occ_symbol)
+        if not parsed:
+            return None, None, None
+
+        # Lazy-init HTTP session
+        if self._http_session is None or self._http_session.closed:
+            self._http_session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=5)
+            )
+
+        contract_type = parsed.right  # 'call' or 'put'
+        expiry_str = parsed.expiry.strftime("%Y-%m-%d")
+        strike = parsed.strike
+
+        url = (
+            f"https://api.polygon.io/v3/snapshot/options/{underlying}"
+            f"?strike_price={strike}"
+            f"&expiration_date={expiry_str}"
+            f"&contract_type={contract_type}"
+            f"&apiKey={self._polygon_api_key}"
+        )
+
+        self._nbbo_fetches += 1
+        try:
+            async with self._http_session.get(url) as resp:
+                if resp.status != 200:
+                    self._nbbo_failures += 1
+                    return None, None, None
+                data = await resp.json()
+                results = data.get("results", [])
+                if not results:
+                    self._nbbo_failures += 1
+                    return None, None, None
+                # Find matching contract
+                for r in results:
+                    detail = r.get("details", {})
+                    if (detail.get("strike_price") == strike
+                            and detail.get("expiration_date") == expiry_str
+                            and detail.get("contract_type") == contract_type):
+                        quote = r.get("last_quote", {})
+                        bid = quote.get("bid", 0.0)
+                        ask = quote.get("ask", 0.0)
+                        oi = r.get("open_interest", None)
+                        return bid, ask, oi
+                # If only one result, use it
+                if len(results) == 1:
+                    r = results[0]
+                    quote = r.get("last_quote", {})
+                    return quote.get("bid", 0.0), quote.get("ask", 0.0), r.get("open_interest")
+                self._nbbo_failures += 1
+                return None, None, None
+        except Exception as e:
+            self._nbbo_failures += 1
+            logger.debug("NBBO fetch failed for %s: %s", occ_symbol, e)
+            return None, None, None
+
+    async def detect(self) -> list[dict]:
         """
         Run detection across all active symbols.
         Returns list of hot symbol dicts ready for DB insert.
@@ -250,6 +321,13 @@ class HotOptionsDetector:
             details = self._get_top_contract(symbol)
             self._recent_detections[symbol] = time.time()
 
+            # Fetch NBBO for top contract
+            bid, ask, oi = None, None, None
+            if details["top_contract"]:
+                bid, ask, oi = await self._fetch_contract_nbbo(
+                    details["top_contract"], symbol
+                )
+
             hot_symbols.append({
                 "symbol": symbol,
                 "detected_at": now_et,
@@ -265,6 +343,9 @@ class HotOptionsDetector:
                 "top_contract": details["top_contract"],
                 "top_contract_volume": details["top_contract_volume"],
                 "top_contract_notional": details["top_contract_notional"],
+                "top_contract_bid": bid,
+                "top_contract_ask": ask,
+                "top_contract_oi": oi,
                 "trade_date": now_et.date(),
             })
 
@@ -283,8 +364,9 @@ class HotOptionsDetector:
                     (symbol, detected_at, contracts, notional, prints,
                      call_volume, put_volume, unique_contracts, avg_vol_per_contract,
                      volume_ratio, baseline_volume, top_contract, top_contract_volume,
-                     top_contract_notional, trade_date)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
+                     top_contract_notional, top_contract_bid, top_contract_ask,
+                     top_contract_oi, trade_date)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
                     ON CONFLICT (symbol, trade_date, detected_at) DO NOTHING
                 """, [
                     (
@@ -294,6 +376,8 @@ class HotOptionsDetector:
                         h["avg_vol_per_contract"], h["volume_ratio"],
                         h["baseline_volume"], h["top_contract"],
                         h["top_contract_volume"], h["top_contract_notional"],
+                        h["top_contract_bid"], h["top_contract_ask"],
+                        h["top_contract_oi"],
                         h["trade_date"],
                     )
                     for h in hot_symbols
@@ -312,4 +396,6 @@ class HotOptionsDetector:
             "intraday_hits": self._intraday_hits,
             "fallback_hits": self._fallback_hits,
             "cooldown_active": len(self._recent_detections),
+            "nbbo_fetches": self._nbbo_fetches,
+            "nbbo_failures": self._nbbo_failures,
         }
