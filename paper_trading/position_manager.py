@@ -750,7 +750,7 @@ class PositionManager:
             entry_price=setup.entry_price,
             shares=qty,
             signal_score=0,
-            signal_rsi=0,
+            signal_rsi=setup.rsi_14 or 0,   # v79: use actual RSI from TA lookup (was hardcoded 0)
             signal_notional=0,
             direction=setup.direction,
             stop_price=setup.stop_loss,
@@ -784,7 +784,7 @@ class PositionManager:
                 entry_price=trade.entry_price,
                 shares=trade.shares,
                 signal_score=0,
-                signal_rsi=0,
+                signal_rsi=trade.signal_rsi,   # v79: use actual RSI from TradeRecord (was 0)
                 signal_notional=0,
                 table_name=self.trades_table,
                 direction=trade.direction,

@@ -5,19 +5,83 @@ Polls engulfing_scores table for qualifying 5-min patterns and returns
 TradeSetup objects with entry, stop, target, and direction.
 
 Replaces the old EngulfingChecker (v59 and earlier).
+
+## Account B Filter Stack (v79 — 2026-03-18)
+
+Filters are applied in three stages across two files.
+
+### Stage 1 — DB query + post-query (this file, PatternPoller)
+  - timeframe = '5min'
+  - scan_ts within last N minutes (ACCOUNT_B_LOOKBACK_MIN, default 10)
+  - volume_confirmed = TRUE
+  - trend_context IN ('uptrend', 'downtrend')
+  - candle_range <= ACCOUNT_B_MAX_CANDLE_RANGE (default 0.57)
+  - risk_per_share >= ACCOUNT_B_MIN_RISK_PER_SHARE (default $1.00)
+  - pattern_strength != 'weak' (if ACCOUNT_B_FILTER_WEAK=True)
+  - Not already seen this session (dedup set)
+
+### Stage 2 — TA filters (main.py / _poll_account_b_patterns)
+  FAIL-CLOSED (v79 fix): if TA data missing for symbol → trade SKIPPED.
+  Before v79, the filter was fail-open: trades passed silently when RSI was
+  unavailable, causing signal_rsi=0 in paper_trades_log_b across all 246
+  live trades (Feb 18 – Mar 18 2026). This was the primary driver of poor
+  live performance vs backtest expectations.
+
+  - RSI momentum gate (ACCOUNT_B_REQUIRE_MOMENTUM_RSI=True):
+      Bullish: RSI >= ACCOUNT_B_RSI_BULL_MIN (55)
+      Bearish: RSI <= ACCOUNT_B_RSI_BEAR_MAX (45)
+      Backtest: 75.8% WR with filter vs 40.9% without (99-trade sample)
+  - Trend alignment (ACCOUNT_B_REQUIRE_TREND_ALIGNMENT=True):
+      Bullish: SMA20 > SMA50
+      Bearish: SMA20 < SMA50
+      Backtest: 67.4% WR with filter vs 42.4% without (99-trade sample)
+
+### Stage 3 — Time gate (main.py / _poll_account_b_patterns)
+  - No entries before 9:35 AM ET (v79: buffer for open-bar noise. Live data
+    showed 39% WR in the 9am hour vs 58% WR at 10am, partly from patterns
+    firing on incomplete first candles at 9:30)
+  - No entries after 11:00 AM ET (v73: 3yr backtest morning +$17K, afternoon -$209)
+
+## Live Performance Notes (Feb 18 – Mar 18 2026, 246 real trades)
+  - RSI filter NOT applied due to fail-open bug — all signal_rsi = 0
+  - 9:30-9:35 window: 39% WR (worst); 10am: 58% WR (best)
+  - EOD exits were entire profit engine (+$5,731 of +$4,873 total)
+  - Stop exits: -$14,531 (primary drag — system entered bad setups freely)
+  - v79 fixes: fail-closed TA gate + 9:35 AM buffer + RSI logged correctly
+
+## Related files
+  - paper_trading/main.py               Stage 2+3 filters (_poll_account_b_patterns)
+  - paper_trading/config.py             All ACCOUNT_B_* settings
+  - docs/ACCOUNT_B_TRADING_LOGIC.md     Human-readable spec
+  - Projects/DayTrading/ACCOUNT_B_TRADING_LOGIC.md  DayTrading-side spec
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
 class TradeSetup:
-    """A qualifying pattern ready for order submission."""
+    """
+    A qualifying pattern ready for order submission.
+
+    Core fields populated by PatternPoller (Stage 1):
+      symbol, direction, entry_price, stop_loss, target_1,
+      risk_per_share, candle_range, pattern_strength, pattern_date, scan_ts
+
+    TA fields populated by _poll_account_b_patterns after TA lookup (Stage 2):
+      rsi_14, sma_20, sma_50
+
+    These TA fields are written to paper_trades_log_b.signal_rsi so that
+    post-hoc analysis can verify filters actually ran. If TA is unavailable,
+    the trade is REJECTED before TradeSetup reaches the order stage — so
+    rsi_14=None in a live TradeSetup means TA lookup hasn't happened yet,
+    not that TA was missing and the trade slipped through.
+    """
     symbol: str
     direction: str           # 'bullish' or 'bearish'
     entry_price: float
@@ -28,20 +92,18 @@ class TradeSetup:
     pattern_strength: str    # 'strong', 'moderate', 'weak'
     pattern_date: datetime
     scan_ts: datetime
+    rsi_14: Optional[float] = field(default=None)
+    sma_20: Optional[float] = field(default=None)
+    sma_50: Optional[float] = field(default=None)
 
 
 class PatternPoller:
     """
     Polls engulfing_scores for 5-min patterns matching big-hitter profile.
 
-    Filters applied:
-    - timeframe = '5min'
-    - scan_ts within lookback window
-    - volume_confirmed = TRUE
-    - trend_context IN ('uptrend', 'downtrend')
-    - candle_range <= max_candle_range
-    - risk_per_share >= min_risk_per_share
-    - Not already seen this session
+    Applies Stage 1 filters only (DB query + post-query).
+    Stage 2 (TA fail-closed) and Stage 3 (time gate) are in main.py.
+    See module docstring for complete filter stack and performance history.
     """
 
     def __init__(

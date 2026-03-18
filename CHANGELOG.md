@@ -2,6 +2,48 @@
 
 All notable changes to FL3_V2 paper trading system.
 
+## [2026-03-06 10:30 PST] — Per-Position Sizing Cap (v77)
+
+### Done
+- **Per-position notional cap**: Each Account B/C position now capped at `MAX_POSITION_SIZE_PCT` (10%) of equity (~$9.5K per position on ~$95K equity). Prevents risk-based sizing from creating outsized positions when risk_per_share is small relative to stock price (e.g., $1 risk on $150 stock = $75K position before cap)
+- **Committed capital fix merged to master**: Cherry-picked `6c9b0fa` (committed capital tracking) to master — previously stuck on unmerged `fix/equity-cap-committed-capital` branch. This caused v75 to deploy without the fix, resulting in $377K exposure on $98K equity (3.9x over-leverage) on March 4th
+- **Dual guard on position sizing**: Positions are now constrained by BOTH per-position cap (10% equity) AND total committed capital cap (90% equity). The two guards work together — per-position prevents any single oversized trade, committed capital prevents total over-leverage
+
+### State
+- **v77 DEPLOYED** on `paper-trading-live` (2026-03-06)
+- Both fixes cherry-picked to master to prevent future branch-merge gaps
+- Old `fix/equity-cap-committed-capital` branch deleted
+
+### Next
+- Monitor Account B position sizes — expect ~$9.5K per position, 8-9 max concurrent
+- Verify no trades rejected due to price exceeding per-position cap (would indicate cap too tight)
+
+### Files Changed
+- `paper_trading/position_manager.py` — added per-position cap in `open_limit_position()`, committed capital tracking cherry-picked
+
+## [2026-03-05 10:58 PST] — Flow Signals Pipeline (v76)
+
+### Done
+- **`_refresh_flow_signals()` added as Step 6** in `BaselineRefreshJob.run()` — joins `engulfing_scores` (daily 1D patterns) with `orats_daily` (options flow data) and upserts to new `flow_signals` table
+- **Alignment rules:** Bullish = P/C ratio <= 0.7 + volume z-score >= 1.5; Bearish = P/C ratio >= 1.3 + volume z-score >= 1.5. Backtest: 72.5% directional WR (+4.3pp over engulfing alone, n=1,565 over 2 years)
+- **Columns written:** symbol, pattern_date, direction, iv_rank, volume_zscore, put_call_ratio, flow_aligned (boolean), computed_at
+- **Cleanup:** Deletes flow_signals rows older than 30 days (same pattern as `_cleanup_old_buckets()`)
+- **DDL:** `flow_signals` table created with PK `(symbol, pattern_date)`, index on `pattern_date`
+
+### State
+- Code ready in `scripts/refresh_baselines.py` — needs image rebuild + job update to deploy
+- `flow_signals` table already created in DB with full `fr3_app` permissions
+- Engulfing dashboard already reads from `flow_signals` (LEFT JOIN in db_poller, Flow Signals tab in frontend)
+
+### Next
+- Build + push new `fl3-v2-baseline-refresh` image (v76)
+- Update Cloud Run job to v76 image
+- Execute job manually to populate `flow_signals` for first time
+- Verify Flow Signals tab on dashboard shows aligned signals
+
+### Files Changed
+- `scripts/refresh_baselines.py` — added `_refresh_flow_signals()` as Step 6
+
 ## [2026-03-04 12:35 PST] — Precomputed Dashboard Tables (v75)
 
 ### Done
@@ -1830,3 +1872,40 @@ GEX_DEAD_ZONE_MAX_PCT: float = 5.0
 - `paper_trading/config.py` — GEX dead zone config (3 new fields)
 - `paper_trading/signal_filter.py` — dead zone check, gex_dead_zone counter, docstring
 - `CHANGELOG.md` — v56 deploy entry
+
+## [2026-03-18 11:00 PST] — Account B v79: fail-closed TA gate + 9:35 AM buffer + RSI logging fix
+
+### Done
+- **Fail-closed TA gate**: `_poll_account_b_patterns` now rejects trades when RSI/SMA
+  unavailable (was fail-open — RSI filter silently skipped, all 246 live trades had
+  `signal_rsi=0`, filter never actually ran Feb 18–Mar 18)
+- **9:35 AM open buffer**: Added `ACCOUNT_B_FIRST_ENTRY_TIME = 9:35 AM` gate. Live data
+  showed 39% WR in 9am window vs 58% at 10am, partly from incomplete first candles at 9:30
+- **RSI logged correctly**: `TradeSetup.rsi_14/sma_20/sma_50` fields added to dataclass.
+  TA values stamped on setup after lookup, written to `paper_trades_log_b.signal_rsi`
+- **`ACCOUNT_B_FIRST_ENTRY_TIME`** added to `config.py` (was local var in main.py)
+- **Documentation**: `engulfing_checker.py` module docstring fully rewritten with 3-stage
+  filter spec, live performance history, and v79 fix explanation. `main.py` function
+  docstring updated. `ACCOUNT_B_TRADING_LOGIC.md` fully rewritten. `CLAUDE.md` updated.
+
+### State
+- All 3 code changes in `paper_trading/`: `engulfing_checker.py`, `main.py`, `position_manager.py`
+- `config.py` updated with `ACCOUNT_B_FIRST_ENTRY_TIME`
+- NOT yet deployed to Cloud Run — requires `docker build + push + gcloud run services update`
+- Account B running live with old code until deployment
+
+### Next
+- Deploy v79 to Cloud Run (`paper-trading-live`)
+- Monitor `paper_trades_log_b.signal_rsi` for non-zero values (confirms fix working)
+- After 2+ weeks live data: re-analyze hour-of-day WR with RSI properly applied
+- Consider: BD conviction gate (BD6+), market regime gate for bullish entries on down days
+- Investigate Tuesday vs Thursday day-of-week pattern (65% vs 50% WR — needs 60+ trades)
+
+### Files Changed
+- `paper_trading/engulfing_checker.py` — module docstring, TradeSetup dataclass (rsi_14/sma_20/sma_50 fields), PatternPoller docstring
+- `paper_trading/main.py` — `_poll_account_b_patterns()`: fail-closed TA, 9:35 gate from config, RSI stamping, dashboard RSI logging
+- `paper_trading/position_manager.py` — `open_limit_position()`: `signal_rsi=setup.rsi_14`, `log_trade_open()` call updated
+- `paper_trading/config.py` — `ACCOUNT_B_FIRST_ENTRY_TIME` added
+- `DayTrading/ACCOUNT_B_TRADING_LOGIC.md` — fully rewritten with 3-stage filter spec + live perf data
+- `FL3_V2/CLAUDE.md` — Account B section updated, Current Status updated
+

@@ -370,13 +370,35 @@ class PaperTradingEngine:
             self._closing_symbols_c.discard(symbol)
 
     async def _poll_account_b_patterns(self):
-        """Poll engulfing_scores for qualifying big-hitter patterns and submit limit orders."""
+        """
+        Poll engulfing_scores for qualifying big-hitter patterns and submit limit orders.
+
+        Filter stages applied here (Stage 2 + 3 — see engulfing_checker.py for Stage 1):
+
+        Stage 2 — TA filters (fail-closed as of v79):
+          If RSI or SMA data is missing for a symbol, the trade is SKIPPED.
+          Before v79 this was fail-open: a missing TA entry caused ta.get("rsi_14")
+          to return None, the filter condition evaluated False, and every trade
+          passed silently. This caused signal_rsi=0 in paper_trades_log_b for all
+          246 live trades (Feb 18 – Mar 18 2026) and is the primary reason live
+          performance diverged from backtest expectations.
+
+        Stage 3 — Time gate:
+          - Before 9:35 AM ET: skip (v79 — open-bar noise, 39% WR in 9am window)
+          - After 11:00 AM ET: skip (v73 — 3yr backtest morning +$17K, afternoon -$209)
+
+        The actual RSI value is stored on TradeSetup.rsi_14 and logged to
+        paper_trades_log_b.signal_rsi so post-hoc analysis can verify filters ran.
+        """
         if not self._account_b_enabled or self._eod_complete:
             return
         if not self._is_entry_allowed():
             return
-        # Account B cutoff: no new orders after 11 AM ET (3yr backtest: morning +$17K, afternoon -$209)
         now_et = self._get_et_now().time()
+        # Stage 3: time gate — no entries before 9:35 AM (v79: open-bar noise buffer)
+        if now_et < self.config.ACCOUNT_B_FIRST_ENTRY_TIME:
+            return
+        # Stage 3: time gate — no entries after 11 AM ET (v73: 3yr backtest validated)
         if now_et > self.config.ACCOUNT_B_LAST_ENTRY_TIME:
             return
 
@@ -384,17 +406,44 @@ class PaperTradingEngine:
         if not setups:
             return
 
-        # TA tier filters (v78): momentum RSI + trend alignment
+        # Stage 2 — TA filters (FAIL-CLOSED as of v79)
+        # Previously fail-open: missing TA → filter skipped → all trades passed.
+        # Now: missing TA → trade rejected. Controlled by config flags.
         if self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI or self.config.ACCOUNT_B_REQUIRE_TREND_ALIGNMENT:
             filtered_setups = []
             skipped_rsi = 0
             skipped_trend = 0
+            skipped_no_ta = 0
             for setup in setups:
                 ta = self.signal_generator._get_ta_for_symbol(setup.symbol)
 
-                # Momentum RSI filter
-                if self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI and ta.get("rsi_14") is not None:
-                    rsi = float(ta["rsi_14"])
+                # FAIL-CLOSED: if TA is missing entirely, skip the trade (v79 fix)
+                rsi = ta.get("rsi_14")
+                sma_20 = ta.get("sma_20")
+                sma_50 = ta.get("sma_50")
+                ta_required = (
+                    self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI or
+                    self.config.ACCOUNT_B_REQUIRE_TREND_ALIGNMENT
+                )
+                if ta_required and (rsi is None or sma_20 is None or sma_50 is None):
+                    skipped_no_ta += 1
+                    logger.debug(
+                        f"Account B SKIP {setup.symbol}: TA unavailable "
+                        f"(rsi={rsi}, sma20={sma_20}, sma50={sma_50})"
+                    )
+                    continue
+
+                rsi = float(rsi)
+                sma_20 = float(sma_20)
+                sma_50 = float(sma_50)
+
+                # Stamp TA on setup so it gets logged to paper_trades_log_b.signal_rsi
+                setup.rsi_14 = rsi
+                setup.sma_20 = sma_20
+                setup.sma_50 = sma_50
+
+                # RSI momentum gate
+                if self.config.ACCOUNT_B_REQUIRE_MOMENTUM_RSI:
                     if setup.direction == "bullish" and rsi < self.config.ACCOUNT_B_RSI_BULL_MIN:
                         skipped_rsi += 1
                         logger.debug(f"Account B SKIP {setup.symbol}: RSI {rsi:.1f} < {self.config.ACCOUNT_B_RSI_BULL_MIN} (bullish needs momentum)")
@@ -404,27 +453,24 @@ class PaperTradingEngine:
                         logger.debug(f"Account B SKIP {setup.symbol}: RSI {rsi:.1f} > {self.config.ACCOUNT_B_RSI_BEAR_MAX} (bearish needs weakness)")
                         continue
 
-                # Trend alignment filter
+                # Trend alignment gate
                 if self.config.ACCOUNT_B_REQUIRE_TREND_ALIGNMENT:
-                    sma_20 = ta.get("sma_20")
-                    sma_50 = ta.get("sma_50")
-                    if sma_20 is not None and sma_50 is not None:
-                        sma_20 = float(sma_20)
-                        sma_50 = float(sma_50)
-                        if setup.direction == "bullish" and sma_20 <= sma_50:
-                            skipped_trend += 1
-                            logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} <= SMA50 {sma_50:.2f} (bullish needs uptrend)")
-                            continue
-                        if setup.direction == "bearish" and sma_20 >= sma_50:
-                            skipped_trend += 1
-                            logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} >= SMA50 {sma_50:.2f} (bearish needs downtrend)")
-                            continue
+                    if setup.direction == "bullish" and sma_20 <= sma_50:
+                        skipped_trend += 1
+                        logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} <= SMA50 {sma_50:.2f} (bullish needs uptrend)")
+                        continue
+                    if setup.direction == "bearish" and sma_20 >= sma_50:
+                        skipped_trend += 1
+                        logger.debug(f"Account B SKIP {setup.symbol}: SMA20 {sma_20:.2f} >= SMA50 {sma_50:.2f} (bearish needs downtrend)")
+                        continue
 
                 filtered_setups.append(setup)
 
-            if skipped_rsi or skipped_trend:
-                logger.info(f"Account B TA filters: {len(setups)} → {len(filtered_setups)} "
-                            f"(skipped: {skipped_rsi} RSI, {skipped_trend} trend)")
+            if skipped_no_ta or skipped_rsi or skipped_trend:
+                logger.info(
+                    f"Account B TA filters: {len(setups)} → {len(filtered_setups)} "
+                    f"(skipped: {skipped_no_ta} no-TA, {skipped_rsi} RSI, {skipped_trend} trend)"
+                )
             setups = filtered_setups
 
         for setup in setups:
@@ -435,12 +481,12 @@ class PaperTradingEngine:
             if self.position_manager_b.already_traded(setup.symbol):
                 continue
 
-            # Log signal to dashboard
+            # Log signal to dashboard — use actual RSI from TA lookup (v79: was hardcoded 0)
             if self.dashboard_b and self.dashboard_b.enabled:
                 self.dashboard_b.log_signal(
                     symbol=setup.symbol,
                     score=0,
-                    rsi=0,
+                    rsi=setup.rsi_14 or 0,
                     ratio=0,
                     notional=0,
                     price=setup.entry_price,

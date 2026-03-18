@@ -77,7 +77,8 @@ class TradingConfig:
     ACCOUNT_B_MIN_RISK_PER_SHARE: float = 1.00     # Min distance entry→stop (avoid tiny stops)
     ACCOUNT_B_CONFIRMATION_WINDOW_MIN: int = 30    # Cancel unfilled limit orders after this
     ACCOUNT_B_LOOKBACK_MIN: int = 10               # Only patterns from last N minutes
-    ACCOUNT_B_LAST_ENTRY_TIME: dt_time = dt_time(11, 0)  # No new orders after 11 AM ET (3yr backtest: morning=+$17K, afternoon=-$209)
+    ACCOUNT_B_FIRST_ENTRY_TIME: dt_time = dt_time(9, 35)  # No entries before 9:35 AM ET (v79: open-bar noise buffer; live data 39% WR at 9am vs 58% at 10am)
+    ACCOUNT_B_LAST_ENTRY_TIME: dt_time = dt_time(11, 0)   # No entries after 11 AM ET (v73: 3yr backtest morning=+$17K, afternoon=-$209)
 
     # Account B — TA Tier Filters (v78)
     # Analysis of 99 trades: momentum RSI 75.8% WR vs 40.9%, trend aligned 67.4% vs 42.4%

@@ -45,18 +45,19 @@ Before ending ANY session (whether asked to or not), you MUST:
 
 ## Current Status
 
-_Last updated: 2026-03-04 12:35 PST_
+_Last updated: 2026-03-18 11:00 PST_
 
-- **v75 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00131-762` (2026-03-04 12:30 PST)
-  - **Precomputed dashboard tables**: `sparkline_1d` (3,011 symbols, 5-min refresh) + `adv_14d` (2,069 symbols, daily refresh via `fl3-v2-baseline-refresh` job) replace expensive `spot_prices_1m` scans in engulfing dashboard
-  - `fl3-v2-baseline-refresh` job updated from v9 → v75
-- **v74** (2026-03-03 17:20 PST) — Intraday bar batch cap 20→35
-- **v73 DEPLOYED** on `paper-trading-live` revision `paper-trading-live-00124-9cd` (2026-03-03 14:58 PST)
-  - **Account B 11 AM ET entry cutoff**: No new orders placed after 11:00 AM ET. 3-year backtest (559 trades): morning +$17,327, afternoon -$209. Trailing stop alternative rejected (hurts P&L by $3-9K). Full analysis: `Docs/ACCOUNT_B_11AM_CUTOFF.md`
-  - Also synced previously deployed v70-v72 changes to git (EOD weekend guard, cancel-before-close, Cameron scanner fixes, multi-stage Dockerfile, unused dep removal)
-- **v72 DEPLOYED** on revision `paper-trading-live-00123-9bd` (2026-03-03 08:40 PST)
-  - **Over-leveraging fix**: Position sizing now caps by `equity * 0.90` instead of `buying_power * 0.95`.
-- **v70-v71** — Weekend EOD closer fix, WebSocket trading hours guard, Account B/C buying power cap
+- **v79 DEPLOYED** on `paper-trading-live` (2026-03-18)
+  - **Account B fail-closed TA gate**: RSI/SMA missing → trade rejected (was fail-open, causing signal_rsi=0 on all 246 live trades Feb 18–Mar 18)
+  - **Account B 9:35 AM open buffer**: no entries before 9:35 ET (was 9:30; live data showed 39% WR in 9am window)
+  - **Account B RSI logging fix**: `signal_rsi` in `paper_trades_log_b` now stores actual RSI value
+  - **`ACCOUNT_B_FIRST_ENTRY_TIME`** added to `config.py` (was hardcoded in main.py)
+  - Full documentation updated: `engulfing_checker.py`, `main.py`, `config.py`, `ACCOUNT_B_TRADING_LOGIC.md`, `CLAUDE.md`
+- **v76 CODE READY** — `_refresh_flow_signals()` added to `scripts/refresh_baselines.py` as Step 6. Needs image rebuild + Cloud Run job update to deploy.
+  - `flow_signals` table created in DB. Engulfing dashboard already consumes it (Flow Signals tab)
+- **v75** (2026-03-04) — Precomputed dashboard tables (`sparkline_1d`, `adv_14d`), `fl3-v2-baseline-refresh` job updated v9→v75
+- **v74** (2026-03-03) — Intraday bar batch cap 20→35
+- **v73** (2026-03-03) — Account B 11 AM ET entry cutoff
 - **Cameron Article Enrichment (V2 side) READY** — Code complete, DDL pending deployment
   - DDL needed before deploy: `sql/create_cameron_candidates_daily.sql`, `sql/alter_paper_trades_log_c_has_news.sql`
 - **V6 Research COMPLETE (2026-02-26)** — OI direction DISPROVEN, momentum strategy discovered
@@ -453,21 +454,44 @@ Six tabs updated in real-time via `gspread` — three per account:
 | Greeks (Black-Scholes) | Code exists - NOT used in live trading |
 | ORATS scanner | `identify_uoa_candidates.py` runs independently, does NOT feed live trader |
 
-### Account B — Big-Hitter Pattern Trader (v60+)
+### Account B — Big-Hitter Pattern Trader (v60+, filter fixes v79)
 
-Parallel paper trading account using **DayTrading engulfing scanner big-hitter profile** as the primary signal. Account B is fully independent of Account A and the UOA firehose — it polls `engulfing_scores` directly.
+Parallel paper trading account using **DayTrading engulfing scanner big-hitter profile**
+as the primary signal. Account B is fully independent of Account A and the UOA firehose
+— it polls `engulfing_scores` directly.
+
+**v79 fixes (2026-03-18):**
+- **Fail-closed TA gate**: missing RSI/SMA now rejects trade (was fail-open — all 246
+  live trades Feb 18–Mar 18 had `signal_rsi=0`, RSI filter never actually ran)
+- **9:35 AM open buffer**: no entries before 9:35 (was 9:30 — live data showed 39% WR
+  in 9am window vs 58% at 10am, partly from incomplete first candles)
+- **RSI logged correctly**: `signal_rsi` in `paper_trades_log_b` now stores actual value
+
+**Filter stack (3 stages):**
+```
+Stage 1 — PatternPoller / engulfing_checker.py (DB query + post-query):
+  timeframe='5min', scan_ts last 10min, volume_confirmed, trend_context,
+  candle_range<=0.57, risk>=1.00/share, strength!='weak', dedup
+
+Stage 2 — _poll_account_b_patterns / main.py (FAIL-CLOSED):
+  If RSI or SMA missing for symbol → SKIP (not pass-through)
+  Bullish: RSI>=55 AND SMA20>SMA50
+  Bearish: RSI<=45 AND SMA20<SMA50
+
+Stage 3 — Time gate / main.py:
+  No entries before 9:35 AM ET (v79: open-bar noise)
+  No entries after 11:00 AM ET (v73: backtest validated)
+```
 
 **Signal flow:**
 ```
-During market hours, before 11 AM ET (every 30s):
-  Poll engulfing_scores (timeframe='5min', last 10 min, volume_confirmed, trend_context)
-    → Apply big-hitter filters:
-      - candle_range <= 0.57
-      - risk_per_share >= $1.00 (abs(entry - stop))
-      - Not already seen this session
-    → Submit limit buy (bullish) or sell-short (bearish) at entry_price
+During market hours, 9:35–11:00 AM ET (every 30s):
+  Poll engulfing_scores (Stage 1 filters)
+    → Apply TA fail-closed gate (Stage 2)
+    → Apply time gate (Stage 3)
+    → Submit limit buy/short at entry_price
     → Monitor fill (cancel after 30 min if unfilled)
-    → Monitor price vs stop_loss and target_1 (via WebSocket, REST fallback)
+    → Monitor vs stop_loss and target_1 (WebSocket, REST fallback)
     → Exit at stop (market), target (market), or EOD 3:55 PM
 ```
 
@@ -493,6 +517,7 @@ During market hours, before 11 AM ET (every 30s):
 | `ACCOUNT_B_MIN_RISK_PER_SHARE` | `1.00` | Min distance entry→stop (avoid tiny stops) |
 | `ACCOUNT_B_CONFIRMATION_WINDOW_MIN` | `30` | Cancel unfilled limit orders after N minutes |
 | `ACCOUNT_B_LOOKBACK_MIN` | `10` | Only patterns from last N minutes |
+| `ACCOUNT_B_FIRST_ENTRY_TIME` | `9:35 AM` | No new orders before this time (v79: open-bar noise buffer) |
 | `ACCOUNT_B_LAST_ENTRY_TIME` | `11:00 AM` | No new orders after this time (v73: 3yr backtest validated) |
 
 **Key files:**
@@ -641,7 +666,7 @@ FL3_V2/
 ├── scripts/
 │   ├── firehose_main.py         # Main firehose orchestrator
 │   ├── ta_pipeline_v2.py        # TA refresh orchestrator
-│   ├── refresh_baselines.py     # Daily baseline refresh
+│   ├── refresh_baselines.py     # Daily baseline refresh (6 steps: cleanup, TA, analyze, health, adv_14d, flow_signals)
 │   └── patterns/                # Cameron pattern detectors
 │       ├── bull_flag.py
 │       ├── consolidation_breakout.py
