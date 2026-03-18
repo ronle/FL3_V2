@@ -80,13 +80,15 @@ class TradingConfig:
     ACCOUNT_B_FIRST_ENTRY_TIME: dt_time = dt_time(9, 35)  # No entries before 9:35 AM ET (v79: open-bar noise buffer; live data 39% WR at 9am vs 58% at 10am)
     ACCOUNT_B_LAST_ENTRY_TIME: dt_time = dt_time(11, 0)   # No entries after 11 AM ET (v73: 3yr backtest morning=+$17K, afternoon=-$209)
 
-    # Account B — TA Tier Filters (v78)
-    # Analysis of 99 trades: momentum RSI 75.8% WR vs 40.9%, trend aligned 67.4% vs 42.4%
+    # Account B — TA Tier Filters (v78→v80: disabled)
+    # v78 added RSI/SMA gates based on 99-trade sample. Fail-open bug meant they never ran
+    # on any of 246 live trades (Feb-Mar 2026). v79 made fail-closed but that blocks trades
+    # on an unvalidated filter. v80: disabled gates, keep RSI stamping for future analysis.
     ACCOUNT_B_FILTER_WEAK: bool = True              # Reject pattern_strength='weak' (-$54/trade avg)
-    ACCOUNT_B_REQUIRE_MOMENTUM_RSI: bool = True      # Bull: RSI>=55, Bear: RSI<=45 (75.8% WR)
-    ACCOUNT_B_RSI_BULL_MIN: float = 55.0             # Min RSI for bullish entries
-    ACCOUNT_B_RSI_BEAR_MAX: float = 45.0             # Max RSI for bearish entries
-    ACCOUNT_B_REQUIRE_TREND_ALIGNMENT: bool = True    # Bull: SMA20>SMA50, Bear: SMA20<SMA50 (67.4% WR)
+    ACCOUNT_B_REQUIRE_MOMENTUM_RSI: bool = False     # DISABLED v80: never validated live
+    ACCOUNT_B_RSI_BULL_MIN: float = 55.0             # Min RSI for bullish entries (unused when disabled)
+    ACCOUNT_B_RSI_BEAR_MAX: float = 45.0             # Max RSI for bearish entries (unused when disabled)
+    ACCOUNT_B_REQUIRE_TREND_ALIGNMENT: bool = False   # DISABLED v80: never validated live
 
     # Account C — Cameron B2 Pattern Trader
     USE_ACCOUNT_C: bool = True
