@@ -16,18 +16,37 @@ Account B (big-hitter pattern trader):
 - No new orders after 11 AM ET (v73: 3yr backtest shows morning +$17K, afternoon -$209)
 - Supports both long and short (direction from pattern)
 
+Account E (Expert Committee — AI virtual trading desk):
+- 7 domain experts emit signals with conviction scores + TTL
+- PM Synthesizer applies weighted consensus (score >= 60 threshold)
+- Risk Manager has veto power on any trade
+- Supports intraday (EOD close, -3% stop) and swing (2-5 day, -5% stop)
+- US equities + options, long and short
+- Weekly weight recalibration (Sunday 6 PM ET)
+
 Legacy (UOA signals, disabled by default):
 - Uptrend, Score >= 10, RSI < 55, ADV >= 1K, $50K+ notional
 - Same-day exit at 3:55 PM
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time as dt_time
 
 
 @dataclass
 class TradingConfig:
     """Paper trading configuration."""
+
+    def __post_init__(self):
+        if self.ACCOUNT_E_BASE_WEIGHTS is None:
+            self.ACCOUNT_E_BASE_WEIGHTS = {
+                "flow_analyst": 0.25,
+                "technical_analyst": 0.20,
+                "quant_analyst": 0.20,
+                "sentiment_analyst": 0.15,
+                "macro_strategist": 0.10,
+                "risk_manager": 0.10,
+            }
 
     # v58: Momentum EOD Screener (Account A)
     USE_MOMENTUM_SCREENER: bool = False    # PAUSED v73: -$9.9K in 3 days (20 trades, 5% WR). Catching falling knives in down market.
@@ -90,17 +109,85 @@ class TradingConfig:
     ACCOUNT_B_RSI_BEAR_MAX: float = 45.0             # Max RSI for bearish entries (unused when disabled)
     ACCOUNT_B_REQUIRE_TREND_ALIGNMENT: bool = False   # DISABLED v80: never validated live
 
-    # Account C — Cameron B2 Pattern Trader
-    USE_ACCOUNT_C: bool = True
-    CAMERON_RVOL_MIN: float = 10.0                    # Min relative volume for candidates
-    CAMERON_SCAN_START: dt_time = dt_time(9, 45)      # Start scanning at 9:45 AM ET
-    CAMERON_SCAN_END: dt_time = dt_time(11, 0)        # Stop scanning at 11:00 AM ET
-    CAMERON_POLL_INTERVAL_SEC: int = 30               # Poll cameron_scores every 30s
-    CAMERON_SCAN_INTERVAL_SEC: int = 60               # Run scanner every 60s
-    CAMERON_MAX_BF_PER_DAY: int = 1                   # Max bull flag trades per day
-    CAMERON_MAX_RISK_PER_TRADE: float = 500.0         # Max dollar risk per trade
-    CAMERON_MAX_POSITIONS: int = 5                    # Max concurrent Cameron positions
-    CAMERON_CONFIRMATION_WINDOW_MIN: int = 30         # Cancel unfilled limit orders after this
+    # Account D — SPY 0DTE Binary Bet (15-min hold)
+    # Core concept: 15-minute binary bet on SPY direction using TA consensus.
+    # Every trade enters and exits within a fixed 15-minute window.
+    USE_ACCOUNT_D: bool = True
+    ACCOUNT_D_POLL_INTERVAL_SEC: int = 30          # Poll for SPY signals every 30s
+    ACCOUNT_D_MAX_RISK_PER_TRADE: float = 200.0    # Max $ premium per trade (options are leveraged)
+    ACCOUNT_D_MAX_CONTRACTS: int = 3               # Max option contracts per trade
+    ACCOUNT_D_MAX_POSITIONS: int = 3               # Max concurrent 0DTE positions
+    ACCOUNT_D_MAX_TRADES_PER_DAY: int = 6          # Daily trade cap — stop entering after this many fills
+    ACCOUNT_D_HOLD_DURATION_MIN: int = 15          # Hard exit after 15 minutes regardless of P&L
+    ACCOUNT_D_SCAN_START: dt_time = dt_time(9, 45)  # Start scanning at 9:45 AM ET (after open vol settles)
+    ACCOUNT_D_SCAN_END: dt_time = dt_time(15, 40)   # Stop scanning at 3:40 PM ET (last 15-min window before 3:55 force-close)
+    ACCOUNT_D_MIN_DELTA: float = 0.30              # Min delta for strike selection
+    ACCOUNT_D_MAX_DELTA: float = 0.50              # Max delta for strike selection
+    ACCOUNT_D_MIN_OPTION_VOLUME: int = 100         # Min option volume at strike
+    ACCOUNT_D_MAX_SPREAD_PCT: float = 0.10         # Max bid-ask spread as % of mid
+    ACCOUNT_D_CONFIRMATION_WINDOW_MIN: int = 5     # Cancel unfilled limit orders after 5 min (0DTE moves fast)
+    ACCOUNT_D_STOP_LOSS_PCT: float = -0.40         # Stop loss at -40% of premium
+    ACCOUNT_D_TAKE_PROFIT_PCT: float = 0.50        # Take profit at +50% of premium
+    ACCOUNT_D_TIME_EXIT_BUFFER_MIN: int = 5        # Force-close safety net: 3:55 PM (only if 15-min exit missed)
+    ACCOUNT_D_MIN_CONFIDENCE: float = 0.60         # Min TA confidence to enter (3/5 = 0.60, collect data first)
+    ACCOUNT_D_TA_CONSENSUS_MIN: int = 3            # Min indicators agreeing (out of 5)
+    ACCOUNT_D_VIRTUAL_LOG_INTERVAL_SEC: int = 300  # Log premium every 5 min during hold (virtual mode)
+
+    # Account E — Expert Committee (AI virtual trading desk)
+    USE_ACCOUNT_E: bool = False  # Disabled until Account E Alpaca credentials are set
+
+    # Account E Agent Settings (v2 — Claude CLI agents)
+    ACCOUNT_E_USE_AGENTS: bool = True           # True=Claude CLI agents, False=rule-based only
+    ACCOUNT_E_EXPERT_MODEL: str = "sonnet"      # Model for 4 expert agents
+    ACCOUNT_E_PM_MODEL: str = "opus"            # Model for PM synthesis agent
+    ACCOUNT_E_EXPERT_BUDGET: float = 0.25       # USD hard cap per expert agent
+    ACCOUNT_E_PM_BUDGET: float = 0.50           # USD hard cap for PM agent
+    ACCOUNT_E_AGENT_TIMEOUT_SEC: int = 180      # 3 min per agent
+    ACCOUNT_E_MAX_DAILY_AGENT_COST: float = 30.00  # USD daily ceiling (4 Sonnet + 1 Opus)
+
+    # Expert base weights (signal-weighted ensemble)
+    ACCOUNT_E_BASE_WEIGHTS: dict = None  # Set in __post_init__
+
+    # PM synthesis thresholds
+    ACCOUNT_E_MIN_WEIGHTED_SCORE: float = 60.0       # Min conviction to trigger trade
+    ACCOUNT_E_COLD_START_MIN_SCORE: float = 70.0     # Higher threshold during first 20 trades
+    ACCOUNT_E_CONFLICT_DISCOUNT: float = 0.7         # 30% discount when both sides have 2+ experts
+    ACCOUNT_E_OPPOSITION_PENALTY: float = 0.5        # Opposition halves the dominant score
+
+    # Position sizing & limits
+    ACCOUNT_E_MAX_POSITIONS: int = 15                # Max concurrent open positions
+    ACCOUNT_E_MAX_POSITION_SIZE_PCT: float = 0.10    # Max 10% of portfolio per position
+    ACCOUNT_E_INTRADAY_STOP_PCT: float = -0.03       # Hard stop for intraday trades
+    ACCOUNT_E_SWING_STOP_PCT: float = -0.05          # Hard stop for swing trades
+    ACCOUNT_E_MAX_SWING_DAYS: int = 5                # Force-close swing positions on D+5
+
+    # Timing
+    ACCOUNT_E_POLL_INTERVAL_SEC: int = 30            # Poll pm_decisions_e every N seconds
+    ACCOUNT_E_POSITION_CHECK_INTERVAL_SEC: int = 30  # Check stop/target hits every N seconds
+    ACCOUNT_E_FIRST_ENTRY_TIME: dt_time = dt_time(9, 35)   # No entries before 9:35 AM ET
+    ACCOUNT_E_LAST_ENTRY_TIME: dt_time = dt_time(15, 40)   # No entries after 3:40 PM ET
+    ACCOUNT_E_OPTION_EXPIRY_CLOSE_TIME: dt_time = dt_time(15, 30)  # Close expiring options by 3:30 PM
+
+    # Risk manager veto thresholds
+    ACCOUNT_E_MAX_BETA: float = 1.2                  # Portfolio beta ceiling
+    ACCOUNT_E_MAX_SECTOR_CONCENTRATION: float = 0.30 # Max 30% sector exposure
+    ACCOUNT_E_MAX_DRAWDOWN: float = 0.10             # Max 10% portfolio drawdown
+
+    # Cold-start bootstrap
+    ACCOUNT_E_MIN_TRADES_FOR_RECAL: int = 20         # Trades before dynamic weight recalibration
+    ACCOUNT_E_COLD_START_SIZE_MULT: float = 0.50     # 50% position sizing for first 10 trades
+
+    # Weight recalibration
+    ACCOUNT_E_WEIGHT_MIN: float = 0.05               # Floor weight per expert (5%)
+    ACCOUNT_E_WEIGHT_MAX: float = 0.40               # Ceiling weight per expert (40%)
+    ACCOUNT_E_TRAILING_SHARPE_WINDOW: int = 20       # Rolling 20-trade Sharpe for recalibration
+
+    # Expert rate limiting (max signals per symbol per window_minutes)
+    ACCOUNT_E_PORTFOLIO_SIGNAL_CAP: int = 50         # Max 50 signals/hour across all symbols
+
+    # Options
+    ACCOUNT_E_ALLOW_OPTIONS: bool = True              # Allow option trades
+    ACCOUNT_E_ALLOW_SHORT: bool = True                # Allow bearish/short signals
 
     # ADV filter (v57) — reject illiquid names (avg_daily_volume from orats_daily, D-1)
     # 3yr backtest: ADV>=1K Sharpe 1.25, WR 56.7%, PF 1.52 vs no-filter Sharpe 0.78
@@ -148,7 +235,7 @@ class TradingConfig:
 
     # Intraday bar collection
     COLLECT_INTRADAY_BARS: bool = True
-    INTRADAY_BARS_MAX_BATCHES: int = 35      # 35 × 100 = 3,500 symbols (covers 3,014 tracked + headroom)
+    INTRADAY_BARS_MAX_BATCHES: int = 55      # 55 × 100 = 5,500 symbols (covers 5,203 tracked + headroom)
     INTRADAY_BARS_INTERVAL_SEC: int = 60     # collect every 60 seconds
     INTRADAY_BARS_RETENTION_DAYS: int = 21   # 21 calendar days ≈ 14 trading days
 
